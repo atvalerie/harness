@@ -119,10 +119,12 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
             let max_tokens = profile.and_then(|p| p.max_output_tokens).unwrap_or(8192);
             let fallback = app.config.active_provider_config().fallback_models.iter().any(|candidate| candidate == &m.id);
 
-            let pricing = match (m.input_price_per_m, m.output_price_per_m) {
+            let pricing = if m.id.to_ascii_lowercase().ends_with("-free") {
+                " [Free]".to_string()
+            } else { match (m.input_price_per_m, m.output_price_per_m) {
                 (Some(in_p), Some(out_p)) => format!(" [${:.2} in / ${:.2} out per 1M tokens]", in_p, out_p),
-                _ => " [Free tier / Standard API]".to_string(),
-            };
+                _ => " [Pricing unavailable]".to_string(),
+            }};
 
             lines.push(Line::from(vec![
                 Span::styled(if is_selected { "◆ " } else { marker }, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),

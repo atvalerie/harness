@@ -364,10 +364,22 @@ impl App {
                 self.add_message("system", format!("Fetching models from {}...", self.config.provider));
                 let client = self.client.clone();
                 let configured_models = self.config.configured_models();
+                let bootstrap_model = self.config.model.clone();
+                let free_only = self.config.provider.eq_ignore_ascii_case("opencode-zen")
+                    && self.config.get_api_key_for_active_provider().is_none();
+                if free_only {
+                    self.add_message("system", "No Zen API key detected; showing -free models only.");
+                }
                 tokio::spawn(async move {
                     let res = match client.list_models().await {
                         Ok(mut models) => {
+                            if free_only {
+                                models.retain(|model| is_free_model_id(&model.id));
+                            }
                             for id in configured_models {
+                                if free_only && !is_free_model_id(&id) {
+                                    continue;
+                                }
                                 if !models.iter().any(|model| model.id == id) {
                                     models.push(crate::client::types::ModelInfo {
                                         id: id.clone(),
@@ -381,7 +393,15 @@ impl App {
                             }
                             Ok(models)
                         }
-                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().map(|id| crate::client::types::ModelInfo {
+                        Err(_error) if free_only && configured_models.is_empty() => Ok(vec![crate::client::types::ModelInfo {
+                            display_name: bootstrap_model.clone(),
+                            id: bootstrap_model,
+                            description: "Bootstrap free model (live catalog unavailable)".to_string(),
+                            input_price_per_m: None,
+                            output_price_per_m: None,
+                            input_token_limit: None,
+                        }]),
+                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().filter(|id| !free_only || is_free_model_id(id)).map(|id| crate::client::types::ModelInfo {
                             display_name: id.clone(),
                             id,
                             description: "Configured provider model (API model listing unavailable)".to_string(),
@@ -1161,4 +1181,8 @@ impl App {
             }
         }
     }
+}
+
+fn is_free_model_id(id: &str) -> bool {
+    id.trim().to_ascii_lowercase().ends_with("-free")
 }
