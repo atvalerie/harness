@@ -99,13 +99,16 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
     let popup_area = centered_rect(80, 75, area);
     frame.render_widget(Clear, popup_area);
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(" Models & Profiles ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from("[Enter] use  [R] reasoning  [[]/[]] thinking  [T] temperature  [-/+] max tokens  [F] fallback  [Esc] close"));
+    let block = Block::default().borders(Borders::ALL).title(" Models & Profiles ").border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let header_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1.min(inner.height) };
+    let footer_height = 1.min(inner.height.saturating_sub(header_area.height));
+    let footer_area = Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(footer_height), width: inner.width, height: footer_height };
+    let list_area = Rect { x: inner.x, y: inner.y + header_area.height, width: inner.width, height: inner.height.saturating_sub(header_area.height + footer_height) };
+    frame.render_widget(Paragraph::new("[Enter] use  [R] reasoning  [[]/[]] thinking  [T] temperature  [-/+] max tokens  [F] fallback"), header_area);
 
+    let mut lines = Vec::new();
     if app.available_models.is_empty() {
         lines.push(Line::from("No models loaded or query still in progress..."));
     } else {
@@ -143,10 +146,6 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    lines.push(Line::from(vec![
-        Span::styled("[S] save config  [Esc] close", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-    ]));
-
     let selected_offset = 3usize.saturating_add(
         app.available_models
             .iter()
@@ -154,28 +153,24 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
             .map(|model| 2 + usize::from(!model.description.is_empty()))
             .sum::<usize>(),
     );
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Live Models List ")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((selected_offset as u16, 0));
-
-    frame.render_widget(paragraph, popup_area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((selected_offset.saturating_sub(3) as u16, 0));
+    frame.render_widget(paragraph, list_area);
+    frame.render_widget(Paragraph::new("[S] save config  [Esc] close"), footer_area);
 }
 
 pub fn render_sessions_modal(app: &App, frame: &mut Frame, area: Rect) {
     if !app.show_sessions_modal { return; }
     let popup_area = centered_rect(75, 65, area);
     frame.render_widget(Clear, popup_area);
-    let mut lines = vec![
-        Line::from(Span::styled(" Session Browser ", Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD))),
-        Line::from("[Enter] resume  [D] delete  [E] export  [Esc] close"),
-        Line::from(""),
-    ];
+    let block = Block::default().borders(Borders::ALL).title(" Session Browser ").border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    let header_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1.min(inner.height) };
+    let footer_height = 1.min(inner.height.saturating_sub(header_area.height));
+    let footer_area = Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(footer_height), width: inner.width, height: footer_height };
+    let list_area = Rect { x: inner.x, y: inner.y + header_area.height, width: inner.width, height: inner.height.saturating_sub(header_area.height + footer_height) };
+    frame.render_widget(Paragraph::new("[Enter] resume  [D] delete  [E] export"), header_area);
+    let mut lines = Vec::new();
     if app.available_sessions.is_empty() {
         lines.push(Line::from("No saved sessions."));
     } else {
@@ -190,8 +185,9 @@ pub fn render_sessions_modal(app: &App, frame: &mut Frame, area: Rect) {
             ]));
         }
     }
-    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Saved Sessions ").border_style(Style::default().fg(Color::Magenta))).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, popup_area);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((app.sessions_selected as u16, 0));
+    frame.render_widget(paragraph, list_area);
+    frame.render_widget(Paragraph::new("[Esc] close"), footer_area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
