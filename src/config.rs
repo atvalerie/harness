@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 const KEYRING_SERVICE: &str = "gemini-harness";
 const KEYRING_USER: &str = "api_key";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3.6-flash";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -84,7 +85,7 @@ impl Default for AppConfig {
         Self {
             provider: default_provider(),
             base_url: None,
-            model: "gemini-3.8-flash".to_string(),
+            model: DEFAULT_GEMINI_MODEL.to_string(),
             fallback_models: default_fallback_models(),
             max_retries: default_max_retries(),
             thinking_budget: 1024,
@@ -113,7 +114,11 @@ Operational Guidelines:\n\
 fn default_provider() -> String { "gemini".to_string() }
 
 fn default_fallback_models() -> Vec<String> {
-    vec!["gemini-2.5-flash-lite".to_string(), "gemini-2.5-flash".to_string()]
+    vec![
+        "gemini-3.5-flash".to_string(),
+        "gemini-3.1-flash-lite".to_string(),
+        "gemini-2.5-flash-lite".to_string(),
+    ]
 }
 
 fn default_max_retries() -> u32 { 3 }
@@ -174,12 +179,43 @@ impl AppConfig {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(cfg) = serde_json::from_str::<AppConfig>(&content) {
-                        return cfg;
+                        return Self::migrate_legacy_gemini_defaults(cfg);
                     }
                 }
             }
         }
         Self::default()
+    }
+
+    fn migrate_legacy_gemini_defaults(mut config: Self) -> Self {
+        if !config.provider.eq_ignore_ascii_case("gemini") {
+            return config;
+        }
+
+        // Older releases shipped these as their built-in/default choices.
+        // Keep explicitly selected models intact, but repair configurations
+        // that still contain the old generated fallback chain.
+        let old_fallbacks = vec![
+            "gemini-2.5-flash-lite".to_string(),
+            "gemini-2.5-flash".to_string(),
+        ];
+        if config.fallback_models == old_fallbacks {
+            config.fallback_models = default_fallback_models();
+        }
+
+        if let Some(provider) = config.providers.get_mut("gemini") {
+            if provider.fallback_models == old_fallbacks {
+                provider.fallback_models = default_fallback_models();
+            }
+        }
+
+        // The old generated configs used one of these as the primary model.
+        // Move those configs to the current free-tier-safe default.
+        if matches!(config.model.as_str(), "gemini-3.8-flash" | "gemini-3.5-flash-lite") {
+            config.model = DEFAULT_GEMINI_MODEL.to_string();
+        }
+
+        config
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -279,5 +315,33 @@ impl AppConfig {
             // If fallback file was written, consider success
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_fallback_models, AppConfig};
+
+    #[test]
+    fn defaults_target_free_tier_models() {
+        let config = AppConfig::default();
+        assert_eq!(config.model, "gemini-3.6-flash");
+        assert_eq!(config.fallback_models, default_fallback_models());
+    }
+
+    #[test]
+    fn migrates_old_generated_gemini_defaults() {
+        let mut config = AppConfig::default();
+        config.model = "gemini-3.5-flash-lite".to_string();
+        config.fallback_models = vec![
+            "gemini-2.5-flash-lite".to_string(),
+            "gemini-2.5-flash".to_string(),
+        ];
+        config.providers.get_mut("gemini").unwrap().fallback_models = config.fallback_models.clone();
+
+        let migrated = AppConfig::migrate_legacy_gemini_defaults(config);
+        assert_eq!(migrated.model, "gemini-3.6-flash");
+        assert_eq!(migrated.fallback_models, default_fallback_models());
+        assert_eq!(migrated.providers["gemini"].fallback_models, default_fallback_models());
     }
 }
