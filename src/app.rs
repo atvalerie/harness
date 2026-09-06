@@ -826,7 +826,7 @@ impl App {
         self.trigger_generation(tx);
     }
 
-    fn build_request(&self) -> crate::client::types::GenerateContentRequest {
+    pub fn build_request(&self) -> crate::client::types::GenerateContentRequest {
         let mut contents: Vec<crate::client::types::Content> = Vec::new();
 
         for m in &self.messages {

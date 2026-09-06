@@ -22,14 +22,23 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    #[serde(default = "default_stdio_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
+
+fn default_stdio_transport() -> String { "stdio".to_string() }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelProfile {
