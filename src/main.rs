@@ -2,10 +2,10 @@ mod app;
 mod client;
 mod config;
 mod events;
+mod mcp;
+mod session;
 mod tools;
 mod ui;
-mod session;
-mod mcp;
 
 use app::{App, EngineState};
 use client::{is_zen_unsupported_model_id, ProviderKind};
@@ -35,15 +35,26 @@ fn resolve_api_key(config: &AppConfig) -> io::Result<String> {
     if let Some(key) = config.get_api_key_for_active_provider() {
         return Ok(key);
     }
-    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible {
+    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible
+    {
         return Ok(String::new());
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "No provider API key found in the environment or keyring",
+    ))
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
     let mut args = std::env::args().skip(1);
-    let mut cli = CliArgs { prompt: None, chat: false, provider: None, model: None, base_url: None, config_path: None };
+    let mut cli = CliArgs {
+        prompt: None,
+        chat: false,
+        provider: None,
+        model: None,
+        base_url: None,
+        config_path: None,
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--prompt" => cli.prompt = Some(args.next().ok_or_else(|| "-p/--prompt requires a value".to_string())?),
@@ -60,20 +71,43 @@ fn parse_cli_args() -> Result<CliArgs, String> {
 }
 
 async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(prompt) = cli.prompt else { return Err("Missing prompt. Use -p \"prompt\" or launch without arguments for the TUI.".into()) };
+    let Some(prompt) = cli.prompt else {
+        return Err(
+            "Missing prompt. Use -p \"prompt\" or launch without arguments for the TUI.".into(),
+        );
+    };
     let mut config = AppConfig::load();
-    if let Some(provider) = cli.provider { config.select_provider(&provider); }
-    if let Some(model) = cli.model { config.model = model; }
+    if let Some(provider) = cli.provider {
+        config.select_provider(&provider);
+    }
+    if let Some(model) = cli.model {
+        config.model = model;
+    }
     if let Some(base_url) = cli.base_url {
-        let value = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) };
-        if let Some(provider) = config.providers.get_mut(&config.provider) { provider.base_url = value; }
-        else { config.base_url = value; }
+        let value = if base_url.eq_ignore_ascii_case("default") {
+            None
+        } else {
+            Some(base_url)
+        };
+        if let Some(provider) = config.providers.get_mut(&config.provider) {
+            provider.base_url = value;
+        } else {
+            config.base_url = value;
+        }
     }
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
     app.add_message("user", prompt);
     let request = app.build_request();
-    let result = app.client.generate_content_with_fallback(&app.config.model, &app.config.effective_fallback_models(), app.config.max_retries, &request).await?;
+    let result = app
+        .client
+        .generate_content_with_fallback(
+            &app.config.model,
+            &app.config.effective_fallback_models(),
+            app.config.max_retries,
+            &request,
+        )
+        .await?;
     println!("{}", result);
     Ok(())
 }
@@ -84,12 +118,23 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // normal line-input and echo flags before reading stdin.
     let _ = crossterm::terminal::disable_raw_mode();
     let mut config = AppConfig::load();
-    if let Some(provider) = cli.provider { config.select_provider(&provider); }
-    if let Some(model) = cli.model { config.model = model; }
+    if let Some(provider) = cli.provider {
+        config.select_provider(&provider);
+    }
+    if let Some(model) = cli.model {
+        config.model = model;
+    }
     if let Some(base_url) = cli.base_url {
-        let value = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) };
-        if let Some(provider) = config.providers.get_mut(&config.provider) { provider.base_url = value; }
-        else { config.base_url = value; }
+        let value = if base_url.eq_ignore_ascii_case("default") {
+            None
+        } else {
+            Some(base_url)
+        };
+        if let Some(provider) = config.providers.get_mut(&config.provider) {
+            provider.base_url = value;
+        } else {
+            config.base_url = value;
+        }
     }
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
@@ -99,10 +144,16 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         print!("> ");
         io::stdout().flush()?;
         line.clear();
-        if stdin.read_line(&mut line)? == 0 { break; }
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
         let prompt = line.trim();
-        if prompt.is_empty() { continue; }
-        if prompt.eq_ignore_ascii_case("/quit") || prompt.eq_ignore_ascii_case("/exit") { break; }
+        if prompt.is_empty() {
+            continue;
+        }
+        if prompt.eq_ignore_ascii_case("/quit") || prompt.eq_ignore_ascii_case("/exit") {
+            break;
+        }
         app.add_message("user", prompt.to_string());
         let request = app.build_request();
         let model = app.config.model.clone();
@@ -135,7 +186,8 @@ fn prompt_for_api_key_if_missing(config: &AppConfig) -> io::Result<String> {
     if let Some(key) = config.get_api_key_for_active_provider() {
         return Ok(key);
     }
-    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible {
+    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible
+    {
         return Ok(String::new());
     }
 
@@ -172,7 +224,9 @@ fn prompt_for_api_key_if_missing(config: &AppConfig) -> io::Result<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args().map_err(|error| {
-        if error.starts_with("Usage:") { eprintln!("{}", error); }
+        if error.starts_with("Usage:") {
+            eprintln!("{}", error);
+        }
         io::Error::new(io::ErrorKind::InvalidInput, error)
     })?;
     if let Some(path) = &cli.config_path {
@@ -211,7 +265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Initialize App state and channels
     let mut app = App::new(config, api_key);
     let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
-    for tool in mcp_tools { app.tool_registry.register(tool); }
+    for tool in mcp_tools {
+        app.tool_registry.register(tool);
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     // 6. Spawn input event listener thread
@@ -365,7 +421,12 @@ fn handle_key_event(
         match key.code {
             KeyCode::Esc => app.show_sessions_modal = false,
             KeyCode::Up => app.sessions_selected = app.sessions_selected.saturating_sub(1),
-            KeyCode::Down => if !app.available_sessions.is_empty() { app.sessions_selected = (app.sessions_selected + 1).min(app.available_sessions.len() - 1); },
+            KeyCode::Down => {
+                if !app.available_sessions.is_empty() {
+                    app.sessions_selected =
+                        (app.sessions_selected + 1).min(app.available_sessions.len() - 1);
+                }
+            }
             KeyCode::Enter => app.resume_selected_session(),
             KeyCode::Char('d') | KeyCode::Char('D') => app.delete_selected_session(),
             KeyCode::Char('e') | KeyCode::Char('E') => app.export_selected_session(),
@@ -415,14 +476,18 @@ fn handle_key_event(
             }
             KeyCode::Down => {
                 let count = app.filtered_model_indices().len();
-                if count > 0 { app.models_selected = (app.models_selected + 1).min(count - 1); }
+                if count > 0 {
+                    app.models_selected = (app.models_selected + 1).min(count - 1);
+                }
             }
             KeyCode::PageUp => {
                 app.models_selected = app.models_selected.saturating_sub(10);
             }
             KeyCode::PageDown => {
                 let count = app.filtered_model_indices().len();
-                if count > 0 { app.models_selected = (app.models_selected + 10).min(count - 1); }
+                if count > 0 {
+                    app.models_selected = (app.models_selected + 10).min(count - 1);
+                }
             }
             KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_selected_reasoning(),
             KeyCode::Char('[') => app.adjust_selected_thinking(-256),
@@ -431,7 +496,10 @@ fn handle_key_event(
             KeyCode::Char('-') => app.adjust_selected_max_tokens(-512),
             KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_selected_max_tokens(512),
             KeyCode::Char('f') | KeyCode::Char('F') => app.toggle_selected_fallback(),
-            KeyCode::Char('s') | KeyCode::Char('S') => { let _ = app.config.save(); app.set_status("Model profile saved"); }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                let _ = app.config.save();
+                app.set_status("Model profile saved");
+            }
             _ => {}
         }
         return;
@@ -564,9 +632,24 @@ fn handle_key_event(
         KeyCode::Tab => {
             if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
                 let commands = [
-                    "/help", "/models", "/model", "/compact",
-                    "/thinking", "/reasoning", "/autocompact", "/session", "/sessions", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
-                    "/clear", "/save", "/quit",
+                    "/help",
+                    "/models",
+                    "/model",
+                    "/compact",
+                    "/thinking",
+                    "/reasoning",
+                    "/autocompact",
+                    "/session",
+                    "/sessions",
+                    "/temp",
+                    "/sys",
+                    "/key",
+                    "/provider",
+                    "/baseurl",
+                    "/copy",
+                    "/clear",
+                    "/save",
+                    "/quit",
                 ];
                 let prefix = app.input_buffer.to_lowercase();
                 if let Some(matched) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
@@ -618,7 +701,9 @@ fn handle_key_event(
         // - If at bottom with empty input buffer (or mouse wheel translated by terminal): scroll chat up!
         // - If at bottom with existing input text or history index active: navigate command history
         KeyCode::Up => {
-            if app.chat_scroll > 0 || (app.input_buffer.is_empty() && app.input_history_idx.is_none()) {
+            if app.chat_scroll > 0
+                || (app.input_buffer.is_empty() && app.input_history_idx.is_none())
+            {
                 app.chat_scroll = app.chat_scroll.saturating_add(3);
             } else if !app.input_history.is_empty() {
                 let next_idx = match app.input_history_idx {

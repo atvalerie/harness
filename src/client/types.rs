@@ -184,7 +184,11 @@ mod tests {
     #[test]
     fn thought_signature_is_preserved_as_a_function_call_sibling() {
         let part = Part::FunctionCall {
-            function_call: FunctionCallPayload { name: "run_command".into(), args: serde_json::json!({"command":"git status"}), id: Some("call-1".into()) },
+            function_call: FunctionCallPayload {
+                name: "run_command".into(),
+                args: serde_json::json!({"command":"git status"}),
+                id: Some("call-1".into()),
+            },
             thought_signature: Some("sig".into()),
         };
         let value = serde_json::to_value(part).unwrap();

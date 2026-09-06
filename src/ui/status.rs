@@ -52,20 +52,52 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     let status_info = app.status_message.as_deref().unwrap_or("ready");
 
     let line = Line::from(vec![
-        Span::styled(" HARNESS ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {} ", state_badge), Style::default().fg(state_fg).bg(state_bg).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " HARNESS ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", state_badge),
+            Style::default()
+                .fg(state_fg)
+                .bg(state_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
-        Span::styled(&app.config.model, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            &app.config.model,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(pricing_str, Style::default().fg(Color::DarkGray)),
         Span::raw(" │ "),
         Span::styled("think: ", Style::default().fg(Color::DarkGray)),
         Span::styled(thinking_str, Style::default().fg(Color::Magenta)),
         Span::raw(" │ "),
         Span::styled("temp: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.1}", app.config.temperature), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{:.1}", app.config.temperature),
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw(" │ "),
         Span::styled("ctx: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}/{} ({:.1}%)", app.total_tokens, format_compact_number(context_limit), context_pct), Style::default().fg(if context_pct > 80.0 { Color::Red } else { Color::Green })),
+        Span::styled(
+            format!(
+                "{}/{} ({:.1}%)",
+                app.total_tokens,
+                format_compact_number(context_limit),
+                context_pct
+            ),
+            Style::default().fg(if context_pct > 80.0 {
+                Color::Red
+            } else {
+                Color::Green
+            }),
+        ),
         Span::styled(tps_str, Style::default().fg(Color::LightCyan)),
         Span::raw(" │ "),
         Span::styled(status_info, Style::default().fg(Color::DarkGray)),

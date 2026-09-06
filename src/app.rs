@@ -2,8 +2,8 @@ use crate::client::types::{Content, GenerationConfig, Part, SafetySetting, Think
 use crate::client::{AiClient, ProviderKind};
 use crate::config::AppConfig;
 use crate::events::{AppEvent, StreamSignal};
-use crate::tools::{ToolPreview, ToolRegistry};
 use crate::session::{self, SessionSnapshot};
+use crate::tools::{ToolPreview, ToolRegistry};
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::Path;
@@ -108,7 +108,10 @@ fn open_config_file(path: &Path) -> Result<(), String> {
         command
     };
 
-    command.spawn().map(|_| ()).map_err(|error| format!("Could not open config: {}", error))
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open config: {}", error))
 }
 
 impl App {
@@ -164,22 +167,35 @@ impl App {
     }
 
     pub fn selected_model_id(&self) -> Option<String> {
-        self.filtered_model_indices().get(self.models_selected).and_then(|index| self.available_models.get(*index)).map(|model| model.id.clone())
+        self.filtered_model_indices()
+            .get(self.models_selected)
+            .and_then(|index| self.available_models.get(*index))
+            .map(|model| model.id.clone())
     }
 
     pub fn filtered_model_indices(&self) -> Vec<usize> {
         let filter = self.models_filter.to_ascii_lowercase();
-        self.available_models.iter().enumerate().filter_map(|(index, model)| {
-            if filter.is_empty() || model.id.to_ascii_lowercase().contains(&filter) || model.display_name.to_ascii_lowercase().contains(&filter) || model.description.to_ascii_lowercase().contains(&filter) {
-                Some(index)
-            } else {
-                None
-            }
-        }).collect()
+        self.available_models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| {
+                if filter.is_empty()
+                    || model.id.to_ascii_lowercase().contains(&filter)
+                    || model.display_name.to_ascii_lowercase().contains(&filter)
+                    || model.description.to_ascii_lowercase().contains(&filter)
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn clamp_model_selection(&mut self) {
-        self.models_selected = self.models_selected.min(self.filtered_model_indices().len().saturating_sub(1));
+        self.models_selected = self
+            .models_selected
+            .min(self.filtered_model_indices().len().saturating_sub(1));
     }
 
     pub fn refresh_sessions(&mut self) {
@@ -188,13 +204,23 @@ impl App {
     }
 
     pub fn resume_selected_session(&mut self) {
-        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
+        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else {
+            return;
+        };
         if let Some(snapshot) = session::load(&info.path) {
             self.messages = snapshot.messages;
             self.config.select_provider(&snapshot.provider);
             self.config.model = snapshot.model;
             let provider_config = self.config.active_provider_config();
-            self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage, crate::client::ProviderProtocol::parse(&provider_config.protocol));
+            self.client.update_provider(
+                ProviderKind::parse(&provider_config.kind),
+                provider_config
+                    .base_url
+                    .or_else(|| self.config.base_url.clone()),
+                provider_config.headers,
+                provider_config.stream_usage,
+                crate::client::ProviderProtocol::parse(&provider_config.protocol),
+            );
             if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                 self.client.update_api_key(api_key);
             }
@@ -207,7 +233,9 @@ impl App {
     }
 
     pub fn delete_selected_session(&mut self) {
-        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
+        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else {
+            return;
+        };
         if std::fs::remove_file(&info.path).is_ok() {
             self.refresh_sessions();
             self.set_status(format!("Deleted session '{}'", info.name));
@@ -215,10 +243,16 @@ impl App {
     }
 
     pub fn export_selected_session(&mut self) {
-        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
-        let export_path = info.path.with_file_name(format!("{}.export.json", info.name));
+        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else {
+            return;
+        };
+        let export_path = info
+            .path
+            .with_file_name(format!("{}.export.json", info.name));
         if let Ok(snapshot) = std::fs::read_to_string(&info.path) {
-            if std::fs::write(&export_path, snapshot).is_ok() { self.set_status(format!("Exported session to {}", export_path.display())); }
+            if std::fs::write(&export_path, snapshot).is_ok() {
+                self.set_status(format!("Exported session to {}", export_path.display()));
+            }
         }
     }
 
@@ -230,25 +264,42 @@ impl App {
     }
 
     pub fn toggle_selected_reasoning(&mut self) {
-        let Some(model) = self.selected_model_id() else { return };
+        let Some(model) = self.selected_model_id() else {
+            return;
+        };
         let key = format!("{}:{}", self.config.provider, model);
         let profile = self.config.model_profiles.entry(key).or_default();
-        let enabled = !profile.reasoning_enabled.unwrap_or(self.config.thinking_budget > 0);
+        let enabled = !profile
+            .reasoning_enabled
+            .unwrap_or(self.config.thinking_budget > 0);
         profile.reasoning_enabled = Some(enabled);
-        self.add_message("system", format!("{} reasoning {}", model, if enabled { "enabled" } else { "disabled" }));
+        self.add_message(
+            "system",
+            format!(
+                "{} reasoning {}",
+                model,
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        );
     }
 
     pub fn adjust_selected_thinking(&mut self, delta: i32) {
-        let Some(model) = self.selected_model_id() else { return };
+        let Some(model) = self.selected_model_id() else {
+            return;
+        };
         let key = format!("{}:{}", self.config.provider, model);
         let profile = self.config.model_profiles.entry(key).or_default();
-        let current = profile.thinking_budget.unwrap_or(self.config.thinking_budget);
+        let current = profile
+            .thinking_budget
+            .unwrap_or(self.config.thinking_budget);
         profile.thinking_budget = Some((current + delta).max(0));
         profile.reasoning_enabled = Some(profile.thinking_budget != Some(0));
     }
 
     pub fn adjust_selected_temperature(&mut self, delta: f32) {
-        let Some(model) = self.selected_model_id() else { return };
+        let Some(model) = self.selected_model_id() else {
+            return;
+        };
         let key = format!("{}:{}", self.config.provider, model);
         let profile = self.config.model_profiles.entry(key).or_default();
         let current = profile.temperature.unwrap_or(self.config.temperature);
@@ -256,7 +307,9 @@ impl App {
     }
 
     pub fn adjust_selected_max_tokens(&mut self, delta: i32) {
-        let Some(model) = self.selected_model_id() else { return };
+        let Some(model) = self.selected_model_id() else {
+            return;
+        };
         let key = format!("{}:{}", self.config.provider, model);
         let profile = self.config.model_profiles.entry(key).or_default();
         let current = profile.max_output_tokens.unwrap_or(8192) as i32;
@@ -264,20 +317,30 @@ impl App {
     }
 
     pub fn toggle_selected_fallback(&mut self) {
-        let Some(model) = self.selected_model_id() else { return };
+        let Some(model) = self.selected_model_id() else {
+            return;
+        };
         let provider_name = self.config.provider.clone();
-        let provider = self.config.providers.entry(provider_name.clone()).or_insert_with(|| crate::config::ProviderConfig {
-            kind: "openai-compatible".to_string(),
-            protocol: "auto".to_string(),
-            base_url: self.config.base_url.clone(),
-            model: None,
-            models: Vec::new(),
-            fallback_models: Vec::new(),
-            api_key_env: None,
-            headers: std::collections::BTreeMap::new(),
-            stream_usage: true,
-        });
-        if let Some(position) = provider.fallback_models.iter().position(|candidate| candidate == &model) {
+        let provider = self
+            .config
+            .providers
+            .entry(provider_name.clone())
+            .or_insert_with(|| crate::config::ProviderConfig {
+                kind: "openai-compatible".to_string(),
+                protocol: "auto".to_string(),
+                base_url: self.config.base_url.clone(),
+                model: None,
+                models: Vec::new(),
+                fallback_models: Vec::new(),
+                api_key_env: None,
+                headers: std::collections::BTreeMap::new(),
+                stream_usage: true,
+            });
+        if let Some(position) = provider
+            .fallback_models
+            .iter()
+            .position(|candidate| candidate == &model)
+        {
             provider.fallback_models.remove(position);
         } else {
             provider.fallback_models.push(model);
@@ -295,8 +358,14 @@ impl App {
     }
 
     pub fn flush_session(&mut self) -> Result<(), String> {
-        let Some(path) = &self.session_path else { return Ok(()) };
-        let snapshot = SessionSnapshot { provider: self.config.provider.clone(), model: self.config.model.clone(), messages: self.messages.clone() };
+        let Some(path) = &self.session_path else {
+            return Ok(());
+        };
+        let snapshot = SessionSnapshot {
+            provider: self.config.provider.clone(),
+            model: self.config.model.clone(),
+            messages: self.messages.clone(),
+        };
         session::save(path, &snapshot)?;
         self.session_messages_at_save = self.messages.len();
         Ok(())
@@ -362,14 +431,20 @@ impl App {
                 self.compact_history(tx);
             }
             "/models" => {
-                self.add_message("system", format!("Fetching models from {}...", self.config.provider));
+                self.add_message(
+                    "system",
+                    format!("Fetching models from {}...", self.config.provider),
+                );
                 let client = self.client.clone();
                 let configured_models = self.config.configured_models();
                 let bootstrap_model = self.config.model.clone();
                 let free_only = self.config.provider.eq_ignore_ascii_case("opencode-zen")
                     && self.config.get_api_key_for_active_provider().is_none();
                 if free_only {
-                    self.add_message("system", "No Zen API key detected; showing -free models only.");
+                    self.add_message(
+                        "system",
+                        "No Zen API key detected; showing -free models only.",
+                    );
                 }
                 tokio::spawn(async move {
                     let res = match client.list_models().await {
@@ -378,7 +453,10 @@ impl App {
                                 models.retain(|model| is_free_model_id(&model.id));
                             }
                             for id in configured_models {
-                                if free_only && (!is_free_model_id(&id) || crate::client::is_zen_unsupported_model_id(&id)) {
+                                if free_only
+                                    && (!is_free_model_id(&id)
+                                        || crate::client::is_zen_unsupported_model_id(&id))
+                                {
                                     continue;
                                 }
                                 if !models.iter().any(|model| model.id == id) {
@@ -394,22 +472,35 @@ impl App {
                             }
                             Ok(models)
                         }
-                        Err(_error) if free_only && configured_models.is_empty() => Ok(vec![crate::client::types::ModelInfo {
-                            display_name: bootstrap_model.clone(),
-                            id: bootstrap_model,
-                            description: "Bootstrap free model (live catalog unavailable)".to_string(),
-                            input_price_per_m: None,
-                            output_price_per_m: None,
-                            input_token_limit: None,
-                        }]),
-                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().filter(|id| !free_only || (is_free_model_id(id) && !crate::client::is_zen_unsupported_model_id(id))).map(|id| crate::client::types::ModelInfo {
-                            display_name: id.clone(),
-                            id,
-                            description: "Configured provider model (API model listing unavailable)".to_string(),
-                            input_price_per_m: None,
-                            output_price_per_m: None,
-                            input_token_limit: None,
-                        }).collect()),
+                        Err(_error) if free_only && configured_models.is_empty() => {
+                            Ok(vec![crate::client::types::ModelInfo {
+                                display_name: bootstrap_model.clone(),
+                                id: bootstrap_model,
+                                description: "Bootstrap free model (live catalog unavailable)"
+                                    .to_string(),
+                                input_price_per_m: None,
+                                output_price_per_m: None,
+                                input_token_limit: None,
+                            }])
+                        }
+                        Err(_error) if !configured_models.is_empty() => Ok(configured_models
+                            .into_iter()
+                            .filter(|id| {
+                                !free_only
+                                    || (is_free_model_id(id)
+                                        && !crate::client::is_zen_unsupported_model_id(id))
+                            })
+                            .map(|id| crate::client::types::ModelInfo {
+                                display_name: id.clone(),
+                                id,
+                                description:
+                                    "Configured provider model (API model listing unavailable)"
+                                        .to_string(),
+                                input_price_per_m: None,
+                                output_price_per_m: None,
+                                input_token_limit: None,
+                            })
+                            .collect()),
                         Err(error) => Err(error),
                     };
                     let _ = tx.send(AppEvent::ModelsFetched(res));
@@ -418,12 +509,22 @@ impl App {
             "/providers" => {
                 let mut lines = vec!["Available providers:".to_string()];
                 for (name, provider) in &self.config.providers {
-                    let marker = if name == &self.config.provider { "*" } else { " " };
+                    let marker = if name == &self.config.provider {
+                        "*"
+                    } else {
+                        " "
+                    };
                     let model = provider.model.as_deref().unwrap_or("(choose a model)");
-                    lines.push(format!("{} {:<18} kind={} protocol={}  model={}", marker, name, provider.kind, provider.protocol, model));
+                    lines.push(format!(
+                        "{} {:<18} kind={} protocol={}  model={}",
+                        marker, name, provider.kind, provider.protocol, model
+                    ));
                 }
                 if !self.config.providers.contains_key(&self.config.provider) {
-                    lines.push(format!("* {:<18} kind={}  model={}", self.config.provider, "openai-compatible", self.config.model));
+                    lines.push(format!(
+                        "* {:<18} kind={}  model={}",
+                        self.config.provider, "openai-compatible", self.config.model
+                    ));
                 }
                 lines.push("Supported kinds: gemini, openai-compatible (custom endpoints, OpenRouter, Zen, local servers)".to_string());
                 lines.push("Use /provider <name> to switch.".to_string());
@@ -431,55 +532,112 @@ impl App {
             }
             "/provider" => {
                 if arg.is_empty() {
-                    self.add_message("system", format!("Current provider: {}", self.config.provider));
+                    self.add_message(
+                        "system",
+                        format!("Current provider: {}", self.config.provider),
+                    );
                 } else {
                     self.config.select_provider(arg);
                     let provider_config = self.config.active_provider_config();
                     let provider = ProviderKind::parse(&provider_config.kind);
-                    self.client.update_provider(provider, provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage, crate::client::ProviderProtocol::parse(&provider_config.protocol));
+                    self.client.update_provider(
+                        provider,
+                        provider_config
+                            .base_url
+                            .or_else(|| self.config.base_url.clone()),
+                        provider_config.headers,
+                        provider_config.stream_usage,
+                        crate::client::ProviderProtocol::parse(&provider_config.protocol),
+                    );
                     if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                         self.client.update_api_key(api_key);
                     }
                     self.set_status(format!("Provider set to {}", self.config.provider));
-                    self.add_message("system", format!("Provider set to {}", self.config.provider));
+                    self.add_message(
+                        "system",
+                        format!("Provider set to {}", self.config.provider),
+                    );
                 }
             }
             "/baseurl" => {
                 if arg.is_empty() {
-                    let base_url = self.config.active_provider_config().base_url.or_else(|| self.config.base_url.clone());
-                    self.add_message("system", format!("Current base URL: {}", base_url.as_deref().unwrap_or("provider default")));
+                    let base_url = self
+                        .config
+                        .active_provider_config()
+                        .base_url
+                        .or_else(|| self.config.base_url.clone());
+                    self.add_message(
+                        "system",
+                        format!(
+                            "Current base URL: {}",
+                            base_url.as_deref().unwrap_or("provider default")
+                        ),
+                    );
                 } else {
-                    let base_url = if arg.eq_ignore_ascii_case("default") { None } else { Some(arg.to_string()) };
+                    let base_url = if arg.eq_ignore_ascii_case("default") {
+                        None
+                    } else {
+                        Some(arg.to_string())
+                    };
                     if let Some(provider) = self.config.providers.get_mut(&self.config.provider) {
                         provider.base_url = base_url.clone();
                     } else {
                         self.config.base_url = base_url.clone();
                     }
                     let provider_config = self.config.active_provider_config();
-                    self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage, crate::client::ProviderProtocol::parse(&provider_config.protocol));
+                    self.client.update_provider(
+                        ProviderKind::parse(&provider_config.kind),
+                        provider_config
+                            .base_url
+                            .or_else(|| self.config.base_url.clone()),
+                        provider_config.headers,
+                        provider_config.stream_usage,
+                        crate::client::ProviderProtocol::parse(&provider_config.protocol),
+                    );
                     self.set_status("Provider base URL updated");
-                    self.add_message("system", "Provider base URL updated. Use /save to persist it.");
+                    self.add_message(
+                        "system",
+                        "Provider base URL updated. Use /save to persist it.",
+                    );
                 }
             }
             "/config" => {
                 let path = AppConfig::config_path();
                 match arg.to_ascii_lowercase().as_str() {
-                    "" | "path" => self.add_message("system", format!("Config path: {}", path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "unavailable".to_string()))),
-                    "dir" => self.add_message("system", format!("Config directory: {}", path.as_ref().and_then(|path| path.parent()).map(|path| path.display().to_string()).unwrap_or_else(|| "unavailable".to_string()))),
-                    "open" => {
-                        match path {
-                            Some(path) => {
-                                if !path.exists() {
-                                    let _ = self.config.save();
-                                }
-                                match open_config_file(&path) {
-                                    Ok(()) => self.add_message("system", format!("Opened config: {}", path.display())),
-                                    Err(error) => self.add_message("system", error),
-                                }
+                    "" | "path" => self.add_message(
+                        "system",
+                        format!(
+                            "Config path: {}",
+                            path.as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "unavailable".to_string())
+                        ),
+                    ),
+                    "dir" => self.add_message(
+                        "system",
+                        format!(
+                            "Config directory: {}",
+                            path.as_ref()
+                                .and_then(|path| path.parent())
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "unavailable".to_string())
+                        ),
+                    ),
+                    "open" => match path {
+                        Some(path) => {
+                            if !path.exists() {
+                                let _ = self.config.save();
                             }
-                            None => self.add_message("system", "Config path is unavailable."),
+                            match open_config_file(&path) {
+                                Ok(()) => self.add_message(
+                                    "system",
+                                    format!("Opened config: {}", path.display()),
+                                ),
+                                Err(error) => self.add_message("system", error),
+                            }
                         }
-                    }
+                        None => self.add_message("system", "Config path is unavailable."),
+                    },
                     _ => self.add_message("system", "Usage: /config <path|open|dir>"),
                 }
             }
@@ -489,7 +647,10 @@ impl App {
                 } else {
                     self.config.model = arg.to_string();
                     self.set_status(format!("Model set to: {}", self.config.model));
-                    self.add_message("system", format!("Active model switched to: {}", self.config.model));
+                    self.add_message(
+                        "system",
+                        format!("Active model switched to: {}", self.config.model),
+                    );
                 }
             }
             "/thinking" => {
@@ -498,15 +659,30 @@ impl App {
                     self.set_status(format!("Thinking budget set to: {}", b));
                     self.add_message("system", format!("Thinking budget set to: {} tokens", b));
                 } else {
-                    self.add_message("system", format!("Current thinking budget: {} tokens. Use /thinking <int>", self.config.thinking_budget));
+                    self.add_message(
+                        "system",
+                        format!(
+                            "Current thinking budget: {} tokens. Use /thinking <int>",
+                            self.config.thinking_budget
+                        ),
+                    );
                 }
             }
             "/reasoning" => {
                 let key = self.config.model_profile_key();
                 let profile = self.config.model_profiles.entry(key).or_default();
                 if arg.is_empty() {
-                    let enabled = profile.reasoning_enabled.unwrap_or(self.config.thinking_budget > 0);
-                    self.add_message("system", format!("Reasoning for {}: {}", self.config.model, if enabled { "on" } else { "off" }));
+                    let enabled = profile
+                        .reasoning_enabled
+                        .unwrap_or(self.config.thinking_budget > 0);
+                    self.add_message(
+                        "system",
+                        format!(
+                            "Reasoning for {}: {}",
+                            self.config.model,
+                            if enabled { "on" } else { "off" }
+                        ),
+                    );
                 } else if arg.eq_ignore_ascii_case("on") || arg.eq_ignore_ascii_case("off") {
                     let enabled = arg.eq_ignore_ascii_case("on");
                     profile.reasoning_enabled = Some(enabled);
@@ -517,41 +693,75 @@ impl App {
                 } else if let Ok(budget) = arg.parse::<i32>() {
                     profile.thinking_budget = Some(budget.max(0));
                     profile.reasoning_enabled = Some(budget > 0);
-                    self.set_status(format!("Reasoning budget set to {} for {}", budget.max(0), self.config.model));
+                    self.set_status(format!(
+                        "Reasoning budget set to {} for {}",
+                        budget.max(0),
+                        self.config.model
+                    ));
                 } else {
                     self.add_message("system", "Usage: /reasoning <on|off|token-budget>");
                 }
             }
             "/autocompact" => {
                 if arg.is_empty() {
-                    self.add_message("system", format!("Automatic compaction: {} at ~{} tokens", if self.config.auto_compact { "on" } else { "off" }, self.config.auto_compact_threshold_tokens));
+                    self.add_message(
+                        "system",
+                        format!(
+                            "Automatic compaction: {} at ~{} tokens",
+                            if self.config.auto_compact {
+                                "on"
+                            } else {
+                                "off"
+                            },
+                            self.config.auto_compact_threshold_tokens
+                        ),
+                    );
                 } else if arg.eq_ignore_ascii_case("on") || arg.eq_ignore_ascii_case("off") {
                     self.config.auto_compact = arg.eq_ignore_ascii_case("on");
-                    self.set_status(format!("Automatic compaction {}", if self.config.auto_compact { "enabled" } else { "disabled" }));
+                    self.set_status(format!(
+                        "Automatic compaction {}",
+                        if self.config.auto_compact {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ));
                 } else if let Ok(tokens) = arg.parse::<u64>() {
                     self.config.auto_compact_threshold_tokens = tokens.max(1_000);
                     self.config.auto_compact = true;
-                    self.set_status(format!("Automatic compaction threshold set to {} tokens", self.config.auto_compact_threshold_tokens));
+                    self.set_status(format!(
+                        "Automatic compaction threshold set to {} tokens",
+                        self.config.auto_compact_threshold_tokens
+                    ));
                 } else {
                     self.add_message("system", "Usage: /autocompact <on|off|token-threshold>");
                 }
             }
-            "/session" => {
-                match arg.to_ascii_lowercase().as_str() {
-                    "save" => match self.flush_session() {
-                        Ok(()) => self.add_message("system", "Session saved."),
-                        Err(error) => self.add_message("system", format!("Session save failed: {}", error)),
-                    },
-                    "clear" => {
-                        self.messages.clear();
-                        self.session_messages_at_save = 0;
-                        let _ = self.flush_session();
-                        self.add_message("system", "Session cleared and saved.");
+            "/session" => match arg.to_ascii_lowercase().as_str() {
+                "save" => match self.flush_session() {
+                    Ok(()) => self.add_message("system", "Session saved."),
+                    Err(error) => {
+                        self.add_message("system", format!("Session save failed: {}", error))
                     }
-                    "path" => self.add_message("system", format!("Session path: {}", self.session_path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "disabled".to_string()))),
-                    _ => self.add_message("system", "Usage: /session <save|clear|path>"),
+                },
+                "clear" => {
+                    self.messages.clear();
+                    self.session_messages_at_save = 0;
+                    let _ = self.flush_session();
+                    self.add_message("system", "Session cleared and saved.");
                 }
-            }
+                "path" => self.add_message(
+                    "system",
+                    format!(
+                        "Session path: {}",
+                        self.session_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "disabled".to_string())
+                    ),
+                ),
+                _ => self.add_message("system", "Usage: /session <save|clear|path>"),
+            },
             "/sessions" => {
                 self.refresh_sessions();
                 self.show_sessions_modal = true;
@@ -559,15 +769,30 @@ impl App {
             "/temp" => {
                 if let Ok(t) = arg.parse::<f32>() {
                     self.config.temperature = t.clamp(0.0, 2.0);
-                    self.set_status(format!("Temperature set to: {:.2}", self.config.temperature));
-                    self.add_message("system", format!("Temperature set to: {:.2}", self.config.temperature));
+                    self.set_status(format!(
+                        "Temperature set to: {:.2}",
+                        self.config.temperature
+                    ));
+                    self.add_message(
+                        "system",
+                        format!("Temperature set to: {:.2}", self.config.temperature),
+                    );
                 } else {
-                    self.add_message("system", format!("Current temperature: {:.2}. Use /temp <float>", self.config.temperature));
+                    self.add_message(
+                        "system",
+                        format!(
+                            "Current temperature: {:.2}. Use /temp <float>",
+                            self.config.temperature
+                        ),
+                    );
                 }
             }
             "/sys" => {
                 if arg.is_empty() {
-                    self.add_message("system", format!("Current system prompt:\n{}", self.config.system_instruction));
+                    self.add_message(
+                        "system",
+                        format!("Current system prompt:\n{}", self.config.system_instruction),
+                    );
                 } else {
                     self.config.system_instruction = arg.to_string();
                     self.set_status("System instruction updated");
@@ -582,7 +807,10 @@ impl App {
                         Ok(()) => {
                             self.client.update_api_key(arg.to_string());
                             self.set_status("API key updated successfully");
-                            self.add_message("system", "Provider API key updated and stored securely.");
+                            self.add_message(
+                                "system",
+                                "Provider API key updated and stored securely.",
+                            );
                         }
                         Err(e) => {
                             self.add_message("system", format!("Failed to store key: {}", e));
@@ -599,17 +827,15 @@ impl App {
                 self.set_status("Session cleared");
                 self.add_message("system", "Conversation history cleared.");
             }
-            "/save" => {
-                match self.config.save() {
-                    Ok(()) => {
-                        self.set_status("Configuration saved");
-                        self.add_message("system", "Configuration saved to disk.");
-                    }
-                    Err(e) => {
-                        self.add_message("system", format!("Error saving configuration: {}", e));
-                    }
+            "/save" => match self.config.save() {
+                Ok(()) => {
+                    self.set_status("Configuration saved");
+                    self.add_message("system", "Configuration saved to disk.");
                 }
-            }
+                Err(e) => {
+                    self.add_message("system", format!("Error saving configuration: {}", e));
+                }
+            },
             "/copy" => {
                 self.copy_last_response();
             }
@@ -617,7 +843,10 @@ impl App {
                 self.should_quit = true;
             }
             _ => {
-                self.add_message("system", format!("Unknown command: '{}'. Type /help for assistance.", cmd));
+                self.add_message(
+                    "system",
+                    format!("Unknown command: '{}'. Type /help for assistance.", cmd),
+                );
             }
         }
     }
@@ -637,14 +866,11 @@ impl App {
                 tokio::spawn(async move {
                     #[cfg(windows)]
                     {
+                        use std::process::Stdio;
                         use tokio::io::AsyncWriteExt;
                         use tokio::process::Command;
-                        use std::process::Stdio;
 
-                        if let Ok(mut child) = Command::new("clip")
-                            .stdin(Stdio::piped())
-                            .spawn()
-                        {
+                        if let Ok(mut child) = Command::new("clip").stdin(Stdio::piped()).spawn() {
                             if let Some(mut stdin) = child.stdin.take() {
                                 let _ = stdin.write_all(text.as_bytes()).await;
                             }
@@ -654,9 +880,9 @@ impl App {
 
                     #[cfg(not(windows))]
                     {
+                        use std::process::Stdio;
                         use tokio::io::AsyncWriteExt;
                         use tokio::process::Command;
-                        use std::process::Stdio;
 
                         if let Ok(mut child) = Command::new("xclip")
                             .arg("-selection")
@@ -673,7 +899,13 @@ impl App {
                 });
 
                 self.set_status("Copied response to clipboard");
-                self.add_message("system", format!("Copied last assistant response ({} chars) to system clipboard.", char_len));
+                self.add_message(
+                    "system",
+                    format!(
+                        "Copied last assistant response ({} chars) to system clipboard.",
+                        char_len
+                    ),
+                );
             }
             None => {
                 self.add_message("system", "No assistant response found to copy.");
@@ -690,7 +922,12 @@ impl App {
             && self.estimated_context_tokens() >= self.config.auto_compact_threshold_tokens
         {
             self.pending_generation_after_compaction = true;
-            self.pending_prompt_after_compaction = self.messages.iter().rev().find(|message| message.role == "user").map(|message| message.content.clone());
+            self.pending_prompt_after_compaction = self
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone());
             self.state = EngineState::Compacting;
             self.compact_history(tx);
             return;
@@ -720,7 +957,9 @@ impl App {
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<StreamSignal>();
 
         let stream_handle = tokio::spawn(async move {
-            client.stream_generate_content(&model, &fallback_models, max_retries, &request, stream_tx).await;
+            client
+                .stream_generate_content(&model, &fallback_models, max_retries, &request, stream_tx)
+                .await;
         });
 
         self.active_stream_task = Some(stream_handle);
@@ -734,8 +973,13 @@ impl App {
     }
 
     fn estimated_context_tokens(&self) -> u64 {
-        let message_chars: usize = self.messages.iter().map(|message| message.content.len()).sum();
-        ((message_chars + self.config.system_instruction.len()) as u64 / 4).max(self.total_tokens as u64)
+        let message_chars: usize = self
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
+        ((message_chars + self.config.system_instruction.len()) as u64 / 4)
+            .max(self.total_tokens as u64)
     }
 
     pub fn cancel_generation(&mut self) {
@@ -758,7 +1002,12 @@ impl App {
         self.set_status("Generation stopped");
     }
 
-    pub fn handle_stream_signal(&mut self, epoch: u64, sig: StreamSignal, tx: UnboundedSender<AppEvent>) {
+    pub fn handle_stream_signal(
+        &mut self,
+        epoch: u64,
+        sig: StreamSignal,
+        tx: UnboundedSender<AppEvent>,
+    ) {
         if epoch != self.stream_epoch {
             return;
         }
@@ -777,7 +1026,12 @@ impl App {
                     }
                 }
             }
-            StreamSignal::ToolCall { id, name, args, thought_signature } => {
+            StreamSignal::ToolCall {
+                id,
+                name,
+                args,
+                thought_signature,
+            } => {
                 // If model produced any thought prior to tool call, record it
                 if !self.current_thought_buffer.is_empty() {
                     let thought = std::mem::take(&mut self.current_thought_buffer);
@@ -823,10 +1077,17 @@ impl App {
                         });
                     }
                 } else {
-                    self.add_message("system", format!("Warning: Model attempted to call unknown tool '{}'", name));
+                    self.add_message(
+                        "system",
+                        format!("Warning: Model attempted to call unknown tool '{}'", name),
+                    );
                 }
             }
-            StreamSignal::Usage { prompt_tokens, candidates_tokens, total_tokens } => {
+            StreamSignal::Usage {
+                prompt_tokens,
+                candidates_tokens,
+                total_tokens,
+            } => {
                 self.prompt_tokens = prompt_tokens;
                 self.candidates_tokens = candidates_tokens;
                 self.total_tokens = total_tokens;
@@ -869,7 +1130,11 @@ impl App {
         }
     }
 
-    pub fn approve_pending_tool(&mut self, whitelist_for_session: bool, tx: UnboundedSender<AppEvent>) {
+    pub fn approve_pending_tool(
+        &mut self,
+        whitelist_for_session: bool,
+        tx: UnboundedSender<AppEvent>,
+    ) {
         if let Some(pending) = self.pending_tool_call.take() {
             if whitelist_for_session {
                 self.session_allowed_tools.insert(pending.tool_name.clone());
@@ -881,8 +1146,11 @@ impl App {
     pub fn deny_pending_tool(&mut self, tx: UnboundedSender<AppEvent>) {
         if let Some(pending) = self.pending_tool_call.take() {
             let rejection_result = "Execution rejected by user.".to_string();
-            self.add_message("system", format!("Denied execution of tool '{}'", pending.tool_name));
-            
+            self.add_message(
+                "system",
+                format!("Denied execution of tool '{}'", pending.tool_name),
+            );
+
             // Send denial back into tool result pipeline so Gemini can adjust
             let app_tx = tx.clone();
             tokio::spawn(async move {
@@ -936,7 +1204,11 @@ impl App {
 
         // Add tool interaction to chat view
         let preview_snippet = if output_str.len() > 200 {
-            format!("{}...\n(Total {} chars)", &output_str[..200], output_str.len())
+            format!(
+                "{}...\n(Total {} chars)",
+                &output_str[..200],
+                output_str.len()
+            )
         } else {
             output_str.clone()
         };
@@ -998,7 +1270,12 @@ impl App {
             } else if m.role == "function" {
                 if let Ok(part) = serde_json::from_str::<Part>(&m.content) {
                     if let Some(last) = contents.last_mut() {
-                        if last.role.as_deref() == Some("user") && last.parts.iter().any(|p| matches!(p, Part::FunctionResponse { .. })) {
+                        if last.role.as_deref() == Some("user")
+                            && last
+                                .parts
+                                .iter()
+                                .any(|p| matches!(p, Part::FunctionResponse { .. }))
+                        {
                             last.parts.push(part);
                             continue;
                         }
@@ -1028,12 +1305,14 @@ impl App {
         }
 
         let model_profile = self.config.active_model_profile();
-        let thinking_budget = model_profile.thinking_budget.unwrap_or(self.config.thinking_budget);
-        let reasoning_enabled = model_profile.reasoning_enabled.unwrap_or(thinking_budget > 0);
+        let thinking_budget = model_profile
+            .thinking_budget
+            .unwrap_or(self.config.thinking_budget);
+        let reasoning_enabled = model_profile
+            .reasoning_enabled
+            .unwrap_or(thinking_budget > 0);
         let thinking_config = if reasoning_enabled && thinking_budget > 0 {
-            Some(ThinkingConfig {
-                thinking_budget,
-            })
+            Some(ThinkingConfig { thinking_budget })
         } else {
             None
         };
@@ -1073,8 +1352,18 @@ impl App {
                 temperature: Some(model_profile.temperature.unwrap_or(self.config.temperature)),
                 max_output_tokens: Some(model_profile.max_output_tokens.unwrap_or(8192)),
                 thinking_config,
-                reasoning_effort: if reasoning_enabled { model_profile.reasoning_effort.clone() } else { None },
-                extra: if model_profile.extra.is_empty() { None } else { Some(serde_json::Value::Object(model_profile.extra.clone().into_iter().collect())) },
+                reasoning_effort: if reasoning_enabled {
+                    model_profile.reasoning_effort.clone()
+                } else {
+                    None
+                },
+                extra: if model_profile.extra.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(
+                        model_profile.extra.clone().into_iter().collect(),
+                    ))
+                },
             }),
             safety_settings: Some(safety_settings),
             tools: Some(tools),
@@ -1084,13 +1373,22 @@ impl App {
     pub fn compact_history(&mut self, tx: UnboundedSender<AppEvent>) {
         let count = self.messages.len();
         if count <= 2 {
-            self.add_message("system", "History is already minimal; compaction unnecessary.");
+            self.add_message(
+                "system",
+                "History is already minimal; compaction unnecessary.",
+            );
             return;
         }
 
         self.set_status("Compacting conversation history...");
         self.state = EngineState::Compacting;
-        self.add_message("system", format!("Compacting {} turns into a concise context summary...", count));
+        self.add_message(
+            "system",
+            format!(
+                "Compacting {} turns into a concise context summary...",
+                count
+            ),
+        );
 
         let mut transcript = String::new();
         for m in &self.messages {
@@ -1139,12 +1437,18 @@ impl App {
         let max_retries = self.config.max_retries;
 
         tokio::spawn(async move {
-            let res = client.generate_content_with_fallback(&model, &fallback_models, max_retries, &request).await;
+            let res = client
+                .generate_content_with_fallback(&model, &fallback_models, max_retries, &request)
+                .await;
             let _ = tx.send(AppEvent::CompactionFinished(res));
         });
     }
 
-    pub fn handle_compaction_result(&mut self, result: Result<String, String>, tx: UnboundedSender<AppEvent>) {
+    pub fn handle_compaction_result(
+        &mut self,
+        result: Result<String, String>,
+        tx: UnboundedSender<AppEvent>,
+    ) {
         match result {
             Ok(summary) => {
                 let original_count = self.messages.len();
@@ -1162,7 +1466,10 @@ impl App {
                 self.set_status("Context compacted");
                 self.add_message(
                     "system",
-                    format!("Successfully compacted {} messages. Context window reclaimed.", original_count),
+                    format!(
+                        "Successfully compacted {} messages. Context window reclaimed.",
+                        original_count
+                    ),
                 );
                 let continue_generation = self.pending_generation_after_compaction;
                 self.pending_generation_after_compaction = false;
@@ -1171,7 +1478,9 @@ impl App {
                 }
                 self.state = EngineState::Idle;
                 let _ = self.flush_session();
-                if continue_generation { self.trigger_generation(tx); }
+                if continue_generation {
+                    self.trigger_generation(tx);
+                }
             }
             Err(e) => {
                 self.set_status("Compaction failed");

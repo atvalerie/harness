@@ -42,7 +42,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         let lower_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(5),    // Main chat log viewport
+                Constraint::Min(5), // Main chat log viewport
                 Constraint::Length(hitl_height),
             ])
             .split(panel_area);

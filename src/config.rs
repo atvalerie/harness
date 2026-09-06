@@ -1,10 +1,10 @@
 use directories::ProjectDirs;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::env;
-use std::path::PathBuf;
 use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 const KEYRING_SERVICE: &str = "gemini-harness";
 const KEYRING_USER: &str = "api_key";
@@ -53,7 +53,9 @@ pub struct McpServerConfig {
     pub enabled: bool,
 }
 
-fn default_stdio_transport() -> String { "stdio".to_string() }
+fn default_stdio_transport() -> String {
+    "stdio".to_string()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelProfile {
@@ -114,7 +116,9 @@ You have direct access to native tools for filesystem inspection, safe command e
 Operational Guidelines:\n\
 1. Proactively use `web_search` and `web_fetch` whenever you need up-to-date documentation or external facts.\n\
 2. Prioritize reading relevant files before modifying them.\n\
-3. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.".to_string(),
+3. Use `read_file` for source and text inspection, using its optional `start_line` and `max_lines` for bounded chunks. Do not emulate file reads with `run_command`, `type`, `Get-Content`, `findstr`, or line-count probes.\n\
+4. Use `run_command` for actual execution such as builds, tests, git, and scripts. Its working directory persists after `cd` or `Set-Location`; use its optional `shell` field when a specific shell is required.\n\
+5. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.".to_string(),
             providers: default_provider_configs(),
             model_profiles: BTreeMap::new(),
             auto_compact: default_auto_compact(),
@@ -125,9 +129,15 @@ Operational Guidelines:\n\
     }
 }
 
-fn default_provider() -> String { "gemini".to_string() }
-fn default_provider_kind() -> String { "openai-compatible".to_string() }
-fn default_provider_protocol() -> String { "auto".to_string() }
+fn default_provider() -> String {
+    "gemini".to_string()
+}
+fn default_provider_kind() -> String {
+    "openai-compatible".to_string()
+}
+fn default_provider_protocol() -> String {
+    "auto".to_string()
+}
 
 fn default_fallback_models() -> Vec<String> {
     vec![
@@ -137,89 +147,125 @@ fn default_fallback_models() -> Vec<String> {
     ]
 }
 
-fn default_max_retries() -> u32 { 3 }
-fn default_auto_compact() -> bool { true }
-fn default_auto_compact_threshold() -> u64 { 100_000 }
-fn default_true() -> bool { true }
-fn default_session_name() -> String { "default".to_string() }
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_auto_compact() -> bool {
+    true
+}
+fn default_auto_compact_threshold() -> u64 {
+    100_000
+}
+fn default_true() -> bool {
+    true
+}
+fn default_session_name() -> String {
+    "default".to_string()
+}
 
 fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
     let mut providers = BTreeMap::new();
-    providers.insert("gemini".to_string(), ProviderConfig {
-        kind: "gemini".to_string(),
-        protocol: "auto".to_string(),
-        base_url: None,
-        model: Some(DEFAULT_GEMINI_MODEL.to_string()),
-        models: Vec::new(),
-        fallback_models: default_fallback_models(),
-        api_key_env: Some("GEMINI_API_KEY".to_string()),
-        headers: BTreeMap::new(),
-        stream_usage: true,
-    });
-    providers.insert("openai".to_string(), ProviderConfig {
-        kind: "openai-compatible".to_string(),
-        protocol: "auto".to_string(),
-        base_url: None,
-        model: None,
-        models: Vec::new(),
-        fallback_models: Vec::new(),
-        api_key_env: Some("OPENAI_API_KEY".to_string()),
-        headers: BTreeMap::new(),
-        stream_usage: true,
-    });
-    providers.insert("opencode-zen".to_string(), ProviderConfig {
-        kind: "openai-compatible".to_string(),
-        protocol: "auto".to_string(),
-        base_url: Some("https://opencode.ai/zen/v1".to_string()),
-        model: Some("ling-3.0-flash-fin-free".to_string()),
-        // The live /models catalog is the source of truth. This single model
-        // is only a bootstrap choice for the first request before discovery.
-        models: Vec::new(),
-        fallback_models: Vec::new(),
-        api_key_env: Some("OPENCODE_API_KEY".to_string()),
-        headers: BTreeMap::new(),
-        // Zen documents a few models that emit non-standard SSE when this is
-        // requested, so keep the provider-compatible default disabled.
-        stream_usage: false,
-    });
+    providers.insert(
+        "gemini".to_string(),
+        ProviderConfig {
+            kind: "gemini".to_string(),
+            protocol: "auto".to_string(),
+            base_url: None,
+            model: Some(DEFAULT_GEMINI_MODEL.to_string()),
+            models: Vec::new(),
+            fallback_models: default_fallback_models(),
+            api_key_env: Some("GEMINI_API_KEY".to_string()),
+            headers: BTreeMap::new(),
+            stream_usage: true,
+        },
+    );
+    providers.insert(
+        "openai".to_string(),
+        ProviderConfig {
+            kind: "openai-compatible".to_string(),
+            protocol: "auto".to_string(),
+            base_url: None,
+            model: None,
+            models: Vec::new(),
+            fallback_models: Vec::new(),
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            headers: BTreeMap::new(),
+            stream_usage: true,
+        },
+    );
+    providers.insert(
+        "opencode-zen".to_string(),
+        ProviderConfig {
+            kind: "openai-compatible".to_string(),
+            protocol: "auto".to_string(),
+            base_url: Some("https://opencode.ai/zen/v1".to_string()),
+            model: Some("ling-3.0-flash-fin-free".to_string()),
+            // The live /models catalog is the source of truth. This single model
+            // is only a bootstrap choice for the first request before discovery.
+            models: Vec::new(),
+            fallback_models: Vec::new(),
+            api_key_env: Some("OPENCODE_API_KEY".to_string()),
+            headers: BTreeMap::new(),
+            // Zen documents a few models that emit non-standard SSE when this is
+            // requested, so keep the provider-compatible default disabled.
+            stream_usage: false,
+        },
+    );
     providers
 }
 
 impl AppConfig {
     pub fn active_provider_config(&self) -> ProviderConfig {
-        self.providers.get(&self.provider).cloned().unwrap_or_else(|| ProviderConfig {
-            kind: default_provider_kind(),
-            protocol: default_provider_protocol(),
-            base_url: self.base_url.clone(),
-            model: None,
-            models: Vec::new(),
-            fallback_models: self.fallback_models.clone(),
-            api_key_env: None,
-            headers: BTreeMap::new(),
-            stream_usage: true,
-        })
+        self.providers
+            .get(&self.provider)
+            .cloned()
+            .unwrap_or_else(|| ProviderConfig {
+                kind: default_provider_kind(),
+                protocol: default_provider_protocol(),
+                base_url: self.base_url.clone(),
+                model: None,
+                models: Vec::new(),
+                fallback_models: self.fallback_models.clone(),
+                api_key_env: None,
+                headers: BTreeMap::new(),
+                stream_usage: true,
+            })
     }
 
     pub fn select_provider(&mut self, name: &str) {
         self.provider = name.trim().to_string();
-        if let Some(model) = self.providers.get(&self.provider).and_then(|provider| provider.model.clone()) {
+        if let Some(model) = self
+            .providers
+            .get(&self.provider)
+            .and_then(|provider| provider.model.clone())
+        {
             self.model = model;
         }
     }
 
     pub fn effective_fallback_models(&self) -> Vec<String> {
         let profile = self.active_provider_config();
-        if profile.fallback_models.is_empty() { self.fallback_models.clone() } else { profile.fallback_models }
+        if profile.fallback_models.is_empty() {
+            self.fallback_models.clone()
+        } else {
+            profile.fallback_models
+        }
     }
 
     pub fn configured_models(&self) -> Vec<String> {
         self.active_provider_config().models
     }
 
-    pub fn model_profile_key(&self) -> String { format!("{}:{}", self.provider, self.model) }
+    pub fn model_profile_key(&self) -> String {
+        format!("{}:{}", self.provider, self.model)
+    }
 
     pub fn active_model_profile(&self) -> ModelProfile {
-        self.model_profiles.get(&self.model_profile_key()).cloned().or_else(|| self.model_profiles.get(&self.model).cloned()).unwrap_or_default()
+        self.model_profiles
+            .get(&self.model_profile_key())
+            .cloned()
+            .or_else(|| self.model_profiles.get(&self.model).cloned())
+            .unwrap_or_default()
     }
 
     pub fn config_dir() -> Option<PathBuf> {
@@ -242,12 +288,27 @@ impl AppConfig {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(cfg) = serde_json::from_str::<AppConfig>(&content) {
-                        return Self::with_builtin_providers(Self::migrate_legacy_gemini_defaults(cfg));
+                        let cfg = Self::migrate_legacy_gemini_defaults(cfg);
+                        let cfg = Self::with_builtin_providers(cfg);
+                        return Self::with_tool_guidance(cfg);
                     }
                 }
             }
         }
         Self::default()
+    }
+
+    fn with_tool_guidance(mut config: Self) -> Self {
+        const MARKER: &str = "Use `read_file` for source and text inspection";
+        if !config.system_instruction.contains(MARKER) {
+            config.system_instruction.push_str(
+                "\n\nTool selection rules:\n\
+- Use `read_file` for source and text inspection. Request `start_line` and `max_lines` when you need a bounded chunk; do not use shell commands to print files or count lines.\n\
+- Use `run_command` for builds, tests, git, and other commands that must execute. Its working directory is persistent across tool calls, so `cd` and `Set-Location` affect subsequent tools.\n\
+- `run_command` accepts an optional `shell` of `auto`, `powershell`, or `cmd` on Windows; leave it as `auto` unless syntax requires a specific shell.",
+            );
+        }
+        config
     }
 
     fn with_builtin_providers(mut config: Self) -> Self {
@@ -274,12 +335,16 @@ impl AppConfig {
             "gemini-3.1-flash-lite".to_string(),
             "gemini-2.5-flash-lite".to_string(),
         ];
-        if config.fallback_models == old_fallbacks || config.fallback_models == previous_free_fallbacks {
+        if config.fallback_models == old_fallbacks
+            || config.fallback_models == previous_free_fallbacks
+        {
             config.fallback_models = default_fallback_models();
         }
 
         if let Some(provider) = config.providers.get_mut("gemini") {
-            if provider.fallback_models == old_fallbacks || provider.fallback_models == previous_free_fallbacks {
+            if provider.fallback_models == old_fallbacks
+                || provider.fallback_models == previous_free_fallbacks
+            {
                 provider.fallback_models = default_fallback_models();
             }
         }
@@ -294,8 +359,8 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path()
-            .ok_or_else(|| "Failed to resolve config directory".to_string())?;
+        let path =
+            Self::config_path().ok_or_else(|| "Failed to resolve config directory".to_string())?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -305,15 +370,16 @@ impl AppConfig {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Serialization error: {}", e))?;
 
-        fs::write(&path, json)
-            .map_err(|e| format!("Failed to write config file: {}", e))?;
+        fs::write(&path, json).map_err(|e| format!("Failed to write config file: {}", e))?;
 
         Ok(())
     }
 
     pub fn get_api_key_for(provider: &str) -> Option<String> {
         // 1. Check environment variable first
-        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("openai") || provider.eq_ignore_ascii_case("openai-compatible") {
+        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("openai")
+            || provider.eq_ignore_ascii_case("openai-compatible")
+        {
             vec!["OPENAI_API_KEY", "GEMINI_API_KEY"]
         } else if provider.eq_ignore_ascii_case("gemini") {
             vec!["GEMINI_API_KEY", "OPENAI_API_KEY"]
@@ -359,7 +425,9 @@ impl AppConfig {
         if let Some(variable) = self.active_provider_config().api_key_env {
             if let Ok(key) = std::env::var(variable) {
                 let trimmed = key.trim();
-                if !trimmed.is_empty() { return Some(trimmed.to_string()); }
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
             }
         }
         Self::get_api_key_for(&self.provider)
@@ -425,33 +493,43 @@ mod tests {
             "gemini-2.5-flash-lite".to_string(),
             "gemini-2.5-flash".to_string(),
         ];
-        config.providers.get_mut("gemini").unwrap().fallback_models = config.fallback_models.clone();
+        config.providers.get_mut("gemini").unwrap().fallback_models =
+            config.fallback_models.clone();
 
         let migrated = AppConfig::migrate_legacy_gemini_defaults(config);
         assert_eq!(migrated.model, "gemini-3.5-flash-lite");
         assert_eq!(migrated.fallback_models, default_fallback_models());
-        assert_eq!(migrated.providers["gemini"].fallback_models, default_fallback_models());
+        assert_eq!(
+            migrated.providers["gemini"].fallback_models,
+            default_fallback_models()
+        );
     }
 
     #[test]
     fn custom_provider_selects_its_model() {
         let mut config = AppConfig::default();
-        config.providers.insert("local".to_string(), ProviderConfig {
-            kind: "openai-compatible".to_string(),
-            protocol: "auto".to_string(),
-            base_url: Some("http://localhost:11434/v1".to_string()),
-            model: Some("qwen3:8b".to_string()),
-            models: vec!["qwen3:8b".to_string()],
-            fallback_models: vec!["llama3.2:3b".to_string()],
-            api_key_env: Some("OLLAMA_API_KEY".to_string()),
-            headers: BTreeMap::new(),
-            stream_usage: true,
-        });
+        config.providers.insert(
+            "local".to_string(),
+            ProviderConfig {
+                kind: "openai-compatible".to_string(),
+                protocol: "auto".to_string(),
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                model: Some("qwen3:8b".to_string()),
+                models: vec!["qwen3:8b".to_string()],
+                fallback_models: vec!["llama3.2:3b".to_string()],
+                api_key_env: Some("OLLAMA_API_KEY".to_string()),
+                headers: BTreeMap::new(),
+                stream_usage: true,
+            },
+        );
 
         config.select_provider("local");
         assert_eq!(config.provider, "local");
         assert_eq!(config.model, "qwen3:8b");
-        assert_eq!(config.active_provider_config().base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(
+            config.active_provider_config().base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
         assert_eq!(config.effective_fallback_models(), vec!["llama3.2:3b"]);
     }
 }

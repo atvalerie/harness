@@ -39,7 +39,10 @@ pub fn parse_markdown(text: &str, indent_prefix: &str) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::raw(indent_prefix.to_string()),
                 Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
-                Span::styled(raw_line.to_string(), Style::default().fg(Color::LightYellow)),
+                Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(Color::LightYellow),
+                ),
             ]));
             continue;
         }
@@ -47,22 +50,50 @@ pub fn parse_markdown(text: &str, indent_prefix: &str) -> Vec<Line<'static>> {
         if let Some(h3) = trimmed.strip_prefix("### ") {
             lines.push(Line::from(vec![
                 Span::raw(indent_prefix.to_string()),
-                Span::styled("### ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)),
-                Span::styled(h3.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "### ",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    h3.to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
             continue;
         } else if let Some(h2) = trimmed.strip_prefix("## ") {
             lines.push(Line::from(vec![
                 Span::raw(indent_prefix.to_string()),
-                Span::styled("## ", Style::default().fg(Color::LightCyan).add_modifier(Modifier::DIM)),
-                Span::styled(h2.to_string(), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "## ",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    h2.to_string(),
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
             continue;
         } else if let Some(h1) = trimmed.strip_prefix("# ") {
             lines.push(Line::from(vec![
                 Span::raw(indent_prefix.to_string()),
-                Span::styled("# ", Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
-                Span::styled(h1.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+                Span::styled(
+                    "# ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    h1.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
             ]));
             continue;
         }
@@ -72,12 +103,20 @@ pub fn parse_markdown(text: &str, indent_prefix: &str) -> Vec<Line<'static>> {
                 Span::raw(indent_prefix.to_string()),
                 Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
             ];
-            spans.extend(parse_inline_spans(quote, Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+            spans.extend(parse_inline_spans(
+                quote,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ));
             lines.push(Line::from(spans));
             continue;
         }
 
-        if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             let mut spans = vec![
                 Span::raw(indent_prefix.to_string()),
                 Span::styled("\u{2022} ", Style::default().fg(Color::Cyan)),
@@ -91,7 +130,10 @@ pub fn parse_markdown(text: &str, indent_prefix: &str) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
         } else {
             let mut spans = vec![Span::raw(indent_prefix.to_string())];
-            spans.extend(parse_inline_spans(trimmed, Style::default().fg(Color::White)));
+            spans.extend(parse_inline_spans(
+                trimmed,
+                Style::default().fg(Color::White),
+            ));
             lines.push(Line::from(spans));
         }
     }

@@ -10,9 +10,7 @@ pub struct SseParser {
 
 impl SseParser {
     pub fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     /// Process an arbitrary incoming chunk of bytes from the HTTP stream.
@@ -45,14 +43,17 @@ impl SseParser {
                 }
 
                 if json_str == "[DONE]" {
-                    let _ = tx.send(StreamSignal::Finished { finish_reason: Some("STOP".to_string()) });
+                    let _ = tx.send(StreamSignal::Finished {
+                        finish_reason: Some("STOP".to_string()),
+                    });
                     continue;
                 }
 
                 match serde_json::from_str::<GenerateContentResponse>(json_str) {
                     Ok(resp) => {
                         if let Some(err) = resp.error {
-                            let formatted = super::format_api_error(err.code.map(|c| c as u16), json_str);
+                            let formatted =
+                                super::format_api_error(err.code.map(|c| c as u16), json_str);
                             let _ = tx.send(StreamSignal::Error(formatted));
                             continue;
                         }
@@ -79,7 +80,8 @@ impl SseParser {
                                                 });
                                             } else if let Some(text) = part.text {
                                                 if part.thought.unwrap_or(false) {
-                                                    let _ = tx.send(StreamSignal::ThoughtDelta(text));
+                                                    let _ =
+                                                        tx.send(StreamSignal::ThoughtDelta(text));
                                                 } else {
                                                     let _ = tx.send(StreamSignal::TextDelta(text));
                                                 }
@@ -97,7 +99,10 @@ impl SseParser {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(StreamSignal::Error(format!("JSON Parse Error: {} on payload: {}", e, json_str)));
+                        let _ = tx.send(StreamSignal::Error(format!(
+                            "JSON Parse Error: {} on payload: {}",
+                            e, json_str
+                        )));
                     }
                 }
             }
@@ -105,10 +110,7 @@ impl SseParser {
     }
 }
 
-pub async fn stream_sse_response(
-    response: Response,
-    tx: UnboundedSender<StreamSignal>,
-) {
+pub async fn stream_sse_response(response: Response, tx: UnboundedSender<StreamSignal>) {
     let mut parser = SseParser::new();
     let mut stream = response.bytes_stream();
 

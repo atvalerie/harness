@@ -2,8 +2,8 @@ pub mod fs;
 pub mod grounding;
 pub mod shell;
 
-use async_trait::async_trait;
 use crate::client::types::{FunctionDeclaration, GeminiToolDeclaration};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,11 +12,15 @@ use std::sync::Mutex;
 pub type SharedWorkingDir = Arc<Mutex<PathBuf>>;
 
 pub fn new_working_dir() -> SharedWorkingDir {
-    Arc::new(Mutex::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))))
+    Arc::new(Mutex::new(
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    ))
 }
 
 pub fn working_dir_path(cwd: &SharedWorkingDir) -> PathBuf {
-    cwd.lock().map(|path| path.clone()).unwrap_or_else(|_| PathBuf::from("."))
+    cwd.lock()
+        .map(|path| path.clone())
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +67,9 @@ impl ToolRegistry {
         reg.register(Arc::new(grounding::WebFetchTool));
         reg.register(Arc::new(fs::ReadFileTool::new(reg.working_dir.clone())));
         reg.register(Arc::new(fs::WriteFileTool::new(reg.working_dir.clone())));
-        reg.register(Arc::new(shell::RunCommandTool::new(reg.working_dir.clone())));
+        reg.register(Arc::new(shell::RunCommandTool::new(
+            reg.working_dir.clone(),
+        )));
 
         reg
     }

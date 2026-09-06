@@ -8,7 +8,12 @@ use ratatui::{
 };
 
 pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
-    let prompt_prefix = Span::styled("❯ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let prompt_prefix = Span::styled(
+        "❯ ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
 
     // Calculate inner width available for text (area.width - borders(2) - prompt prefix(2) = area.width - 4)
     let inner_width = area.width.saturating_sub(4) as usize;
@@ -30,7 +35,10 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     let input_text = Span::styled(visible_chars, Style::default().fg(Color::White));
 
     // Command autocompletion ghost hint when typing a slash command (only when cursor is at the end)
-    let ghost_hint = if cursor == chars.len() && app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
+    let ghost_hint = if cursor == chars.len()
+        && app.input_buffer.starts_with('/')
+        && !app.input_buffer.contains(' ')
+    {
         let commands = [
             "/help - show available commands",
             "/models - query live models & pricing",
@@ -71,12 +79,11 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
+    let paragraph = Paragraph::new(line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
 
     frame.render_widget(paragraph, area);
 

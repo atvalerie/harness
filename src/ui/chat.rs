@@ -11,14 +11,26 @@ use ratatui::{
 pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
-    if app.messages.is_empty() && app.current_thought_buffer.is_empty() && app.current_response_buffer.is_empty() {
+    if app.messages.is_empty()
+        && app.current_thought_buffer.is_empty()
+        && app.current_response_buffer.is_empty()
+    {
         lines.push(Line::from(vec![
-            Span::styled("Gemini Developer Harness", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" [{}]", app.config.model), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Gemini Developer Harness",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" [{}]", app.config.model),
+                Style::default().fg(Color::Cyan),
+            ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled("Ready. Type /help for commands or enter a prompt.", Style::default().fg(Color::DarkGray)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "Ready. Type /help for commands or enter a prompt.",
+            Style::default().fg(Color::DarkGray),
+        )]));
     }
 
     for msg in &app.messages {
@@ -26,20 +38,37 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
             "user" => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled("❯ user", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {}", msg.timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "❯ user",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", msg.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {}", l), Style::default().fg(Color::White)),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {}", l),
+                        Style::default().fg(Color::White),
+                    )]));
                 }
             }
             "model" => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled("◆ assistant", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {}", msg.timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "◆ assistant",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", msg.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 // Markdown rendering for assistant messages
                 let md_lines = parse_markdown(&msg.content, "  ");
@@ -49,36 +78,48 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("· thought", Style::default().fg(Color::Magenta)),
-                    Span::styled(format!("  {}", msg.timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", msg.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  │ {}", l), Style::default().fg(Color::DarkGray)),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  │ {}", l),
+                        Style::default().fg(Color::DarkGray),
+                    )]));
                 }
             }
             "tool" => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("⚡ tool", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("  {}", msg.timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", msg.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {}", l), Style::default().fg(Color::Yellow)),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {}", l),
+                        Style::default().fg(Color::Yellow),
+                    )]));
                 }
             }
             "system" => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("— system", Style::default().fg(Color::Blue)),
-                    Span::styled(format!("  {}", msg.timestamp), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {}", msg.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {}", l), Style::default().fg(Color::DarkGray)),
-                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {}", l),
+                        Style::default().fg(Color::DarkGray),
+                    )]));
                 }
             }
             _ => {}
@@ -88,22 +129,29 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     // Render active streaming thought buffer
     if !app.current_thought_buffer.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Thinking... ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::ITALIC)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "Thinking... ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        )]));
         for l in app.current_thought_buffer.lines() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  │ {}", l), Style::default().fg(Color::DarkGray)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                format!("  │ {}", l),
+                Style::default().fg(Color::DarkGray),
+            )]));
         }
     }
 
     // Render active streaming response buffer with live markdown parsing
     if !app.current_response_buffer.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Gemini (Streaming)... ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "Gemini (Streaming)... ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
         let md_stream_lines = parse_markdown(&app.current_response_buffer, "  ");
         lines.extend(md_stream_lines);
     }
