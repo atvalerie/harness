@@ -290,6 +290,11 @@ impl AiClient {
         if models.is_empty() { models.push(clean_model(model).to_string()); }
         let mut last_error = String::new();
         'models: for (model_index, candidate) in models.iter().enumerate() {
+            if self.is_zen() && is_zen_responses_model_id(candidate) {
+                let error = format!("Zen model {} uses the Responses API; select a Chat Completions model.", candidate);
+                let _ = tx.send(StreamSignal::Error(error));
+                return;
+            }
             for attempt in 0..=max_retries {
                 let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
                 let payload = openai::request_payload(candidate, request, true, self.include_stream_usage);
@@ -321,6 +326,9 @@ impl AiClient {
     }
 
     async fn generate_openai(&self, model: &str, request: &GenerateContentRequest) -> Result<String, String> {
+        if self.is_zen() && is_zen_responses_model_id(model) {
+            return Err(format!("Zen model {} uses the Responses API; select a Chat Completions model.", model));
+        }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = self.authorize(self.client.post(&url).json(&openai::request_payload(model, request, false, false))).send().await.map_err(|e| format!("Request failed: {}", e))?;
         let status = response.status();
@@ -339,6 +347,7 @@ impl AiClient {
         let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Failed to deserialize models list: {}", e))?;
         Ok(data.get("data").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|entry| {
             let id = entry.get("id").and_then(|v| v.as_str())?;
+            if self.is_zen() && is_zen_responses_model_id(id) { return None; }
             let description = entry.get("description").and_then(|v| v.as_str()).unwrap_or("OpenAI-compatible model").to_string();
             let input_price_per_m = openrouter_price_per_m(entry, "prompt");
             let output_price_per_m = openrouter_price_per_m(entry, "completion");
@@ -353,6 +362,23 @@ impl AiClient {
             })
         }).collect())
     }
+
+    fn is_zen(&self) -> bool {
+        self.base_url.to_ascii_lowercase().contains("opencode.ai/zen/")
+    }
+}
+
+/// Zen publishes one model catalog for several wire protocols. These model
+/// families are documented as Responses, Anthropic Messages, or Gemini-native
+/// endpoints rather than Chat Completions, which is the protocol handled here.
+pub fn is_zen_responses_model_id(model: &str) -> bool {
+    let model = clean_model(model).to_ascii_lowercase();
+    model.starts_with("gpt-")
+        || model.starts_with("claude-")
+        || model.starts_with("gemini-")
+        || model.starts_with("grok-")
+        || model.starts_with("muse-spark-")
+        || model.starts_with("qwen3.")
 }
 
 fn openrouter_price_per_m(entry: &serde_json::Value, key: &str) -> Option<f64> {
@@ -384,7 +410,7 @@ fn backoff(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{openrouter_price_per_m, ProviderKind};
+    use super::{is_zen_responses_model_id, openrouter_price_per_m, ProviderKind};
     use serde_json::json;
 
     #[test]
@@ -400,6 +426,13 @@ mod tests {
         let entry = json!({"pricing": {"prompt": "0.00000015", "completion": "0.0000006"}});
         assert_eq!(openrouter_price_per_m(&entry, "prompt"), Some(0.15));
         assert_eq!(openrouter_price_per_m(&entry, "completion"), Some(0.6));
+    }
+
+    #[test]
+    fn recognizes_zen_models_that_need_another_protocol() {
+        assert!(is_zen_responses_model_id("muse-spark-1.3-contributor-free"));
+        assert!(is_zen_responses_model_id("gpt-5.5"));
+        assert!(!is_zen_responses_model_id("mimo-v2.5-free"));
     }
 }
 
@@ -427,11 +460,11 @@ pub fn format_api_error(status_code: Option<u16>, raw_body: &str) -> String {
             let status = err.get("status").and_then(|s| s.as_str()).unwrap_or("");
 
             if status == "UNAVAILABLE" || code == 503 {
-                return "Gemini service temporarily unavailable (503 high demand). Please retry in a moment.".to_string();
+                return "Provider service temporarily unavailable (503 high demand). Please retry in a moment.".to_string();
             } else if status == "RESOURCE_EXHAUSTED" || code == 429 {
-                return "Gemini rate limit / quota exceeded (429). Please wait before retrying.".to_string();
+                return "Provider rate limit / quota exceeded (429). Please wait before retrying or use a fallback model.".to_string();
             } else if status == "PERMISSION_DENIED" || code == 403 {
-                return "API key invalid or permission denied (403). Check your key with /key <api_key>.".to_string();
+                return "Provider API key invalid or permission denied (403). Check the active provider key.".to_string();
             } else if status == "INVALID_ARGUMENT" || code == 400 {
                 return format!("Invalid request payload (400): {}", message);
             } else {

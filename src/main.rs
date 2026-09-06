@@ -8,7 +8,7 @@ mod session;
 mod mcp;
 
 use app::{App, EngineState};
-use client::ProviderKind;
+use client::{is_zen_responses_model_id, ProviderKind};
 use config::AppConfig;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -294,6 +294,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match res {
                             Ok(models) => {
                                 app.available_models = models;
+                                if app.config.provider.eq_ignore_ascii_case("opencode-zen")
+                                    && app.config.get_api_key_for_active_provider().is_none()
+                                {
+                                    let current_model = app.config.model.clone();
+                                    let free_fallbacks = app.available_models.iter()
+                                        .filter(|model| model.id.to_ascii_lowercase().ends_with("-free"))
+                                        .filter(|model| !is_zen_responses_model_id(&model.id))
+                                        .map(|model| model.id.clone())
+                                        .filter(|model| model != &current_model)
+                                        .take(5)
+                                        .collect::<Vec<_>>();
+                                    if !free_fallbacks.is_empty() {
+                                        if let Some(provider) = app.config.providers.get_mut(&app.config.provider) {
+                                            if provider.fallback_models.is_empty() {
+                                                provider.fallback_models = free_fallbacks;
+                                            }
+                                        }
+                                    }
+                                }
                                 app.models_selected = app.available_models.iter().position(|model| model.id == app.config.model).unwrap_or(0);
                                 app.models_filter.clear();
                                 app.models_searching = false;

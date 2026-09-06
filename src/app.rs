@@ -374,10 +374,10 @@ impl App {
                     let res = match client.list_models().await {
                         Ok(mut models) => {
                             if free_only {
-                                models.retain(|model| is_free_model_id(&model.id));
+                                models.retain(|model| is_free_model_id(&model.id) && !crate::client::is_zen_responses_model_id(&model.id));
                             }
                             for id in configured_models {
-                                if free_only && !is_free_model_id(&id) {
+                                if free_only && (!is_free_model_id(&id) || crate::client::is_zen_responses_model_id(&id)) {
                                     continue;
                                 }
                                 if !models.iter().any(|model| model.id == id) {
@@ -401,7 +401,7 @@ impl App {
                             output_price_per_m: None,
                             input_token_limit: None,
                         }]),
-                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().filter(|id| !free_only || is_free_model_id(id)).map(|id| crate::client::types::ModelInfo {
+                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().filter(|id| !free_only || (is_free_model_id(id) && !crate::client::is_zen_responses_model_id(id))).map(|id| crate::client::types::ModelInfo {
                             display_name: id.clone(),
                             id,
                             description: "Configured provider model (API model listing unavailable)".to_string(),
