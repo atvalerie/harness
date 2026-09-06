@@ -36,6 +36,7 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
             "/models - query live models & pricing",
             "/provider <name> - select configured provider",
             "/baseurl <url|default> - set provider base URL",
+            "/config <path|open|dir> - inspect or open config",
             "/reasoning <on|off|budget> - configure active model reasoning",
             "/autocompact <on|off|tokens> - configure automatic compaction",
             "/session <save|clear|path> - manage resumable session",

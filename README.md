@@ -50,7 +50,9 @@ Configuration is saved with `/save` under the platform config directory. A compa
 
 Any entry under `providers` becomes a selectable provider by name. Set `kind` to `gemini` for Gemini's native API; all other kinds use the OpenAI-compatible `/chat/completions` protocol. Set `base_url`, `api_key_env`, `model`, `models`, `fallback_models`, and optional `headers` per provider. OpenAI-compatible providers may omit `api_key_env` for local servers that do not require authentication. Select one with `/provider <name>` or `--provider <name>`.
 
-Useful commands include `/provider`, `/baseurl`, `/model`, `/reasoning`, `/autocompact`, `/session save`, `/session path`, `/models`, and `/save`.
+Useful commands include `/provider`, `/baseurl`, `/config path`, `/config open`, `/model`, `/reasoning`, `/autocompact`, `/session save`, `/session path`, `/models`, and `/save`.
+
+Use `--config PATH` or the `GEMINI_HARNESS_CONFIG` environment variable to run with a separate configuration file. This is useful for keeping local, work, and hosted-provider setups independent.
 
 For scripting, use headless mode:
 

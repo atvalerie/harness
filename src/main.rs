@@ -18,6 +18,7 @@ use crossterm::{
 use events::AppEvent;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, stdout, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -27,6 +28,7 @@ struct CliArgs {
     provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
+    config_path: Option<PathBuf>,
 }
 
 fn resolve_api_key(config: &AppConfig) -> io::Result<String> {
@@ -41,7 +43,7 @@ fn resolve_api_key(config: &AppConfig) -> io::Result<String> {
 
 fn parse_cli_args() -> Result<CliArgs, String> {
     let mut args = std::env::args().skip(1);
-    let mut cli = CliArgs { prompt: None, chat: false, provider: None, model: None, base_url: None };
+    let mut cli = CliArgs { prompt: None, chat: false, provider: None, model: None, base_url: None, config_path: None };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--prompt" => cli.prompt = Some(args.next().ok_or_else(|| "-p/--prompt requires a value".to_string())?),
@@ -49,7 +51,8 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--provider" => cli.provider = Some(args.next().ok_or_else(|| "--provider requires a value".to_string())?),
             "--model" => cli.model = Some(args.next().ok_or_else(|| "--model requires a value".to_string())?),
             "--base-url" => cli.base_url = Some(args.next().ok_or_else(|| "--base-url requires a value".to_string())?),
-            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" | --chat [--provider NAME] [--model MODEL] [--base-url URL]".to_string()),
+            "--config" => cli.config_path = Some(PathBuf::from(args.next().ok_or_else(|| "--config requires a path".to_string())?)),
+            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" | --chat [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]".to_string()),
             unknown => return Err(format!("Unknown argument '{}'. Use --help.", unknown)),
         }
     }
@@ -172,6 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if error.starts_with("Usage:") { eprintln!("{}", error); }
         io::Error::new(io::ErrorKind::InvalidInput, error)
     })?;
+    if let Some(path) = &cli.config_path {
+        std::env::set_var("GEMINI_HARNESS_CONFIG", path);
+    }
     if cli.prompt.is_some() {
         return run_headless(cli).await;
     }

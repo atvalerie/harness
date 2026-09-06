@@ -6,6 +6,8 @@ use crate::tools::{ToolPreview, ToolRegistry};
 use crate::session::{self, SessionSnapshot};
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::Path;
+use std::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -82,6 +84,29 @@ pub struct App {
     pub pending_prompt_after_compaction: Option<String>,
     pub session_path: Option<std::path::PathBuf>,
     pub session_messages_at_save: usize,
+}
+
+fn open_config_file(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("notepad.exe");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command.spawn().map(|_| ()).map_err(|error| format!("Could not open config: {}", error))
 }
 
 impl App {
@@ -295,6 +320,7 @@ impl App {
                     - /models : Fetch live models & pricing from the active provider\n\
                     - /provider <name> : Select a configured provider\n\
                     - /baseurl <url|default> : Set the active provider base URL\n\
+                    - /config <path|open|dir> : Inspect or open the active config file\n\
                     - /model <name> : Switch active model (e.g. /model gemini-3.5-flash-lite)\n\
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
                     - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
@@ -377,6 +403,28 @@ impl App {
                     self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
                     self.set_status("Provider base URL updated");
                     self.add_message("system", "Provider base URL updated. Use /save to persist it.");
+                }
+            }
+            "/config" => {
+                let path = AppConfig::config_path();
+                match arg.to_ascii_lowercase().as_str() {
+                    "" | "path" => self.add_message("system", format!("Config path: {}", path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "unavailable".to_string()))),
+                    "dir" => self.add_message("system", format!("Config directory: {}", path.as_ref().and_then(|path| path.parent()).map(|path| path.display().to_string()).unwrap_or_else(|| "unavailable".to_string()))),
+                    "open" => {
+                        match path {
+                            Some(path) => {
+                                if !path.exists() {
+                                    let _ = self.config.save();
+                                }
+                                match open_config_file(&path) {
+                                    Ok(()) => self.add_message("system", format!("Opened config: {}", path.display())),
+                                    Err(error) => self.add_message("system", error),
+                                }
+                            }
+                            None => self.add_message("system", "Config path is unavailable."),
+                        }
+                    }
+                    _ => self.add_message("system", "Usage: /config <path|open|dir>"),
                 }
             }
             "/model" => {

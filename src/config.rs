@@ -2,6 +2,7 @@ use directories::ProjectDirs;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::env;
 use std::path::PathBuf;
 use std::collections::BTreeMap;
 
@@ -198,6 +199,12 @@ impl AppConfig {
     }
 
     pub fn config_path() -> Option<PathBuf> {
+        if let Ok(path) = env::var("GEMINI_HARNESS_CONFIG") {
+            let path = PathBuf::from(path);
+            if !path.as_os_str().is_empty() {
+                return Some(path);
+            }
+        }
         Self::config_dir().map(|dir| dir.join("config.json"))
     }
 
