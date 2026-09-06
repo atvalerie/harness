@@ -67,6 +67,8 @@ pub struct App {
     pub show_models_modal: bool,
     pub models_scroll: usize,
     pub models_selected: usize,
+    pub models_filter: String,
+    pub models_searching: bool,
     pub show_sessions_modal: bool,
     pub available_sessions: Vec<session::SessionInfo>,
     pub sessions_selected: usize,
@@ -139,6 +141,8 @@ impl App {
             show_models_modal: false,
             models_scroll: 0,
             models_selected: 0,
+            models_filter: String::new(),
+            models_searching: false,
             show_sessions_modal: false,
             available_sessions: Vec::new(),
             sessions_selected: 0,
@@ -160,7 +164,22 @@ impl App {
     }
 
     pub fn selected_model_id(&self) -> Option<String> {
-        self.available_models.get(self.models_selected).map(|model| model.id.clone())
+        self.filtered_model_indices().get(self.models_selected).and_then(|index| self.available_models.get(*index)).map(|model| model.id.clone())
+    }
+
+    pub fn filtered_model_indices(&self) -> Vec<usize> {
+        let filter = self.models_filter.to_ascii_lowercase();
+        self.available_models.iter().enumerate().filter_map(|(index, model)| {
+            if filter.is_empty() || model.id.to_ascii_lowercase().contains(&filter) || model.display_name.to_ascii_lowercase().contains(&filter) || model.description.to_ascii_lowercase().contains(&filter) {
+                Some(index)
+            } else {
+                None
+            }
+        }).collect()
+    }
+
+    pub fn clamp_model_selection(&mut self) {
+        self.models_selected = self.models_selected.min(self.filtered_model_indices().len().saturating_sub(1));
     }
 
     pub fn refresh_sessions(&mut self) {

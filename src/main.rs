@@ -295,6 +295,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(models) => {
                                 app.available_models = models;
                                 app.models_selected = app.available_models.iter().position(|model| model.id == app.config.model).unwrap_or(0);
+                                app.models_filter.clear();
+                                app.models_searching = false;
                                 app.show_models_modal = true;
                                 app.models_scroll = 0;
                                 app.set_status("Fetched live models list.");
@@ -355,22 +357,53 @@ fn handle_key_event(
 
     // 2. When Live Models Modal is active
     if app.show_models_modal {
+        if app.models_searching {
+            match key.code {
+                KeyCode::Esc => {
+                    app.models_searching = false;
+                    app.models_filter.clear();
+                    app.models_selected = 0;
+                }
+                KeyCode::Backspace => {
+                    app.models_filter.pop();
+                    app.models_selected = 0;
+                }
+                KeyCode::Enter => {
+                    app.models_searching = false;
+                    app.select_model_from_catalog();
+                }
+                KeyCode::Char(c) => {
+                    app.models_filter.push(c);
+                    app.models_selected = 0;
+                }
+                _ => {}
+            }
+            app.clamp_model_selection();
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 app.show_models_modal = false;
+            }
+            KeyCode::Char('/') => {
+                app.models_searching = true;
+                app.models_filter.clear();
+                app.models_selected = 0;
             }
             KeyCode::Enter => app.select_model_from_catalog(),
             KeyCode::Up => {
                 app.models_selected = app.models_selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                if !app.available_models.is_empty() { app.models_selected = (app.models_selected + 1).min(app.available_models.len() - 1); }
+                let count = app.filtered_model_indices().len();
+                if count > 0 { app.models_selected = (app.models_selected + 1).min(count - 1); }
             }
             KeyCode::PageUp => {
                 app.models_selected = app.models_selected.saturating_sub(10);
             }
             KeyCode::PageDown => {
-                if !app.available_models.is_empty() { app.models_selected = (app.models_selected + 10).min(app.available_models.len() - 1); }
+                let count = app.filtered_model_indices().len();
+                if count > 0 { app.models_selected = (app.models_selected + 10).min(count - 1); }
             }
             KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_selected_reasoning(),
             KeyCode::Char('[') => app.adjust_selected_thinking(-256),

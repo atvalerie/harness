@@ -92,15 +92,24 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
     let footer_height = 1.min(inner.height.saturating_sub(header_area.height));
     let footer_area = Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(footer_height), width: inner.width, height: footer_height };
     let list_area = Rect { x: inner.x, y: inner.y + header_area.height, width: inner.width, height: inner.height.saturating_sub(header_area.height + footer_height) };
-    frame.render_widget(Paragraph::new("[Enter] use  [R] reasoning  [[]/[]] thinking  [T] temperature  [-/+] max tokens  [F] fallback"), header_area);
+    let header = if app.models_searching {
+        format!("Search: /{}", app.models_filter)
+    } else {
+        "[Enter] use  [/] search  [R] reasoning  [[]/[]] thinking  [T] temperature  [-/+] max tokens  [F] fallback".to_string()
+    };
+    frame.render_widget(Paragraph::new(header), header_area);
 
     let mut lines = Vec::new();
+    let model_indices = app.filtered_model_indices();
     if app.available_models.is_empty() {
         lines.push(Line::from("No models loaded or query still in progress..."));
+    } else if model_indices.is_empty() {
+        lines.push(Line::from(format!("No models match '{}'. Press Esc to clear search.", app.models_filter)));
     } else {
-        for (index, m) in app.available_models.iter().enumerate() {
+        for (filtered_index, source_index) in model_indices.iter().enumerate() {
+            let m = &app.available_models[*source_index];
             let is_current = m.id == app.config.model;
-            let is_selected = index == app.models_selected;
+            let is_selected = filtered_index == app.models_selected;
             let marker = if is_current { "▶ " } else { "  " };
 
             let profile = app.config.model_profiles.get(&format!("{}:{}", app.config.provider, m.id));
@@ -133,15 +142,21 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     let selected_offset = 3usize.saturating_add(
-        app.available_models
+        model_indices
             .iter()
             .take(app.models_selected)
+            .map(|index| &app.available_models[*index])
             .map(|model| 2 + usize::from(!model.description.is_empty()))
             .sum::<usize>(),
     );
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((selected_offset.saturating_sub(3) as u16, 0));
     frame.render_widget(paragraph, list_area);
-    frame.render_widget(Paragraph::new("[S] save config  [Esc] close"), footer_area);
+    let footer = if app.models_searching {
+        "[Enter] use filtered model  [Esc] clear search  [Backspace] edit"
+    } else {
+        "[S] save config  [/] search  [Esc] close"
+    };
+    frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
 pub fn render_sessions_modal(app: &App, frame: &mut Frame, area: Rect) {
