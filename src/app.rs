@@ -59,6 +59,9 @@ pub struct App {
 
     // HITL Modal State
     pub pending_tool_call: Option<PendingToolCall>,
+    /// Number of tool executions belonging to the current assistant turn.
+    /// The next model request must wait until the entire batch is complete.
+    pub pending_tool_executions: usize,
     pub session_allowed_tools: HashSet<String>,
     pub modal_scroll: usize,
 
@@ -138,6 +141,7 @@ impl App {
             current_thought_buffer: String::new(),
             current_response_buffer: String::new(),
             pending_tool_call: None,
+            pending_tool_executions: 0,
             session_allowed_tools: HashSet::new(),
             modal_scroll: 0,
             available_models: Vec::new(),
@@ -998,6 +1002,7 @@ impl App {
         }
 
         self.state = EngineState::Idle;
+        self.pending_tool_executions = 0;
         self.stream_start_time = None;
         self.set_status("Generation stopped");
     }
@@ -1172,6 +1177,7 @@ impl App {
         tx: UnboundedSender<AppEvent>,
     ) {
         self.state = EngineState::ExecutingTool;
+        self.pending_tool_executions = self.pending_tool_executions.saturating_add(1);
         self.set_status(format!("Executing tool '{}'...", tool_name));
 
         if let Some(tool) = self.tool_registry.get(&tool_name) {
@@ -1241,7 +1247,17 @@ impl App {
         });
         let _ = self.flush_session();
 
-        // Resume generation so model can synthesize answer from tool result
+        // Resume generation only after every tool from this assistant turn has
+        // returned. Starting immediately for the first result races the other
+        // tool tasks and can abort/restart an in-flight model request.
+        self.pending_tool_executions = self.pending_tool_executions.saturating_sub(1);
+        if self.pending_tool_executions > 0 {
+            self.state = EngineState::ExecutingTool;
+            return;
+        }
+
+        // Resume generation so model can synthesize an answer from the full
+        // batch of tool results.
         self.state = EngineState::Idle;
         self.trigger_generation(tx);
     }
