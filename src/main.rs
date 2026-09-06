@@ -1,0 +1,446 @@
+mod app;
+mod client;
+mod config;
+mod events;
+mod tools;
+mod ui;
+
+use app::{App, EngineState};
+use config::AppConfig;
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use events::AppEvent;
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::{self, stdout, Write};
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+fn reset_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(stdout(), crossterm::cursor::Show);
+}
+
+fn prompt_for_api_key_if_missing() -> io::Result<String> {
+    if let Some(key) = AppConfig::get_api_key() {
+        return Ok(key);
+    }
+
+    println!();
+    println!("===========================================================");
+    println!("       Gemini High-Performance Native TUI Harness          ");
+    println!("===========================================================");
+    println!("No GEMINI_API_KEY detected in environment or native OS vault.");
+    print!("Please enter your Google AI Studio Gemini API Key: ");
+    io::stdout().flush()?;
+
+    let mut input_key = String::new();
+    io::stdin().read_line(&mut input_key)?;
+    let trimmed = input_key.trim();
+
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "API key cannot be empty. Exiting.",
+        ));
+    }
+
+    if let Err(e) = AppConfig::set_api_key(trimmed) {
+        eprintln!("Warning: could not persist key to keyring: {}", e);
+    } else {
+        println!("API key securely saved to OS vault / config directory.");
+    }
+
+    println!("Starting TUI...\n");
+    std::thread::sleep(Duration::from_millis(500));
+    Ok(trimmed.to_string())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Install panic hook to ensure terminal is restored cleanly on panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        reset_terminal();
+        original_hook(panic_info);
+    }));
+
+    // 2. Check or prompt for API Key
+    let api_key = match prompt_for_api_key_if_missing() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // 3. Load App Configuration
+    let config = AppConfig::load();
+
+    // 4. Initialize Terminal in Raw Mode & Alternate Screen
+    enable_raw_mode()?;
+    let mut stdout_handle = stdout();
+    execute!(stdout_handle, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout_handle);
+    let mut terminal = Terminal::new(backend)?;
+
+    // 5. Initialize App state and channels
+    let mut app = App::new(config, api_key);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+
+    // 6. Spawn input event listener thread
+    let event_tx = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        let _ = event_tx.send(AppEvent::Key(key));
+                    }
+                    Ok(Event::Mouse(mouse)) => {
+                        let _ = event_tx.send(AppEvent::Mouse(mouse));
+                    }
+                    Ok(Event::Resize(w, h)) => {
+                        let _ = event_tx.send(AppEvent::Resize(w, h));
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    // 7. Main TUI Event Loop (60 FPS redraw decoupled from background I/O)
+    let mut render_interval = tokio::time::interval(Duration::from_millis(16)); // ~60fps
+
+    loop {
+        tokio::select! {
+            _ = render_interval.tick() => {
+                terminal.draw(|f| ui::render(&app, f))?;
+            }
+            Some(app_event) = rx.recv() => {
+                match app_event {
+                    AppEvent::Key(key) => {
+                        if key.kind == crossterm::event::KeyEventKind::Press {
+                            handle_key_event(&mut app, key, tx.clone());
+                        }
+                    }
+                    AppEvent::Mouse(mouse) => {
+                        match mouse.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                if app.state == EngineState::AwaitingHitlApproval {
+                                    app.modal_scroll = app.modal_scroll.saturating_sub(3);
+                                } else if app.show_models_modal {
+                                    app.models_scroll = app.models_scroll.saturating_sub(3);
+                                } else {
+                                    app.chat_scroll = app.chat_scroll.saturating_add(3);
+                                }
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                if app.state == EngineState::AwaitingHitlApproval {
+                                    app.modal_scroll = app.modal_scroll.saturating_add(3);
+                                } else if app.show_models_modal {
+                                    app.models_scroll = app.models_scroll.saturating_add(3);
+                                } else {
+                                    app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    AppEvent::Resize(_, _) => {}
+                    AppEvent::Stream { epoch, signal } => {
+                        app.handle_stream_signal(epoch, signal, tx.clone());
+                    }
+                    AppEvent::ToolExecutionResult { tool_name, call_id, result } => {
+                        app.handle_tool_result(tool_name, call_id, result, tx.clone());
+                    }
+                    AppEvent::SystemNotification(msg) => {
+                        app.add_message("system", msg);
+                    }
+                    AppEvent::ModelsFetched(res) => {
+                        match res {
+                            Ok(models) => {
+                                app.available_models = models;
+                                app.show_models_modal = true;
+                                app.models_scroll = 0;
+                                app.set_status("Fetched live models list.");
+                            }
+                            Err(e) => {
+                                app.add_message("system", format!("Failed to fetch models: {}", e));
+                            }
+                        }
+                    }
+                    AppEvent::CompactionFinished(res) => {
+                        app.handle_compaction_result(res);
+                    }
+                }
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    // 8. Clean terminal restoration
+    reset_terminal();
+    Ok(())
+}
+
+fn handle_key_event(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    // Global interrupt: Ctrl+C always exits cleanly
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
+        return;
+    }
+
+    // 1. When Live Models Modal is active
+    if app.show_models_modal {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.show_models_modal = false;
+            }
+            KeyCode::Up => {
+                app.models_scroll = app.models_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.models_scroll = app.models_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.models_scroll = app.models_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.models_scroll = app.models_scroll.saturating_add(10);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // 2. When HITL Modal is active: gatekeeper authorization mode
+    if app.state == EngineState::AwaitingHitlApproval {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.approve_pending_tool(false, tx);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.approve_pending_tool(true, tx);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.deny_pending_tool(tx);
+            }
+            KeyCode::Up => {
+                app.modal_scroll = app.modal_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.modal_scroll = app.modal_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.modal_scroll = app.modal_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.modal_scroll = app.modal_scroll.saturating_add(10);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // 3. When streaming: Esc cancels generation on the fly
+    if app.state == EngineState::Streaming {
+        if key.code == KeyCode::Esc {
+            app.cancel_generation();
+            return;
+        }
+    }
+
+    // Modifiers-based chat scroll
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Up => {
+                app.chat_scroll = app.chat_scroll.saturating_add(3);
+                return;
+            }
+            KeyCode::Down => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Up => {
+                app.chat_scroll = app.chat_scroll.saturating_add(6);
+                return;
+            }
+            KeyCode::Down => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(6);
+                return;
+            }
+            KeyCode::Char('u') => {
+                app.chat_scroll = app.chat_scroll.saturating_add(12);
+                return;
+            }
+            KeyCode::Char('d') => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(12);
+                return;
+            }
+            KeyCode::Char('y') => {
+                app.copy_last_response();
+                return;
+            }
+            // Command history navigation via standard Ctrl+P / Ctrl+N
+            KeyCode::Char('p') => {
+                if !app.input_history.is_empty() {
+                    let next_idx = match app.input_history_idx {
+                        None => app.input_history.len().saturating_sub(1),
+                        Some(i) => i.saturating_sub(1),
+                    };
+                    app.input_history_idx = Some(next_idx);
+                    if let Some(cmd) = app.input_history.get(next_idx) {
+                        app.input_buffer = cmd.clone();
+                        app.input_cursor = app.input_buffer.len();
+                    }
+                }
+                return;
+            }
+            KeyCode::Char('n') => {
+                if let Some(i) = app.input_history_idx {
+                    if i + 1 < app.input_history.len() {
+                        let next_idx = i + 1;
+                        app.input_history_idx = Some(next_idx);
+                        if let Some(cmd) = app.input_history.get(next_idx) {
+                            app.input_buffer = cmd.clone();
+                            app.input_cursor = app.input_buffer.len();
+                        }
+                    } else {
+                        app.input_history_idx = None;
+                        app.input_buffer.clear();
+                        app.input_cursor = 0;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // 4. Normal Prompt and Viewport navigation
+    match key.code {
+        KeyCode::Enter => {
+            app.handle_enter(tx);
+        }
+        KeyCode::Esc => {
+            if app.chat_scroll > 0 {
+                app.chat_scroll = 0; // Jump to bottom
+            } else if !app.input_buffer.is_empty() {
+                app.input_buffer.clear();
+                app.input_cursor = 0;
+                app.input_history_idx = None;
+            }
+        }
+        KeyCode::Tab => {
+            if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
+                let commands = [
+                    "/help", "/models", "/model", "/compact",
+                    "/thinking", "/temp", "/sys", "/key", "/copy",
+                    "/clear", "/save", "/quit",
+                ];
+                let prefix = app.input_buffer.to_lowercase();
+                if let Some(matched) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
+                    app.input_buffer = format!("{} ", matched);
+                    app.input_cursor = app.input_buffer.len();
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            app.input_buffer.insert(app.input_cursor, c);
+            app.input_cursor += 1;
+        }
+        KeyCode::Backspace => {
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                app.input_buffer.remove(app.input_cursor);
+            }
+        }
+        KeyCode::Delete => {
+            if app.input_cursor < app.input_buffer.len() {
+                app.input_buffer.remove(app.input_cursor);
+            }
+        }
+        KeyCode::Left => {
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+            }
+        }
+        KeyCode::Right => {
+            if app.input_cursor < app.input_buffer.len() {
+                app.input_cursor += 1;
+            }
+        }
+        KeyCode::Home => {
+            app.input_cursor = 0;
+        }
+        KeyCode::End => {
+            app.input_cursor = app.input_buffer.len();
+        }
+        // Dedicated Viewport scroll keys
+        KeyCode::PageUp => {
+            app.chat_scroll = app.chat_scroll.saturating_add(8);
+        }
+        KeyCode::PageDown => {
+            app.chat_scroll = app.chat_scroll.saturating_sub(8);
+        }
+        // Up arrow:
+        // - If viewing earlier messages in chat (chat_scroll > 0): scroll further up
+        // - If at bottom with empty input buffer (or mouse wheel translated by terminal): scroll chat up!
+        // - If at bottom with existing input text or history index active: navigate command history
+        KeyCode::Up => {
+            if app.chat_scroll > 0 || (app.input_buffer.is_empty() && app.input_history_idx.is_none()) {
+                app.chat_scroll = app.chat_scroll.saturating_add(3);
+            } else if !app.input_history.is_empty() {
+                let next_idx = match app.input_history_idx {
+                    None => app.input_history.len().saturating_sub(1),
+                    Some(i) => i.saturating_sub(1),
+                };
+                app.input_history_idx = Some(next_idx);
+                if let Some(cmd) = app.input_history.get(next_idx) {
+                    app.input_buffer = cmd.clone();
+                    app.input_cursor = app.input_buffer.len();
+                }
+            }
+        }
+        // Down arrow:
+        // - If viewing earlier messages in chat (chat_scroll > 0): scroll back towards bottom
+        // - If at bottom with history index active: navigate history forward
+        KeyCode::Down => {
+            if app.chat_scroll > 0 {
+                app.chat_scroll = app.chat_scroll.saturating_sub(3);
+            } else if let Some(i) = app.input_history_idx {
+                if i + 1 < app.input_history.len() {
+                    let next_idx = i + 1;
+                    app.input_history_idx = Some(next_idx);
+                    if let Some(cmd) = app.input_history.get(next_idx) {
+                        app.input_buffer = cmd.clone();
+                        app.input_cursor = app.input_buffer.len();
+                    }
+                } else {
+                    app.input_history_idx = None;
+                    app.input_buffer.clear();
+                    app.input_cursor = 0;
+                }
+            }
+        }
+        _ => {}
+    }
+}

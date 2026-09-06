@@ -1,0 +1,792 @@
+use crate::client::types::{Content, GenerationConfig, Part, SafetySetting, ThinkingConfig};
+use crate::client::GeminiClient;
+use crate::config::AppConfig;
+use crate::events::{AppEvent, StreamSignal};
+use crate::tools::{ToolPreview, ToolRegistry};
+use serde_json::json;
+use std::collections::HashSet;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineState {
+    Idle,
+    Streaming,
+    AwaitingHitlApproval,
+    ExecutingTool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String, // "user", "model", "thought", "tool", "system"
+    pub content: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingToolCall {
+    pub call_id: Option<String>,
+    pub tool_name: String,
+    pub args: serde_json::Value,
+    pub preview: ToolPreview,
+}
+
+pub struct App {
+    pub config: AppConfig,
+    pub client: GeminiClient,
+    pub tool_registry: ToolRegistry,
+    pub state: EngineState,
+    pub messages: Vec<ChatMessage>,
+    pub chat_scroll: usize,
+    pub input_buffer: String,
+    pub input_cursor: usize,
+    pub input_history: Vec<String>,
+    pub input_history_idx: Option<usize>,
+
+    // Active token metrics
+    pub prompt_tokens: u32,
+    pub candidates_tokens: u32,
+    pub total_tokens: u32,
+
+    // Streaming state
+    pub active_stream_task: Option<JoinHandle<()>>,
+    pub current_thought_buffer: String,
+    pub current_response_buffer: String,
+
+    // HITL Modal State
+    pub pending_tool_call: Option<PendingToolCall>,
+    pub session_allowed_tools: HashSet<String>,
+    pub modal_scroll: usize,
+
+    // Models list cached
+    pub available_models: Vec<crate::client::types::ModelInfo>,
+    pub show_models_modal: bool,
+    pub models_scroll: usize,
+
+    // Metrics & Performance
+    pub stream_epoch: u64,
+    pub stream_start_time: Option<std::time::Instant>,
+    pub candidate_chunks_count: u32,
+    pub current_tps: f64,
+
+    // Status bar notification
+    pub status_message: Option<String>,
+    pub should_quit: bool,
+}
+
+impl App {
+    pub fn new(config: AppConfig, api_key: String) -> Self {
+        let client = GeminiClient::new(api_key);
+        let tool_registry = ToolRegistry::new();
+
+        Self {
+            config,
+            client,
+            tool_registry,
+            state: EngineState::Idle,
+            messages: Vec::new(),
+            chat_scroll: 0,
+            input_buffer: String::new(),
+            input_cursor: 0,
+            input_history: Vec::new(),
+            input_history_idx: None,
+            prompt_tokens: 0,
+            candidates_tokens: 0,
+            total_tokens: 0,
+            active_stream_task: None,
+            current_thought_buffer: String::new(),
+            current_response_buffer: String::new(),
+            pending_tool_call: None,
+            session_allowed_tools: HashSet::new(),
+            modal_scroll: 0,
+            available_models: Vec::new(),
+            show_models_modal: false,
+            models_scroll: 0,
+            stream_epoch: 0,
+            stream_start_time: None,
+            candidate_chunks_count: 0,
+            current_tps: 0.0,
+            status_message: Some("Ready".to_string()),
+            should_quit: false,
+        }
+    }
+
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+    }
+
+    pub fn add_message(&mut self, role: &str, content: impl Into<String>) {
+        let now = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.messages.push(ChatMessage {
+            role: role.to_string(),
+            content: content.into(),
+            timestamp: now,
+        });
+        self.chat_scroll = 0; // Stick to bottom
+    }
+
+    pub fn handle_enter(&mut self, tx: UnboundedSender<AppEvent>) {
+        if self.state != EngineState::Idle {
+            self.set_status("Engine busy. Press Esc to cancel active stream.");
+            return;
+        }
+
+        let text = self.input_buffer.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        self.input_history.push(text.clone());
+        self.input_history_idx = None;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+
+        if text.starts_with('/') {
+            self.handle_slash_command(&text, tx);
+            return;
+        }
+
+        self.add_message("user", text);
+        self.trigger_generation(tx);
+    }
+
+    pub fn handle_slash_command(&mut self, command_line: &str, tx: UnboundedSender<AppEvent>) {
+        let mut parts = command_line.splitn(2, ' ');
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let arg = parts.next().map(|s| s.trim()).unwrap_or("");
+
+        match cmd.as_str() {
+            "/help" => {
+                self.add_message("system", 
+                    "Available Commands:\n\
+                    - /compact : Summarize conversation history to reclaim context window\n\
+                    - /models : Fetch live models & pricing from Gemini API\n\
+                    - /model <name> : Switch active model (e.g. /model gemini-3.8-flash)\n\
+                    - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
+                    - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
+                    - /sys <instruction> : Update system prompt\n\
+                    - /key <api_key> : Save a new Gemini API key\n\
+                    - /copy : Copy last assistant response to system clipboard (or Ctrl+Y)\n\
+                    - /clear : Clear conversation history\n\
+                    - /save : Save config to disk\n\
+                    - /quit : Exit application"
+                );
+            }
+            "/compact" => {
+                self.compact_history(tx);
+            }
+            "/models" => {
+                self.add_message("system", "Fetching dynamic model list & pricing from Google AI Studio...");
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let res = client.list_models().await;
+                    let _ = tx.send(AppEvent::ModelsFetched(res));
+                });
+            }
+            "/model" => {
+                if arg.is_empty() {
+                    self.add_message("system", format!("Current model: {}", self.config.model));
+                } else {
+                    self.config.model = arg.to_string();
+                    self.set_status(format!("Model set to: {}", self.config.model));
+                    self.add_message("system", format!("Active model switched to: {}", self.config.model));
+                }
+            }
+            "/thinking" => {
+                if let Ok(b) = arg.parse::<i32>() {
+                    self.config.thinking_budget = b;
+                    self.set_status(format!("Thinking budget set to: {}", b));
+                    self.add_message("system", format!("Thinking budget set to: {} tokens", b));
+                } else {
+                    self.add_message("system", format!("Current thinking budget: {} tokens. Use /thinking <int>", self.config.thinking_budget));
+                }
+            }
+            "/temp" => {
+                if let Ok(t) = arg.parse::<f32>() {
+                    self.config.temperature = t.clamp(0.0, 2.0);
+                    self.set_status(format!("Temperature set to: {:.2}", self.config.temperature));
+                    self.add_message("system", format!("Temperature set to: {:.2}", self.config.temperature));
+                } else {
+                    self.add_message("system", format!("Current temperature: {:.2}. Use /temp <float>", self.config.temperature));
+                }
+            }
+            "/sys" => {
+                if arg.is_empty() {
+                    self.add_message("system", format!("Current system prompt:\n{}", self.config.system_instruction));
+                } else {
+                    self.config.system_instruction = arg.to_string();
+                    self.set_status("System instruction updated");
+                    self.add_message("system", "System instruction updated.");
+                }
+            }
+            "/key" => {
+                if arg.is_empty() {
+                    self.add_message("system", "Usage: /key <your_gemini_api_key>");
+                } else {
+                    match AppConfig::set_api_key(arg) {
+                        Ok(()) => {
+                            self.client.update_api_key(arg.to_string());
+                            self.set_status("API key updated successfully");
+                            self.add_message("system", "Gemini API key updated and stored securely.");
+                        }
+                        Err(e) => {
+                            self.add_message("system", format!("Failed to store key: {}", e));
+                        }
+                    }
+                }
+            }
+            "/clear" => {
+                self.messages.clear();
+                self.chat_scroll = 0;
+                self.prompt_tokens = 0;
+                self.candidates_tokens = 0;
+                self.total_tokens = 0;
+                self.set_status("Session cleared");
+                self.add_message("system", "Conversation history cleared.");
+            }
+            "/save" => {
+                match self.config.save() {
+                    Ok(()) => {
+                        self.set_status("Configuration saved");
+                        self.add_message("system", "Configuration saved to disk.");
+                    }
+                    Err(e) => {
+                        self.add_message("system", format!("Error saving configuration: {}", e));
+                    }
+                }
+            }
+            "/copy" => {
+                self.copy_last_response();
+            }
+            "/quit" => {
+                self.should_quit = true;
+            }
+            _ => {
+                self.add_message("system", format!("Unknown command: '{}'. Type /help for assistance.", cmd));
+            }
+        }
+    }
+
+    pub fn copy_last_response(&mut self) {
+        // Find last assistant message
+        let last_model_msg = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "model")
+            .map(|m| m.content.clone());
+
+        match last_model_msg {
+            Some(text) => {
+                let char_len = text.len();
+                tokio::spawn(async move {
+                    #[cfg(windows)]
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        use tokio::process::Command;
+                        use std::process::Stdio;
+
+                        if let Ok(mut child) = Command::new("clip")
+                            .stdin(Stdio::piped())
+                            .spawn()
+                        {
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(text.as_bytes()).await;
+                            }
+                            let _ = child.wait().await;
+                        }
+                    }
+
+                    #[cfg(not(windows))]
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        use tokio::process::Command;
+                        use std::process::Stdio;
+
+                        if let Ok(mut child) = Command::new("xclip")
+                            .arg("-selection")
+                            .arg("clipboard")
+                            .stdin(Stdio::piped())
+                            .spawn()
+                        {
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(text.as_bytes()).await;
+                            }
+                            let _ = child.wait().await;
+                        }
+                    }
+                });
+
+                self.set_status("Copied response to clipboard");
+                self.add_message("system", format!("Copied last assistant response ({} chars) to system clipboard.", char_len));
+            }
+            None => {
+                self.add_message("system", "No assistant response found to copy.");
+            }
+        }
+    }
+
+    pub fn trigger_generation(&mut self, tx: UnboundedSender<AppEvent>) {
+        if self.state != EngineState::Idle {
+            return;
+        }
+
+        self.stream_epoch += 1;
+        let epoch = self.stream_epoch;
+
+        if let Some(handle) = self.active_stream_task.take() {
+            handle.abort();
+        }
+
+        self.state = EngineState::Streaming;
+        self.set_status(format!("Streaming ({})", self.config.model));
+        self.current_thought_buffer.clear();
+        self.current_response_buffer.clear();
+        self.stream_start_time = Some(std::time::Instant::now());
+        self.candidate_chunks_count = 0;
+        self.current_tps = 0.0;
+
+        let client = self.client.clone();
+        let model = self.config.model.clone();
+        let fallback_models = self.config.fallback_models.clone();
+        let max_retries = self.config.max_retries;
+        let request = self.build_request();
+
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<StreamSignal>();
+
+        let stream_handle = tokio::spawn(async move {
+            client.stream_generate_content(&model, &fallback_models, max_retries, &request, stream_tx).await;
+        });
+
+        self.active_stream_task = Some(stream_handle);
+
+        let app_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(sig) = stream_rx.recv().await {
+                let _ = app_tx.send(AppEvent::Stream { epoch, signal: sig });
+            }
+        });
+    }
+
+    pub fn cancel_generation(&mut self) {
+        if let Some(handle) = self.active_stream_task.take() {
+            handle.abort();
+        }
+
+        if !self.current_thought_buffer.is_empty() {
+            let thought = std::mem::take(&mut self.current_thought_buffer);
+            self.add_message("thought", thought);
+        }
+
+        if !self.current_response_buffer.is_empty() {
+            let resp = std::mem::take(&mut self.current_response_buffer);
+            self.add_message("model", resp);
+        }
+
+        self.state = EngineState::Idle;
+        self.stream_start_time = None;
+        self.set_status("Generation stopped");
+    }
+
+    pub fn handle_stream_signal(&mut self, epoch: u64, sig: StreamSignal, tx: UnboundedSender<AppEvent>) {
+        if epoch != self.stream_epoch {
+            return;
+        }
+
+        match sig {
+            StreamSignal::ThoughtDelta(chunk) => {
+                self.current_thought_buffer.push_str(&chunk);
+            }
+            StreamSignal::TextDelta(chunk) => {
+                self.current_response_buffer.push_str(&chunk);
+                self.candidate_chunks_count += 1;
+                if let Some(start) = self.stream_start_time {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if elapsed > 0.1 && self.candidates_tokens > 0 {
+                        self.current_tps = self.candidates_tokens as f64 / elapsed;
+                    }
+                }
+            }
+            StreamSignal::ToolCall { id, name, args } => {
+                // If model produced any thought prior to tool call, record it
+                if !self.current_thought_buffer.is_empty() {
+                    let thought = std::mem::take(&mut self.current_thought_buffer);
+                    self.add_message("thought", thought);
+                }
+
+                // If model produced any response text prior to tool call, flush it into messages
+                if !self.current_response_buffer.is_empty() {
+                    let resp = std::mem::take(&mut self.current_response_buffer);
+                    self.add_message("model", resp);
+                }
+
+                // Record model's functionCall part in conversation history for turn alternation
+                let fc_part = Part::FunctionCall {
+                    function_call: crate::client::types::FunctionCallPayload {
+                        name: name.clone(),
+                        args: args.clone(),
+                        id: id.clone(),
+                    },
+                };
+                self.messages.push(ChatMessage {
+                    role: "model_tool_call".to_string(),
+                    content: serde_json::to_string(&fc_part).unwrap_or_default(),
+                    timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                });
+
+                if let Some(tool) = self.tool_registry.get(&name) {
+                    let preview = tool.generate_preview(&args);
+
+                    if self.session_allowed_tools.contains(&name) {
+                        self.execute_tool(name, id, args, tx);
+                    } else {
+                        // Pause and trigger HITL modal
+                        self.state = EngineState::AwaitingHitlApproval;
+                        self.set_status(format!("HITL Gate: Approval needed for '{}'", name));
+                        self.modal_scroll = 0;
+                        self.pending_tool_call = Some(PendingToolCall {
+                            call_id: id,
+                            tool_name: name,
+                            args,
+                            preview,
+                        });
+                    }
+                } else {
+                    self.add_message("system", format!("Warning: Model attempted to call unknown tool '{}'", name));
+                }
+            }
+            StreamSignal::Usage { prompt_tokens, candidates_tokens, total_tokens } => {
+                self.prompt_tokens = prompt_tokens;
+                self.candidates_tokens = candidates_tokens;
+                self.total_tokens = total_tokens;
+
+                if let Some(start) = self.stream_start_time {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if elapsed > 0.05 {
+                        self.current_tps = self.candidates_tokens as f64 / elapsed;
+                    }
+                }
+            }
+            StreamSignal::Finished { finish_reason } => {
+                if !self.current_thought_buffer.is_empty() {
+                    let thought = std::mem::take(&mut self.current_thought_buffer);
+                    self.add_message("thought", thought);
+                }
+
+                if !self.current_response_buffer.is_empty() {
+                    let resp = std::mem::take(&mut self.current_response_buffer);
+                    self.add_message("model", resp);
+                }
+
+                if self.state == EngineState::Streaming {
+                    self.state = EngineState::Idle;
+                    let reason = finish_reason.unwrap_or_else(|| "STOP".to_string());
+                    self.set_status(format!("Done ({})", reason));
+                }
+                self.stream_start_time = None;
+            }
+            StreamSignal::Notice(message) => {
+                self.set_status(&message);
+                self.add_message("system", message);
+            }
+            StreamSignal::Error(err) => {
+                self.add_message("system", format!("Error: {}", err));
+                self.state = EngineState::Idle;
+                self.set_status("Stream ended with error.");
+            }
+        }
+    }
+
+    pub fn approve_pending_tool(&mut self, whitelist_for_session: bool, tx: UnboundedSender<AppEvent>) {
+        if let Some(pending) = self.pending_tool_call.take() {
+            if whitelist_for_session {
+                self.session_allowed_tools.insert(pending.tool_name.clone());
+            }
+            self.execute_tool(pending.tool_name, pending.call_id, pending.args, tx);
+        }
+    }
+
+    pub fn deny_pending_tool(&mut self, tx: UnboundedSender<AppEvent>) {
+        if let Some(pending) = self.pending_tool_call.take() {
+            let rejection_result = "Execution rejected by user.".to_string();
+            self.add_message("system", format!("Denied execution of tool '{}'", pending.tool_name));
+            
+            // Send denial back into tool result pipeline so Gemini can adjust
+            let app_tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = app_tx.send(AppEvent::ToolExecutionResult {
+                    tool_name: pending.tool_name,
+                    call_id: pending.call_id,
+                    result: Err(rejection_result),
+                });
+            });
+            self.state = EngineState::ExecutingTool;
+        }
+    }
+
+    pub fn execute_tool(
+        &mut self,
+        tool_name: String,
+        call_id: Option<String>,
+        args: serde_json::Value,
+        tx: UnboundedSender<AppEvent>,
+    ) {
+        self.state = EngineState::ExecutingTool;
+        self.set_status(format!("Executing tool '{}'...", tool_name));
+
+        if let Some(tool) = self.tool_registry.get(&tool_name) {
+            let app_tx = tx.clone();
+            let t_name = tool_name.clone();
+            let c_id = call_id.clone();
+
+            tokio::spawn(async move {
+                let res = tool.execute(args).await;
+                let _ = app_tx.send(AppEvent::ToolExecutionResult {
+                    tool_name: t_name,
+                    call_id: c_id,
+                    result: res,
+                });
+            });
+        }
+    }
+
+    pub fn handle_tool_result(
+        &mut self,
+        tool_name: String,
+        call_id: Option<String>,
+        result: Result<String, String>,
+        tx: UnboundedSender<AppEvent>,
+    ) {
+        let (output_str, is_err) = match result {
+            Ok(output) => (output, false),
+            Err(e) => (format!("Error: {}", e), true),
+        };
+
+        // Add tool interaction to chat view
+        let preview_snippet = if output_str.len() > 200 {
+            format!("{}...\n(Total {} chars)", &output_str[..200], output_str.len())
+        } else {
+            output_str.clone()
+        };
+
+        self.add_message(
+            "tool",
+            format!("[Tool Output: {}]\n{}", tool_name, preview_snippet),
+        );
+
+        // Append assistant tool_call & user tool_response to internal conversation history
+        let response_payload = if is_err {
+            json!({ "error": output_str })
+        } else {
+            json!({ "output": output_str })
+        };
+
+        let response_part = Part::FunctionResponse {
+            function_response: crate::client::types::FunctionResponsePayload {
+                name: tool_name.clone(),
+                response: response_payload,
+                id: call_id,
+            },
+        };
+
+        // Save into message stream as a synthesized user/function turn
+        self.messages.push(ChatMessage {
+            role: "function".to_string(),
+            content: serde_json::to_string(&response_part).unwrap_or_default(),
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+        });
+
+        // Resume generation so model can synthesize answer from tool result
+        self.state = EngineState::Idle;
+        self.trigger_generation(tx);
+    }
+
+    fn build_request(&self) -> crate::client::types::GenerateContentRequest {
+        let mut contents: Vec<crate::client::types::Content> = Vec::new();
+
+        for m in &self.messages {
+            if m.role == "thought" || m.role == "system" || m.role == "tool" {
+                continue;
+            }
+
+            if m.role == "model_tool_call" {
+                if let Ok(part) = serde_json::from_str::<Part>(&m.content) {
+                    if let Some(last) = contents.last_mut() {
+                        if last.role.as_deref() == Some("model") {
+                            last.parts.push(part);
+                            continue;
+                        }
+                    }
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![part],
+                    });
+                }
+            } else if m.role == "function" {
+                if let Ok(part) = serde_json::from_str::<Part>(&m.content) {
+                    if let Some(last) = contents.last_mut() {
+                        if last.role.as_deref() == Some("user") && last.parts.iter().any(|p| matches!(p, Part::FunctionResponse { .. })) {
+                            last.parts.push(part);
+                            continue;
+                        }
+                    }
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: vec![part],
+                    });
+                }
+            } else if m.role == "user" {
+                contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part::Text {
+                        text: m.content.clone(),
+                        thought: None,
+                    }],
+                });
+            } else if m.role == "model" {
+                contents.push(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![Part::Text {
+                        text: m.content.clone(),
+                        thought: None,
+                    }],
+                });
+            }
+        }
+
+        // Thinking Config
+        let thinking_config = if self.config.thinking_budget > 0 {
+            Some(ThinkingConfig {
+                thinking_budget: self.config.thinking_budget,
+            })
+        } else {
+            None
+        };
+
+        // Safety Settings: BLOCK_NONE
+        let safety_settings = vec![
+            SafetySetting {
+                category: "HARM_CATEGORY_HARASSMENT".to_string(),
+                threshold: "BLOCK_NONE".to_string(),
+            },
+            SafetySetting {
+                category: "HARM_CATEGORY_HATE_SPEECH".to_string(),
+                threshold: "BLOCK_NONE".to_string(),
+            },
+            SafetySetting {
+                category: "HARM_CATEGORY_SEXUALLY_EXPLICIT".to_string(),
+                threshold: "BLOCK_NONE".to_string(),
+            },
+            SafetySetting {
+                category: "HARM_CATEGORY_DANGEROUS_CONTENT".to_string(),
+                threshold: "BLOCK_NONE".to_string(),
+            },
+        ];
+
+        let tools = self.tool_registry.to_gemini_declarations();
+
+        crate::client::types::GenerateContentRequest {
+            contents,
+            system_instruction: Some(Content {
+                role: Some("system".to_string()),
+                parts: vec![Part::Text {
+                    text: self.config.system_instruction.clone(),
+                    thought: None,
+                }],
+            }),
+            generation_config: Some(GenerationConfig {
+                temperature: Some(self.config.temperature),
+                max_output_tokens: Some(8192),
+                thinking_config,
+            }),
+            safety_settings: Some(safety_settings),
+            tools: Some(tools),
+        }
+    }
+
+    pub fn compact_history(&mut self, tx: UnboundedSender<AppEvent>) {
+        let count = self.messages.len();
+        if count <= 2 {
+            self.add_message("system", "History is already minimal; compaction unnecessary.");
+            return;
+        }
+
+        self.set_status("Compacting conversation history...");
+        self.add_message("system", format!("Compacting {} turns into a concise context summary...", count));
+
+        let mut transcript = String::new();
+        for m in &self.messages {
+            if m.role == "thought" {
+                continue;
+            }
+            transcript.push_str(&format!("{}: {}\n\n", m.role, m.content));
+        }
+
+        let prompt = format!(
+            "Analyze and summarize the following multi-turn coding and development conversation into a concise, high-density structured summary.\n\
+            Preserve all key decisions, file paths modified or discussed, tool outputs, technical facts, and remaining user requests or tasks.\n\n\
+            CONVERSATION TRANSCRIPT:\n{}",
+            transcript
+        );
+
+        let request = crate::client::types::GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("user".to_string()),
+                parts: vec![Part::Text {
+                    text: prompt,
+                    thought: None,
+                }],
+            }],
+            system_instruction: Some(Content {
+                role: Some("system".to_string()),
+                parts: vec![Part::Text {
+                    text: "You are a precise technical summarizer for developer conversations. Retain essential context and code artifacts.".to_string(),
+                    thought: None,
+                }],
+            }),
+            generation_config: Some(GenerationConfig {
+                temperature: Some(0.2),
+                max_output_tokens: Some(2048),
+                thinking_config: None,
+            }),
+            safety_settings: None,
+            tools: None,
+        };
+
+        let client = self.client.clone();
+        let model = self.config.model.clone();
+
+        tokio::spawn(async move {
+            let res = client.generate_content(&model, &request).await;
+            let _ = tx.send(AppEvent::CompactionFinished(res));
+        });
+    }
+
+    pub fn handle_compaction_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(summary) => {
+                let original_count = self.messages.len();
+                self.messages.clear();
+                self.chat_scroll = 0;
+
+                // Insert compacted summary as initial system/user grounding
+                let now = chrono::Local::now().format("%H:%M:%S").to_string();
+                self.messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("Compact History Summary:\n{}", summary),
+                    timestamp: now,
+                });
+
+                self.set_status("Context compacted");
+                self.add_message(
+                    "system",
+                    format!("Successfully compacted {} messages. Context window reclaimed.", original_count),
+                );
+            }
+            Err(e) => {
+                self.set_status("Compaction failed");
+                self.add_message("system", format!("Compaction failed: {}", e));
+            }
+        }
+    }
+}

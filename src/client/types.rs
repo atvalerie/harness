@@ -1,0 +1,170 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Content {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Part {
+    FunctionResponse {
+        #[serde(rename = "functionResponse")]
+        function_response: FunctionResponsePayload,
+    },
+    FunctionCall {
+        #[serde(rename = "functionCall")]
+        function_call: FunctionCallPayload,
+    },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallPayload {
+    pub name: String,
+    pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionResponsePayload {
+    pub name: String,
+    pub response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    pub thinking_budget: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetySetting {
+    pub category: String,
+    pub threshold: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiToolDeclaration {
+    #[serde(rename = "functionDeclarations")]
+    pub function_declarations: Vec<FunctionDeclaration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDeclaration {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateContentRequest {
+    pub contents: Vec<Content>,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    pub system_instruction: Option<Content>,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    pub generation_config: Option<GenerationConfig>,
+    #[serde(rename = "safetySettings", skip_serializing_if = "Option::is_none")]
+    pub safety_settings: Option<Vec<SafetySetting>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<GeminiToolDeclaration>>,
+}
+
+// SSE Incoming Candidate types
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenerateContentResponse {
+    pub candidates: Option<Vec<Candidate>>,
+    #[serde(rename = "usageMetadata")]
+    pub usage_metadata: Option<UsageMetadata>,
+    pub error: Option<ApiError>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ApiError {
+    pub code: Option<i64>,
+    pub message: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Candidate {
+    pub content: Option<ContentPayload>,
+    #[serde(rename = "finishReason")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ContentPayload {
+    pub role: Option<String>,
+    pub parts: Option<Vec<ResponsePart>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponsePart {
+    pub text: Option<String>,
+    pub thought: Option<bool>,
+    #[serde(rename = "functionCall")]
+    pub function_call: Option<FunctionCallPayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageMetadata {
+    #[serde(rename = "promptTokenCount")]
+    pub prompt_token_count: Option<u32>,
+    #[serde(rename = "candidatesTokenCount")]
+    pub candidates_token_count: Option<u32>,
+    #[serde(rename = "totalTokenCount")]
+    pub total_token_count: Option<u32>,
+}
+
+// Models API types
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListModelsResponse {
+    pub models: Option<Vec<ModelApiEntry>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ModelApiEntry {
+    pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "inputTokenLimit")]
+    pub input_token_limit: Option<u64>,
+    #[serde(rename = "outputTokenLimit")]
+    pub output_token_limit: Option<u64>,
+    #[serde(rename = "supportedGenerationMethods")]
+    pub supported_generation_methods: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub input_price_per_m: Option<f64>,
+    pub output_price_per_m: Option<f64>,
+    pub input_token_limit: Option<u64>,
+}

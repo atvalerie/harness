@@ -1,0 +1,20 @@
+[package]
+name = "gemini-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+keyring = "3.0"
+similar = { version = "2.6", features = ["text"] }
+scraper = "0.20"
+directories = "5.0"
+async-trait = "0.1"
+chrono = "0.4"
+
