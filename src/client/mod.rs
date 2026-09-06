@@ -334,8 +334,29 @@ impl AiClient {
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() { return Err(format_api_error(Some(status.as_u16()), &body)); }
         let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Failed to deserialize models list: {}", e))?;
-        Ok(data.get("data").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|entry| entry.get("id").and_then(|v| v.as_str())).map(|id| ModelInfo { id: id.to_string(), display_name: id.to_string(), description: "OpenAI-compatible model".to_string(), input_price_per_m: None, output_price_per_m: None, input_token_limit: None }).collect())
+        Ok(data.get("data").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|entry| {
+            let id = entry.get("id").and_then(|v| v.as_str())?;
+            let description = entry.get("description").and_then(|v| v.as_str()).unwrap_or("OpenAI-compatible model").to_string();
+            let input_price_per_m = openrouter_price_per_m(entry, "prompt");
+            let output_price_per_m = openrouter_price_per_m(entry, "completion");
+            let input_token_limit = entry.get("context_length").and_then(|v| v.as_u64());
+            Some(ModelInfo {
+                id: id.to_string(),
+                display_name: entry.get("name").and_then(|v| v.as_str()).unwrap_or(id).to_string(),
+                description,
+                input_price_per_m,
+                output_price_per_m,
+                input_token_limit,
+            })
+        }).collect())
     }
+}
+
+fn openrouter_price_per_m(entry: &serde_json::Value, key: &str) -> Option<f64> {
+    entry.get("pricing")
+        .and_then(|pricing| pricing.get(key))
+        .and_then(|price| price.as_str().and_then(|value| value.parse::<f64>().ok()).or_else(|| price.as_f64()))
+        .map(|price_per_token| price_per_token * 1_000_000.0)
 }
 
 fn clean_model(model: &str) -> &str { model.strip_prefix("models/").unwrap_or(model) }
@@ -360,7 +381,8 @@ fn backoff(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::ProviderKind;
+    use super::{openrouter_price_per_m, ProviderKind};
+    use serde_json::json;
 
     #[test]
     fn parses_provider_aliases() {
@@ -368,6 +390,13 @@ mod tests {
         assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAiCompatible);
         assert_eq!(ProviderKind::parse("openai-compatible"), ProviderKind::OpenAiCompatible);
         assert_eq!(ProviderKind::parse("local"), ProviderKind::OpenAiCompatible);
+    }
+
+    #[test]
+    fn parses_openrouter_prices_per_million_tokens() {
+        let entry = json!({"pricing": {"prompt": "0.00000015", "completion": "0.0000006"}});
+        assert_eq!(openrouter_price_per_m(&entry, "prompt"), Some(0.15));
+        assert_eq!(openrouter_price_per_m(&entry, "completion"), Some(0.6));
     }
 }
 

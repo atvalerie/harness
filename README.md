@@ -23,6 +23,14 @@ Configuration is saved with `/save` under the platform config directory. A compa
       "models": ["qwen3:8b", "llama3.2:3b"],
       "fallback_models": ["llama3.2:3b"],
       "headers": { "X-Provider-Client": "gemini-harness" }
+    },
+    "openrouter": {
+      "kind": "openai-compatible",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "model": "meta/muse-spark-1.3-contributor",
+      "models": ["meta/muse-spark-1.3-contributor"],
+      "fallback_models": []
     }
   },
   "model_profiles": {
