@@ -19,7 +19,6 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, stdout, Write};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::io::AsyncBufReadExt;
 
 struct CliArgs {
     prompt: Option<String>,
@@ -68,13 +67,13 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(base_url) = cli.base_url { config.base_url = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) }; }
     let api_key = config.get_api_key_for_active_provider().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))?;
     let mut app = App::new(config, api_key);
-    let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let stdin = io::stdin();
+    let mut line = String::new();
     loop {
-        let line = tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            result = input.next_line() => result?,
-        };
-        let Some(line) = line else { break };
+        print!("> ");
+        io::stdout().flush()?;
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 { break; }
         let prompt = line.trim();
         if prompt.is_empty() { continue; }
         if prompt.eq_ignore_ascii_case("/quit") || prompt.eq_ignore_ascii_case("/exit") { break; }
