@@ -19,9 +19,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, stdout, Write};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::io::AsyncBufReadExt;
 
 struct CliArgs {
     prompt: Option<String>,
+    chat: bool,
     provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
@@ -29,14 +31,15 @@ struct CliArgs {
 
 fn parse_cli_args() -> Result<CliArgs, String> {
     let mut args = std::env::args().skip(1);
-    let mut cli = CliArgs { prompt: None, provider: None, model: None, base_url: None };
+    let mut cli = CliArgs { prompt: None, chat: false, provider: None, model: None, base_url: None };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-p" | "--prompt" => cli.prompt = Some(args.next().ok_or_else(|| "-p/--prompt requires a value".to_string())?),
+            "--chat" => cli.chat = true,
             "--provider" => cli.provider = Some(args.next().ok_or_else(|| "--provider requires a value".to_string())?),
             "--model" => cli.model = Some(args.next().ok_or_else(|| "--model requires a value".to_string())?),
             "--base-url" => cli.base_url = Some(args.next().ok_or_else(|| "--base-url requires a value".to_string())?),
-            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" [--provider gemini|openai] [--model MODEL] [--base-url URL]".to_string()),
+            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" | --chat [--provider gemini|openai] [--model MODEL] [--base-url URL]".to_string()),
             unknown => return Err(format!("Unknown argument '{}'. Use --help.", unknown)),
         }
     }
@@ -55,6 +58,33 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let request = app.build_request();
     let result = app.client.generate_content_with_fallback(&app.config.model, &app.config.effective_fallback_models(), app.config.max_retries, &request).await?;
     println!("{}", result);
+    Ok(())
+}
+
+async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = AppConfig::load();
+    if let Some(provider) = cli.provider { config.provider = provider; }
+    if let Some(model) = cli.model { config.model = model; }
+    if let Some(base_url) = cli.base_url { config.base_url = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) }; }
+    let api_key = config.get_api_key_for_active_provider().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))?;
+    let mut app = App::new(config, api_key);
+    let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = input.next_line().await? {
+        let prompt = line.trim();
+        if prompt.is_empty() { continue; }
+        if prompt.eq_ignore_ascii_case("/quit") || prompt.eq_ignore_ascii_case("/exit") { break; }
+        app.add_message("user", prompt.to_string());
+        let request = app.build_request();
+        match app.client.generate_content_with_fallback(&app.config.model, &app.config.effective_fallback_models(), app.config.max_retries, &request).await {
+            Ok(response) => {
+                println!("{}", response);
+                app.add_message("model", response);
+                let _ = app.flush_session();
+            }
+            Err(error) => eprintln!("error: {}", error),
+        }
+    }
+    let _ = app.flush_session();
     Ok(())
 }
 
@@ -107,6 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     if cli.prompt.is_some() {
         return run_headless(cli).await;
+    }
+    if cli.chat {
+        return run_chat(cli).await;
     }
     // 1. Install panic hook to ensure terminal is restored cleanly on panic
     let original_hook = std::panic::take_hook();

@@ -54,4 +54,12 @@ gemini-harness.exe -p "Summarize this" --model gemini-3.8-flash
 
 Headless mode writes only the model response to stdout; diagnostics and failures go to stderr.
 
+For a persistent text-only back-and-forth session:
+
+```text
+gemini-harness.exe --chat
+```
+
+Enter one prompt per line. Use `/exit` or `/quit` to end the session. The conversation is saved using the same turn-boundary session persistence as the TUI.
+
 Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk.
