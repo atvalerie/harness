@@ -117,6 +117,82 @@ fn open_config_file(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not open config: {}", error))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{App, ChatMessage};
+    use crate::client::types::{FunctionCallPayload, FunctionResponsePayload, Part};
+    use crate::config::AppConfig;
+    use serde_json::json;
+
+    fn message(role: &str, part: Part) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: serde_json::to_string(&part).unwrap(),
+            timestamp: String::new(),
+        }
+    }
+
+    #[test]
+    fn drops_orphaned_openai_tool_calls_but_keeps_completed_calls() {
+        let mut config = AppConfig::default();
+        config.providers.get_mut("gemini").unwrap().kind = "openai-compatible".to_string();
+        let mut app = App::new(config, "test-key".to_string());
+        app.messages = vec![
+            message(
+                "model_tool_call",
+                Part::FunctionCall {
+                    function_call: FunctionCallPayload {
+                        name: "read_file".to_string(),
+                        args: json!({"path": "orphan.rs"}),
+                        id: Some("call-orphan".to_string()),
+                    },
+                    thought_signature: None,
+                },
+            ),
+            ChatMessage {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                timestamp: String::new(),
+            },
+        ];
+        let request = app.build_request();
+        assert!(request.contents.iter().all(|content| {
+            content
+                .parts
+                .iter()
+                .all(|part| !matches!(part, Part::FunctionCall { .. }))
+        }));
+
+        app.messages.push(message(
+            "model_tool_call",
+            Part::FunctionCall {
+                function_call: FunctionCallPayload {
+                    name: "read_file".to_string(),
+                    args: json!({"path": "done.rs"}),
+                    id: Some("call-done".to_string()),
+                },
+                thought_signature: None,
+            },
+        ));
+        app.messages.push(message(
+            "function",
+            Part::FunctionResponse {
+                function_response: FunctionResponsePayload {
+                    name: "read_file".to_string(),
+                    response: json!({"output": "ok"}),
+                    id: Some("call-done".to_string()),
+                },
+            },
+        ));
+        let request = app.build_request();
+        assert!(request.contents.iter().any(|content| {
+            content.parts.iter().any(|part| {
+                matches!(part, Part::FunctionCall { function_call, .. } if function_call.id.as_deref() == Some("call-done"))
+            })
+        }));
+    }
+}
+
 impl App {
     pub fn new(config: AppConfig, api_key: String) -> Self {
         let client = AiClient::from_config(api_key.clone(), &config);
@@ -1264,6 +1340,26 @@ impl App {
 
     pub fn build_request(&self) -> crate::client::types::GenerateContentRequest {
         let mut contents: Vec<crate::client::types::Content> = Vec::new();
+        // A process/API failure can leave a persisted assistant tool call
+        // without its matching output. OpenAI Responses rejects the entire
+        // next request in that situation ("No tool output found ..."). Only
+        // replay calls that have a recorded response; this lets a resumed
+        // session recover instead of replaying the same orphan forever.
+        let completed_tool_call_ids: HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "function")
+            .filter_map(|message| serde_json::from_str::<Part>(&message.content).ok())
+            .filter_map(|part| match part {
+                Part::FunctionResponse { function_response } => function_response.id,
+                _ => None,
+            })
+            .collect();
+        let filter_orphaned_calls = self
+            .config
+            .active_provider_config()
+            .kind
+            .eq_ignore_ascii_case("openai-compatible");
 
         for m in &self.messages {
             if m.role == "thought" || m.role == "system" || m.role == "tool" {
@@ -1272,6 +1368,17 @@ impl App {
 
             if m.role == "model_tool_call" {
                 if let Ok(part) = serde_json::from_str::<Part>(&m.content) {
+                    if filter_orphaned_calls {
+                        if let Part::FunctionCall { function_call, .. } = &part {
+                            if function_call
+                                .id
+                                .as_ref()
+                                .is_some_and(|id| !completed_tool_call_ids.contains(id))
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(last) = contents.last_mut() {
                         if last.role.as_deref() == Some("model") {
                             last.parts.push(part);
