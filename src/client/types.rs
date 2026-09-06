@@ -55,6 +55,10 @@ pub struct GenerationConfig {
     pub max_output_tokens: Option<u32>,
     #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<ThinkingConfig>,
+    #[serde(skip)]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip)]
+    pub extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

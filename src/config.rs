@@ -3,9 +3,33 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::collections::BTreeMap;
 
 const KEYRING_SERVICE: &str = "gemini-harness";
 const KEYRING_USER: &str = "api_key";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    #[serde(default = "default_provider")]
+    pub kind: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub temperature: Option<f32>,
+    pub thinking_budget: Option<i32>,
+    pub reasoning_enabled: Option<bool>,
+    pub reasoning_effort: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -21,6 +45,14 @@ pub struct AppConfig {
     pub thinking_budget: i32,
     pub temperature: f32,
     pub system_instruction: String,
+    #[serde(default = "default_provider_configs")]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub model_profiles: BTreeMap<String, ModelProfile>,
+    #[serde(default = "default_auto_compact")]
+    pub auto_compact: bool,
+    #[serde(default = "default_auto_compact_threshold")]
+    pub auto_compact_threshold_tokens: u64,
 }
 
 impl Default for AppConfig {
@@ -44,6 +76,10 @@ Operational Guidelines:\n\
 1. Proactively use `web_search` and `web_fetch` whenever you need up-to-date documentation or external facts.\n\
 2. Prioritize reading relevant files before modifying them.\n\
 3. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.".to_string(),
+            providers: default_provider_configs(),
+            model_profiles: BTreeMap::new(),
+            auto_compact: default_auto_compact(),
+            auto_compact_threshold_tokens: default_auto_compact_threshold(),
         }
     }
 }
@@ -55,8 +91,47 @@ fn default_fallback_models() -> Vec<String> {
 }
 
 fn default_max_retries() -> u32 { 3 }
+fn default_auto_compact() -> bool { true }
+fn default_auto_compact_threshold() -> u64 { 100_000 }
+
+fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
+    let mut providers = BTreeMap::new();
+    providers.insert("gemini".to_string(), ProviderConfig {
+        kind: "gemini".to_string(),
+        base_url: None,
+        fallback_models: default_fallback_models(),
+        api_key_env: Some("GEMINI_API_KEY".to_string()),
+    });
+    providers.insert("openai".to_string(), ProviderConfig {
+        kind: "openai-compatible".to_string(),
+        base_url: None,
+        fallback_models: Vec::new(),
+        api_key_env: Some("OPENAI_API_KEY".to_string()),
+    });
+    providers
+}
 
 impl AppConfig {
+    pub fn active_provider_config(&self) -> ProviderConfig {
+        self.providers.get(&self.provider).cloned().unwrap_or_else(|| ProviderConfig {
+            kind: self.provider.clone(),
+            base_url: self.base_url.clone(),
+            fallback_models: self.fallback_models.clone(),
+            api_key_env: None,
+        })
+    }
+
+    pub fn effective_fallback_models(&self) -> Vec<String> {
+        let profile = self.active_provider_config();
+        if profile.fallback_models.is_empty() { self.fallback_models.clone() } else { profile.fallback_models }
+    }
+
+    pub fn model_profile_key(&self) -> String { format!("{}:{}", self.provider, self.model) }
+
+    pub fn active_model_profile(&self) -> ModelProfile {
+        self.model_profiles.get(&self.model_profile_key()).cloned().or_else(|| self.model_profiles.get(&self.model).cloned()).unwrap_or_default()
+    }
+
     pub fn config_dir() -> Option<PathBuf> {
         ProjectDirs::from("com", "gemini", "gemini-harness")
             .map(|dirs| dirs.config_dir().to_path_buf())

@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     AppEvent::CompactionFinished(res) => {
-                        app.handle_compaction_result(res);
+                        app.handle_compaction_result(res, tx.clone());
                     }
                 }
             }
@@ -351,7 +351,7 @@ fn handle_key_event(
             if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
                 let commands = [
                     "/help", "/models", "/model", "/compact",
-                    "/thinking", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
+                    "/thinking", "/reasoning", "/autocompact", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
                     "/clear", "/save", "/quit",
                 ];
                 let prefix = app.input_buffer.to_lowercase();

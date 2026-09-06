@@ -18,6 +18,7 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     let (state_badge, state_fg, state_bg) = match app.state {
         EngineState::Idle => ("IDLE", Color::Black, Color::DarkGray),
         EngineState::Streaming => ("STREAMING", Color::Black, Color::Green),
+        EngineState::Compacting => ("COMPACTING", Color::Black, Color::Yellow),
         EngineState::AwaitingHitlApproval => ("GATE-HOLD", Color::Black, Color::Yellow),
         EngineState::ExecutingTool => ("TOOL-EXEC", Color::Black, Color::LightCyan),
     };

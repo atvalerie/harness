@@ -38,7 +38,8 @@ impl ProviderKind {
 
 impl AiClient {
     pub fn from_config(api_key: String, config: &AppConfig) -> Self {
-        Self::with_provider(api_key, ProviderKind::parse(&config.provider), config.base_url.clone())
+        let provider = config.active_provider_config();
+        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()))
     }
 
     pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>) -> Self {

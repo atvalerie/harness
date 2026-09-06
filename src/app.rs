@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 pub enum EngineState {
     Idle,
     Streaming,
+    Compacting,
     AwaitingHitlApproval,
     ExecutingTool,
 }
@@ -72,6 +73,8 @@ pub struct App {
     // Status bar notification
     pub status_message: Option<String>,
     pub should_quit: bool,
+    pub pending_generation_after_compaction: bool,
+    pub pending_prompt_after_compaction: Option<String>,
 }
 
 impl App {
@@ -108,6 +111,8 @@ impl App {
             current_tps: 0.0,
             status_message: Some("Ready".to_string()),
             should_quit: false,
+            pending_generation_after_compaction: false,
+            pending_prompt_after_compaction: None,
         }
     }
 
@@ -165,6 +170,8 @@ impl App {
                     - /baseurl <url|default> : Set a custom OpenAI-compatible API base URL\n\
                     - /model <name> : Switch active model (e.g. /model gemini-3.8-flash)\n\
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
+                    - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
+                    - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
                     - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
                     - /sys <instruction> : Update system prompt\n\
                     - /key <api_key> : Save the active provider API key\n\
@@ -222,6 +229,41 @@ impl App {
                     self.add_message("system", format!("Thinking budget set to: {} tokens", b));
                 } else {
                     self.add_message("system", format!("Current thinking budget: {} tokens. Use /thinking <int>", self.config.thinking_budget));
+                }
+            }
+            "/reasoning" => {
+                let key = self.config.model_profile_key();
+                let profile = self.config.model_profiles.entry(key).or_default();
+                if arg.is_empty() {
+                    let enabled = profile.reasoning_enabled.unwrap_or(self.config.thinking_budget > 0);
+                    self.add_message("system", format!("Reasoning for {}: {}", self.config.model, if enabled { "on" } else { "off" }));
+                } else if arg.eq_ignore_ascii_case("on") || arg.eq_ignore_ascii_case("off") {
+                    let enabled = arg.eq_ignore_ascii_case("on");
+                    profile.reasoning_enabled = Some(enabled);
+                    let model = self.config.model.clone();
+                    let status = if enabled { "enabled" } else { "disabled" };
+                    let _ = profile;
+                    self.set_status(format!("Reasoning {} for {}", status, model));
+                } else if let Ok(budget) = arg.parse::<i32>() {
+                    profile.thinking_budget = Some(budget.max(0));
+                    profile.reasoning_enabled = Some(budget > 0);
+                    self.set_status(format!("Reasoning budget set to {} for {}", budget.max(0), self.config.model));
+                } else {
+                    self.add_message("system", "Usage: /reasoning <on|off|token-budget>");
+                }
+            }
+            "/autocompact" => {
+                if arg.is_empty() {
+                    self.add_message("system", format!("Automatic compaction: {} at ~{} tokens", if self.config.auto_compact { "on" } else { "off" }, self.config.auto_compact_threshold_tokens));
+                } else if arg.eq_ignore_ascii_case("on") || arg.eq_ignore_ascii_case("off") {
+                    self.config.auto_compact = arg.eq_ignore_ascii_case("on");
+                    self.set_status(format!("Automatic compaction {}", if self.config.auto_compact { "enabled" } else { "disabled" }));
+                } else if let Ok(tokens) = arg.parse::<u64>() {
+                    self.config.auto_compact_threshold_tokens = tokens.max(1_000);
+                    self.config.auto_compact = true;
+                    self.set_status(format!("Automatic compaction threshold set to {} tokens", self.config.auto_compact_threshold_tokens));
+                } else {
+                    self.add_message("system", "Usage: /autocompact <on|off|token-threshold>");
                 }
             }
             "/temp" => {
@@ -354,6 +396,16 @@ impl App {
             return;
         }
 
+        if self.config.auto_compact
+            && self.estimated_context_tokens() >= self.config.auto_compact_threshold_tokens
+        {
+            self.pending_generation_after_compaction = true;
+            self.pending_prompt_after_compaction = self.messages.iter().rev().find(|message| message.role == "user").map(|message| message.content.clone());
+            self.state = EngineState::Compacting;
+            self.compact_history(tx);
+            return;
+        }
+
         self.stream_epoch += 1;
         let epoch = self.stream_epoch;
 
@@ -371,7 +423,7 @@ impl App {
 
         let client = self.client.clone();
         let model = self.config.model.clone();
-        let fallback_models = self.config.fallback_models.clone();
+        let fallback_models = self.config.effective_fallback_models();
         let max_retries = self.config.max_retries;
         let request = self.build_request();
 
@@ -389,6 +441,11 @@ impl App {
                 let _ = app_tx.send(AppEvent::Stream { epoch, signal: sig });
             }
         });
+    }
+
+    fn estimated_context_tokens(&self) -> u64 {
+        let message_chars: usize = self.messages.iter().map(|message| message.content.len()).sum();
+        ((message_chars + self.config.system_instruction.len()) as u64 / 4).max(self.total_tokens as u64)
     }
 
     pub fn cancel_generation(&mut self) {
@@ -677,10 +734,12 @@ impl App {
             }
         }
 
-        // Thinking Config
-        let thinking_config = if self.config.thinking_budget > 0 {
+        let model_profile = self.config.active_model_profile();
+        let thinking_budget = model_profile.thinking_budget.unwrap_or(self.config.thinking_budget);
+        let reasoning_enabled = model_profile.reasoning_enabled.unwrap_or(thinking_budget > 0);
+        let thinking_config = if reasoning_enabled && thinking_budget > 0 {
             Some(ThinkingConfig {
-                thinking_budget: self.config.thinking_budget,
+                thinking_budget,
             })
         } else {
             None
@@ -718,9 +777,11 @@ impl App {
                 }],
             }),
             generation_config: Some(GenerationConfig {
-                temperature: Some(self.config.temperature),
-                max_output_tokens: Some(8192),
+                temperature: Some(model_profile.temperature.unwrap_or(self.config.temperature)),
+                max_output_tokens: Some(model_profile.max_output_tokens.unwrap_or(8192)),
                 thinking_config,
+                reasoning_effort: if reasoning_enabled { model_profile.reasoning_effort.clone() } else { None },
+                extra: if model_profile.extra.is_empty() { None } else { Some(serde_json::Value::Object(model_profile.extra.clone().into_iter().collect())) },
             }),
             safety_settings: Some(safety_settings),
             tools: Some(tools),
@@ -735,6 +796,7 @@ impl App {
         }
 
         self.set_status("Compacting conversation history...");
+        self.state = EngineState::Compacting;
         self.add_message("system", format!("Compacting {} turns into a concise context summary...", count));
 
         let mut transcript = String::new();
@@ -771,6 +833,8 @@ impl App {
                 temperature: Some(0.2),
                 max_output_tokens: Some(2048),
                 thinking_config: None,
+                reasoning_effort: None,
+                extra: None,
             }),
             safety_settings: None,
             tools: None,
@@ -778,7 +842,7 @@ impl App {
 
         let client = self.client.clone();
         let model = self.config.model.clone();
-        let fallback_models = self.config.fallback_models.clone();
+        let fallback_models = self.config.effective_fallback_models();
         let max_retries = self.config.max_retries;
 
         tokio::spawn(async move {
@@ -787,7 +851,7 @@ impl App {
         });
     }
 
-    pub fn handle_compaction_result(&mut self, result: Result<String, String>) {
+    pub fn handle_compaction_result(&mut self, result: Result<String, String>, tx: UnboundedSender<AppEvent>) {
         match result {
             Ok(summary) => {
                 let original_count = self.messages.len();
@@ -807,10 +871,20 @@ impl App {
                     "system",
                     format!("Successfully compacted {} messages. Context window reclaimed.", original_count),
                 );
+                let continue_generation = self.pending_generation_after_compaction;
+                self.pending_generation_after_compaction = false;
+                if let Some(prompt) = self.pending_prompt_after_compaction.take() {
+                    self.add_message("user", prompt);
+                }
+                self.state = EngineState::Idle;
+                if continue_generation { self.trigger_generation(tx); }
             }
             Err(e) => {
                 self.set_status("Compaction failed");
                 self.add_message("system", format!("Compaction failed: {}", e));
+                self.pending_generation_after_compaction = false;
+                self.pending_prompt_after_compaction = None;
+                self.state = EngineState::Idle;
             }
         }
     }

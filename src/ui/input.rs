@@ -18,6 +18,8 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
             "/models - query live models & pricing",
             "/provider <gemini|openai> - select API provider",
             "/baseurl <url|default> - set provider base URL",
+            "/reasoning <on|off|budget> - configure active model reasoning",
+            "/autocompact <on|off|tokens> - configure automatic compaction",
             "/model <name> - switch active model",
             "/compact - summarize history to reclaim context",
             "/thinking <tokens> - set reasoning budget",

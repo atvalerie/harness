@@ -19,6 +19,12 @@ pub fn request_payload(model: &str, request: &GenerateContentRequest, stream: bo
     if let Some(config) = &request.generation_config {
         if let Some(temp) = config.temperature { payload["temperature"] = json!(temp); }
         if let Some(max) = config.max_output_tokens { payload["max_tokens"] = json!(max); }
+        if let Some(reasoning_effort) = &config.reasoning_effort { payload["reasoning_effort"] = json!(reasoning_effort); }
+        if let Some(extra) = &config.extra {
+            if let Some(extra_object) = extra.as_object() {
+                for (key, value) in extra_object { payload[key] = value.clone(); }
+            }
+        }
     }
     if stream { payload["stream_options"] = json!({ "include_usage": true }); }
     if let Some(tools) = &request.tools {
