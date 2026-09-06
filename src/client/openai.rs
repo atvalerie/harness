@@ -227,11 +227,14 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
                         "response.function_call_arguments.delta" => {
                             let key = value.get("item_id").and_then(Value::as_str).unwrap_or("function_call").to_string();
                             let entry = tools.entry(key).or_insert((None, String::new(), String::new()));
+                            if let Some(call_id) = value.get("call_id").and_then(Value::as_str) { entry.0 = Some(call_id.to_string()); }
                             if let Some(delta) = value.get("delta").and_then(Value::as_str) { entry.2.push_str(delta); }
                         }
                         "response.function_call_arguments.done" => {
                             let key = value.get("item_id").and_then(Value::as_str).unwrap_or("function_call").to_string();
                             let entry = tools.entry(key).or_insert((None, String::new(), String::new()));
+                            if let Some(call_id) = value.get("call_id").and_then(Value::as_str) { entry.0 = Some(call_id.to_string()); }
+                            if let Some(name) = value.get("name").and_then(Value::as_str) { entry.1 = name.to_string(); }
                             if let Some(arguments) = value.get("arguments").and_then(Value::as_str) { entry.2 = arguments.to_string(); }
                         }
                         "response.completed" => {
@@ -342,5 +345,43 @@ mod tests {
         assert_eq!(payload["instructions"], "be concise");
         assert_eq!(payload["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(payload["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn preserves_responses_function_call_ids_for_tool_outputs() {
+        let request = GenerateContentRequest {
+            contents: vec![
+                Content {
+                    role: Some("model".into()),
+                    parts: vec![Part::FunctionCall {
+                        function_call: crate::client::types::FunctionCallPayload {
+                            name: "run_command".into(),
+                            args: json!({"command": "dir"}),
+                            id: Some("call_123".into()),
+                        },
+                        thought_signature: None,
+                    }],
+                },
+                Content {
+                    role: Some("user".into()),
+                    parts: vec![Part::FunctionResponse {
+                        function_response: crate::client::types::FunctionResponsePayload {
+                            name: "run_command".into(),
+                            response: json!({"output": "ok"}),
+                            id: Some("call_123".into()),
+                        },
+                    }],
+                },
+            ],
+            system_instruction: None,
+            generation_config: None,
+            safety_settings: None,
+            tools: None,
+        };
+        let payload = responses_request_payload("muse-spark-1.3-contributor-free", &request, false);
+        assert_eq!(payload["input"][0]["type"], "function_call");
+        assert_eq!(payload["input"][0]["call_id"], "call_123");
+        assert_eq!(payload["input"][1]["type"], "function_call_output");
+        assert_eq!(payload["input"][1]["call_id"], "call_123");
     }
 }

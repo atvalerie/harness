@@ -4,28 +4,34 @@ use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::path::PathBuf;
 
-use super::{DiffHunk, Tool, ToolPreview};
+use super::{working_dir_path, DiffHunk, SharedWorkingDir, Tool, ToolPreview};
 
-fn resolve_path(path_str: &str) -> PathBuf {
+fn resolve_path(path_str: &str, cwd: &std::path::Path) -> PathBuf {
     let initial = PathBuf::from(path_str);
     if initial.exists() || !initial.is_relative() {
         return initial;
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut curr = cwd;
-        while let Some(parent) = curr.parent() {
-            let candidate = parent.join(path_str);
-            if candidate.exists() {
-                return candidate;
-            }
-            curr = parent.to_path_buf();
+    let direct = cwd.join(path_str);
+    if direct.exists() {
+        return direct;
+    }
+    let mut curr = cwd.to_path_buf();
+    while let Some(parent) = curr.parent() {
+        let candidate = parent.join(path_str);
+        if candidate.exists() {
+            return candidate;
         }
+        curr = parent.to_path_buf();
     }
     initial
 }
 
-pub struct ReadFileTool;
+pub struct ReadFileTool { cwd: SharedWorkingDir }
+
+impl ReadFileTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self { Self { cwd } }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -66,7 +72,7 @@ impl Tool for ReadFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
 
-        let path = resolve_path(path_str);
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
         if !path.exists() {
             return Err(format!("File does not exist: {}", path_str));
         }
@@ -83,7 +89,11 @@ impl Tool for ReadFileTool {
     }
 }
 
-pub struct WriteFileTool;
+pub struct WriteFileTool { cwd: SharedWorkingDir }
+
+impl WriteFileTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self { Self { cwd } }
+}
 
 #[async_trait]
 impl Tool for WriteFileTool {
@@ -116,7 +126,7 @@ impl Tool for WriteFileTool {
         let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or("<unknown>");
         let new_content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
-        let path = resolve_path(path_str);
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
         let old_content = if path.exists() {
             fs::read_to_string(&path).unwrap_or_default()
         } else {
@@ -174,7 +184,7 @@ impl Tool for WriteFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter 'content'".to_string())?;
 
-        let path = resolve_path(path_str);
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
