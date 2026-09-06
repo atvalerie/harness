@@ -338,6 +338,7 @@ impl App {
                     "Available Commands:\n\
                     - /compact : Summarize conversation history to reclaim context window\n\
                     - /models : Fetch live models & pricing from the active provider\n\
+                    - /providers : List configured and built-in providers\n\
                     - /provider <name> : Select a configured provider\n\
                     - /baseurl <url|default> : Set the active provider base URL\n\
                     - /config <path|open|dir> : Inspect or open the active config file\n\
@@ -392,6 +393,20 @@ impl App {
                     };
                     let _ = tx.send(AppEvent::ModelsFetched(res));
                 });
+            }
+            "/providers" => {
+                let mut lines = vec!["Available providers:".to_string()];
+                for (name, provider) in &self.config.providers {
+                    let marker = if name == &self.config.provider { "*" } else { " " };
+                    let model = provider.model.as_deref().unwrap_or("(choose a model)");
+                    lines.push(format!("{} {:<18} kind={}  model={}", marker, name, provider.kind, model));
+                }
+                if !self.config.providers.contains_key(&self.config.provider) {
+                    lines.push(format!("* {:<18} kind={}  model={}", self.config.provider, "openai-compatible", self.config.model));
+                }
+                lines.push("Supported kinds: gemini, openai-compatible (custom endpoints, OpenRouter, Zen, local servers)".to_string());
+                lines.push("Use /provider <name> to switch.".to_string());
+                self.add_message("system", lines.join("\n"));
             }
             "/provider" => {
                 if arg.is_empty() {
