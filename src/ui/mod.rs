@@ -29,7 +29,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),    // Main chat log viewport
-                Constraint::Length(10), // Bottom-docked HITL security panel
+                Constraint::Length(5), // Compact bottom-docked HITL security panel
             ])
             .split(chunks[1].union(chunks[2]));
 

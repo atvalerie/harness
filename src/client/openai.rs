@@ -45,7 +45,7 @@ fn content_messages(content: &Content) -> Vec<Value> {
     for part in &content.parts {
         match part {
             Part::Text { text: value, .. } => text.push_str(value),
-            Part::FunctionCall { function_call } => tool_calls.push(json!({
+            Part::FunctionCall { function_call, .. } => tool_calls.push(json!({
                 "id": function_call.id.clone().unwrap_or_else(|| format!("call_{}", function_call.name)),
                 "type": "function",
                 "function": { "name": function_call.name, "arguments": function_call.args.to_string() }
@@ -112,7 +112,7 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
 fn emit_tools(tools: &mut BTreeMap<usize, (Option<String>, String, String)>, tx: &UnboundedSender<StreamSignal>) {
     for (_, (id, name, arguments)) in std::mem::take(tools) {
         let args = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({ "raw_arguments": arguments }));
-        let _ = tx.send(StreamSignal::ToolCall { id, name, args });
+        let _ = tx.send(StreamSignal::ToolCall { id, name, args, thought_signature: None });
     }
 }
 

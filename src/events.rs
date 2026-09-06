@@ -7,6 +7,7 @@ pub enum StreamSignal {
         id: Option<String>,
         name: String,
         args: serde_json::Value,
+        thought_signature: Option<String>,
     },
     Usage {
         prompt_tokens: u32,

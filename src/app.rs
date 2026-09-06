@@ -639,7 +639,7 @@ impl App {
                     }
                 }
             }
-            StreamSignal::ToolCall { id, name, args } => {
+            StreamSignal::ToolCall { id, name, args, thought_signature } => {
                 // If model produced any thought prior to tool call, record it
                 if !self.current_thought_buffer.is_empty() {
                     let thought = std::mem::take(&mut self.current_thought_buffer);
@@ -659,6 +659,7 @@ impl App {
                         args: args.clone(),
                         id: id.clone(),
                     },
+                    thought_signature: thought_signature.clone(),
                 };
                 self.messages.push(ChatMessage {
                     role: "model_tool_call".to_string(),

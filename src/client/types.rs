@@ -17,6 +17,8 @@ pub enum Part {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: FunctionCallPayload,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     Text {
         text: String,
@@ -130,6 +132,8 @@ pub struct ResponsePart {
     pub thought: Option<bool>,
     #[serde(rename = "functionCall")]
     pub function_call: Option<FunctionCallPayload>,
+    #[serde(rename = "thoughtSignature")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,4 +175,20 @@ pub struct ModelInfo {
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
     pub input_token_limit: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thought_signature_is_preserved_as_a_function_call_sibling() {
+        let part = Part::FunctionCall {
+            function_call: FunctionCallPayload { name: "run_command".into(), args: serde_json::json!({"command":"git status"}), id: Some("call-1".into()) },
+            thought_signature: Some("sig".into()),
+        };
+        let value = serde_json::to_value(part).unwrap();
+        assert_eq!(value["thoughtSignature"], "sig");
+        assert_eq!(value["functionCall"]["name"], "run_command");
+    }
 }

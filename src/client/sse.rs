@@ -75,6 +75,7 @@ impl SseParser {
                                                     id: fc.id,
                                                     name: fc.name,
                                                     args: fc.args,
+                                                    thought_signature: part.thought_signature,
                                                 });
                                             } else if let Some(text) = part.text {
                                                 if part.thought.unwrap_or(false) {

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DiffHunk {
     pub tag: String,
     pub line: String,

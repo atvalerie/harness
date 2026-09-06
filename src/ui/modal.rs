@@ -13,82 +13,22 @@ pub fn render_hitl_modal(app: &App, frame: &mut Frame, area: Rect) {
         None => return,
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Line 1: Header + Tool Identification
-    lines.push(Line::from(vec![
-        Span::styled(" ⚠ HITL PERMISSION GATE ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-        Span::styled(format!("Tool: {} ", pending.tool_name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("({})", pending.preview.title), Style::default().fg(Color::DarkGray)),
-    ]));
-
-    // Line 2: Details / Target explanations
-    for d in &pending.preview.details {
-        lines.push(Line::from(vec![
-            Span::styled(" • ", Style::default().fg(Color::Yellow)),
-            Span::styled(d, Style::default().fg(Color::White)),
-        ]));
-    }
-
-    // Line 3+: Unified Diffs or Arguments
-    if !pending.preview.diff_hunks.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Unified Diff Preview: ", Style::default().fg(Color::Yellow)),
-            Span::styled("(Use Up/Down or PgUp/PgDn to scroll diff)", Style::default().fg(Color::DarkGray)),
-        ]));
-
-        for hunk in &pending.preview.diff_hunks {
-            let (prefix, style) = match hunk.tag.as_str() {
-                "+" => ("+ ", Style::default().fg(Color::Green)),
-                "-" => ("- ", Style::default().fg(Color::Red)),
-                _ => ("  ", Style::default().fg(Color::DarkGray)),
-            };
-
-            let line_no_str = match (hunk.old_line_no, hunk.new_line_no) {
-                (Some(o), Some(n)) => format!("{:3}:{:3} ", o, n),
-                (Some(o), None) => format!("{:3}:    ", o),
-                (None, Some(n)) => format!("   :{:3} ", n),
-                _ => "       ".to_string(),
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(line_no_str, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{}{}", prefix, hunk.line), style),
-            ]));
-        }
-    } else {
-        let formatted_args = serde_json::to_string_pretty(&pending.args).unwrap_or_default();
-        for l in formatted_args.lines() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}", l), Style::default().fg(Color::LightCyan)),
-            ]));
-        }
-    }
-
-    // Trailing explanation line
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("Authorize? ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("[Y] Approve Once ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled("[A] Always Allow (Session) ", Style::default().fg(Color::Black).bg(Color::LightCyan).add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled("[N / Esc] Reject ", Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled("  (Rejection returns feedback to Gemini)", Style::default().fg(Color::DarkGray)),
-    ]));
-
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Human-In-The-Loop Security Review ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.modal_scroll as u16, 0));
-
-    frame.render_widget(paragraph, area);
+    let block = Block::default().borders(Borders::ALL).title(" Approval Required ").border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let header_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1.min(inner.height) };
+    let footer_height = 1.min(inner.height.saturating_sub(header_area.height));
+    let footer_area = Rect { x: inner.x, y: inner.y + inner.height.saturating_sub(footer_height), width: inner.width, height: footer_height };
+    let body_area = Rect { x: inner.x, y: inner.y + header_area.height, width: inner.width, height: inner.height.saturating_sub(header_area.height + footer_height) };
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("ACTION ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(&pending.tool_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" — "),
+        Span::styled(&pending.preview.title, Style::default().fg(Color::White)),
+    ])), header_area);
+    let summary = pending.preview.details.iter().take(2).cloned().collect::<Vec<_>>().join("  │  ");
+    frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: true }), body_area);
+    frame.render_widget(Paragraph::new("[Y] approve once   [A] allow this session   [N/Esc] reject"), footer_area);
 }
 
 pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
