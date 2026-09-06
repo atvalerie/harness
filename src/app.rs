@@ -64,6 +64,10 @@ pub struct App {
     pub available_models: Vec<crate::client::types::ModelInfo>,
     pub show_models_modal: bool,
     pub models_scroll: usize,
+    pub models_selected: usize,
+    pub show_sessions_modal: bool,
+    pub available_sessions: Vec<session::SessionInfo>,
+    pub sessions_selected: usize,
 
     // Metrics & Performance
     pub stream_epoch: u64,
@@ -109,6 +113,10 @@ impl App {
             available_models: Vec::new(),
             show_models_modal: false,
             models_scroll: 0,
+            models_selected: 0,
+            show_sessions_modal: false,
+            available_sessions: Vec::new(),
+            sessions_selected: 0,
             stream_epoch: 0,
             stream_start_time: None,
             candidate_chunks_count: 0,
@@ -124,6 +132,102 @@ impl App {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
+    }
+
+    pub fn selected_model_id(&self) -> Option<String> {
+        self.available_models.get(self.models_selected).map(|model| model.id.clone())
+    }
+
+    pub fn refresh_sessions(&mut self) {
+        self.available_sessions = session::list();
+        self.sessions_selected = 0;
+    }
+
+    pub fn resume_selected_session(&mut self) {
+        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
+        if let Some(snapshot) = session::load(&info.path) {
+            self.messages = snapshot.messages;
+            self.config.provider = snapshot.provider;
+            self.config.model = snapshot.model;
+            self.client.update_provider(ProviderKind::parse(&self.config.provider), self.config.base_url.clone());
+            self.chat_scroll = 0;
+            self.session_messages_at_save = self.messages.len();
+            self.show_sessions_modal = false;
+            self.add_message("system", format!("Resumed session '{}'.", info.name));
+        }
+    }
+
+    pub fn delete_selected_session(&mut self) {
+        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
+        if std::fs::remove_file(&info.path).is_ok() {
+            self.refresh_sessions();
+            self.set_status(format!("Deleted session '{}'", info.name));
+        }
+    }
+
+    pub fn export_selected_session(&mut self) {
+        let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
+        let export_path = info.path.with_file_name(format!("{}.export.json", info.name));
+        if let Ok(snapshot) = std::fs::read_to_string(&info.path) {
+            if std::fs::write(&export_path, snapshot).is_ok() { self.set_status(format!("Exported session to {}", export_path.display())); }
+        }
+    }
+
+    pub fn select_model_from_catalog(&mut self) {
+        if let Some(model) = self.selected_model_id() {
+            self.config.model = model.clone();
+            self.set_status(format!("Active model: {}", model));
+        }
+    }
+
+    pub fn toggle_selected_reasoning(&mut self) {
+        let Some(model) = self.selected_model_id() else { return };
+        let key = format!("{}:{}", self.config.provider, model);
+        let profile = self.config.model_profiles.entry(key).or_default();
+        let enabled = !profile.reasoning_enabled.unwrap_or(self.config.thinking_budget > 0);
+        profile.reasoning_enabled = Some(enabled);
+        self.add_message("system", format!("{} reasoning {}", model, if enabled { "enabled" } else { "disabled" }));
+    }
+
+    pub fn adjust_selected_thinking(&mut self, delta: i32) {
+        let Some(model) = self.selected_model_id() else { return };
+        let key = format!("{}:{}", self.config.provider, model);
+        let profile = self.config.model_profiles.entry(key).or_default();
+        let current = profile.thinking_budget.unwrap_or(self.config.thinking_budget);
+        profile.thinking_budget = Some((current + delta).max(0));
+        profile.reasoning_enabled = Some(profile.thinking_budget != Some(0));
+    }
+
+    pub fn adjust_selected_temperature(&mut self, delta: f32) {
+        let Some(model) = self.selected_model_id() else { return };
+        let key = format!("{}:{}", self.config.provider, model);
+        let profile = self.config.model_profiles.entry(key).or_default();
+        let current = profile.temperature.unwrap_or(self.config.temperature);
+        profile.temperature = Some((current + delta).clamp(0.0, 2.0));
+    }
+
+    pub fn adjust_selected_max_tokens(&mut self, delta: i32) {
+        let Some(model) = self.selected_model_id() else { return };
+        let key = format!("{}:{}", self.config.provider, model);
+        let profile = self.config.model_profiles.entry(key).or_default();
+        let current = profile.max_output_tokens.unwrap_or(8192) as i32;
+        profile.max_output_tokens = Some((current + delta).max(256) as u32);
+    }
+
+    pub fn toggle_selected_fallback(&mut self) {
+        let Some(model) = self.selected_model_id() else { return };
+        let provider_name = self.config.provider.clone();
+        let provider = self.config.providers.entry(provider_name.clone()).or_insert_with(|| crate::config::ProviderConfig {
+            kind: provider_name.clone(),
+            base_url: self.config.base_url.clone(),
+            fallback_models: Vec::new(),
+            api_key_env: None,
+        });
+        if let Some(position) = provider.fallback_models.iter().position(|candidate| candidate == &model) {
+            provider.fallback_models.remove(position);
+        } else {
+            provider.fallback_models.push(model);
+        }
     }
 
     pub fn add_message(&mut self, role: &str, content: impl Into<String>) {
@@ -199,6 +303,7 @@ impl App {
                     - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
                     - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
                     - /session <save|clear|path> : Manage the low-write resumable session\n\
+                    - /sessions : Browse, resume, export, or delete sessions\n\
                     - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
                     - /sys <instruction> : Update system prompt\n\
                     - /key <api_key> : Save the active provider API key\n\
@@ -308,6 +413,10 @@ impl App {
                     "path" => self.add_message("system", format!("Session path: {}", self.session_path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "disabled".to_string()))),
                     _ => self.add_message("system", "Usage: /session <save|clear|path>"),
                 }
+            }
+            "/sessions" => {
+                self.refresh_sessions();
+                self.show_sessions_modal = true;
             }
             "/temp" => {
                 if let Ok(t) = arg.parse::<f32>() {

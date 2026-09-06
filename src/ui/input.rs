@@ -21,6 +21,7 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
             "/reasoning <on|off|budget> - configure active model reasoning",
             "/autocompact <on|off|tokens> - configure automatic compaction",
             "/session <save|clear|path> - manage resumable session",
+            "/sessions - browse saved sessions",
             "/model <name> - switch active model",
             "/compact - summarize history to reclaim context",
             "/thinking <tokens> - set reasoning budget",

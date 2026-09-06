@@ -43,4 +43,5 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // Modal Overlays
     modal::render_models_modal(app, frame, frame.area());
+    modal::render_sessions_modal(app, frame, frame.area());
 }

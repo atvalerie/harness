@@ -140,6 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.modal_scroll = app.modal_scroll.saturating_sub(3);
                                 } else if app.show_models_modal {
                                     app.models_scroll = app.models_scroll.saturating_sub(3);
+                                } else if app.show_sessions_modal {
+                                    app.sessions_selected = app.sessions_selected.saturating_sub(1);
                                 } else {
                                     app.chat_scroll = app.chat_scroll.saturating_add(3);
                                 }
@@ -149,6 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app.modal_scroll = app.modal_scroll.saturating_add(3);
                                 } else if app.show_models_modal {
                                     app.models_scroll = app.models_scroll.saturating_add(3);
+                                } else if app.show_sessions_modal {
+                                    if !app.available_sessions.is_empty() { app.sessions_selected = (app.sessions_selected + 1).min(app.available_sessions.len() - 1); }
                                 } else {
                                     app.chat_scroll = app.chat_scroll.saturating_sub(3);
                                 }
@@ -170,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match res {
                             Ok(models) => {
                                 app.available_models = models;
+                                app.models_selected = app.available_models.iter().position(|model| model.id == app.config.model).unwrap_or(0);
                                 app.show_models_modal = true;
                                 app.models_scroll = 0;
                                 app.set_status("Fetched live models list.");
@@ -208,30 +213,56 @@ fn handle_key_event(
         return;
     }
 
-    // 1. When Live Models Modal is active
+    // 1. When Session Browser is active
+    if app.show_sessions_modal {
+        match key.code {
+            KeyCode::Esc => app.show_sessions_modal = false,
+            KeyCode::Up => app.sessions_selected = app.sessions_selected.saturating_sub(1),
+            KeyCode::Down => if !app.available_sessions.is_empty() { app.sessions_selected = (app.sessions_selected + 1).min(app.available_sessions.len() - 1); },
+            KeyCode::Enter => app.resume_selected_session(),
+            KeyCode::Char('d') | KeyCode::Char('D') => app.delete_selected_session(),
+            KeyCode::Char('e') | KeyCode::Char('E') => app.export_selected_session(),
+            _ => {}
+        }
+        return;
+    }
+
+    // 2. When Live Models Modal is active
     if app.show_models_modal {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
                 app.show_models_modal = false;
             }
+            KeyCode::Enter => app.select_model_from_catalog(),
             KeyCode::Up => {
+                app.models_selected = app.models_selected.saturating_sub(1);
                 app.models_scroll = app.models_scroll.saturating_sub(1);
             }
             KeyCode::Down => {
+                if !app.available_models.is_empty() { app.models_selected = (app.models_selected + 1).min(app.available_models.len() - 1); }
                 app.models_scroll = app.models_scroll.saturating_add(1);
             }
             KeyCode::PageUp => {
                 app.models_scroll = app.models_scroll.saturating_sub(10);
             }
             KeyCode::PageDown => {
+                if !app.available_models.is_empty() { app.models_selected = (app.models_selected + 10).min(app.available_models.len() - 1); }
                 app.models_scroll = app.models_scroll.saturating_add(10);
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_selected_reasoning(),
+            KeyCode::Char('[') => app.adjust_selected_thinking(-256),
+            KeyCode::Char(']') => app.adjust_selected_thinking(256),
+            KeyCode::Char('t') | KeyCode::Char('T') => app.adjust_selected_temperature(0.1),
+            KeyCode::Char('-') => app.adjust_selected_max_tokens(-512),
+            KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_selected_max_tokens(512),
+            KeyCode::Char('f') | KeyCode::Char('F') => app.toggle_selected_fallback(),
+            KeyCode::Char('s') | KeyCode::Char('S') => { let _ = app.config.save(); app.set_status("Model profile saved"); }
             _ => {}
         }
         return;
     }
 
-    // 2. When HITL Modal is active: gatekeeper authorization mode
+    // 3. When HITL Modal is active: gatekeeper authorization mode
     if app.state == EngineState::AwaitingHitlApproval {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -260,7 +291,7 @@ fn handle_key_event(
         return;
     }
 
-    // 3. When streaming: Esc cancels generation on the fly
+    // 4. When streaming: Esc cancels generation on the fly
     if app.state == EngineState::Streaming {
         if key.code == KeyCode::Esc {
             app.cancel_generation();
@@ -359,7 +390,7 @@ fn handle_key_event(
             if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
                 let commands = [
                     "/help", "/models", "/model", "/compact",
-                    "/thinking", "/reasoning", "/autocompact", "/session", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
+                    "/thinking", "/reasoning", "/autocompact", "/session", "/sessions", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
                     "/clear", "/save", "/quit",
                 ];
                 let prefix = app.input_buffer.to_lowercase();
