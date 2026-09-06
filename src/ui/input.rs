@@ -9,10 +9,28 @@ use ratatui::{
 
 pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     let prompt_prefix = Span::styled("❯ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    let input_text = Span::styled(&app.input_buffer, Style::default().fg(Color::White));
 
-    // Command autocompletion ghost hint when typing a slash command
-    let ghost_hint = if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
+    // Calculate inner width available for text (area.width - borders(2) - prompt prefix(2) = area.width - 4)
+    let inner_width = area.width.saturating_sub(4) as usize;
+
+    // Handle horizontal scrolling / cursor tracking so long prompts stay visible around the cursor
+    let chars: Vec<char> = app.input_buffer.chars().collect();
+    let cursor = app.input_cursor.min(chars.len());
+
+    let mut start = 0;
+    if cursor >= inner_width {
+        start = cursor.saturating_sub(inner_width.saturating_sub(1));
+    }
+    let end = (start + inner_width).min(chars.len());
+    if end - start < inner_width && start > 0 {
+        start = end.saturating_sub(inner_width);
+    }
+
+    let visible_chars: String = chars.iter().skip(start).take(end - start).collect();
+    let input_text = Span::styled(visible_chars, Style::default().fg(Color::White));
+
+    // Command autocompletion ghost hint when typing a slash command (only when cursor is at the end)
+    let ghost_hint = if cursor == chars.len() && app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
         let commands = [
             "/help - show available commands",
             "/models - query live models & pricing",
@@ -61,8 +79,9 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
 
     frame.render_widget(paragraph, area);
 
-    // Set cursor position inside input block (accounting for border and prefix "❯ ")
-    let cursor_x = area.x + 1 + 2 + app.input_cursor as u16;
+    // Set cursor position inside input block (accounting for border and prefix "❯ ", plus horizontal scrolling offset)
+    let cursor_rel = cursor.saturating_sub(start);
+    let cursor_x = area.x + 1 + 2 + cursor_rel as u16;
     let cursor_y = area.y + 1;
     if cursor_x < area.x + area.width - 1 {
         frame.set_cursor_position((cursor_x, cursor_y));

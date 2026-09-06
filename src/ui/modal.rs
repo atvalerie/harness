@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::tools::DiffHunk;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -26,9 +27,54 @@ pub fn render_hitl_modal(app: &App, frame: &mut Frame, area: Rect) {
         Span::raw(" — "),
         Span::styled(&pending.preview.title, Style::default().fg(Color::White)),
     ])), header_area);
-    let summary = pending.preview.details.iter().take(2).cloned().collect::<Vec<_>>().join("  │  ");
-    frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: true }), body_area);
-    frame.render_widget(Paragraph::new("[Y] approve once   [A] allow this session   [N/Esc] reject"), footer_area);
+
+    let mut body_lines = pending
+        .preview
+        .details
+        .iter()
+        .cloned()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    if !pending.preview.diff_hunks.is_empty() {
+        body_lines.push(Line::from(Span::styled(
+            "Diff:",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        body_lines.extend(pending.preview.diff_hunks.iter().map(render_diff_line));
+    }
+
+    frame.render_widget(
+        Paragraph::new(body_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll as u16, 0)),
+        body_area,
+    );
+    let footer = if pending.preview.diff_hunks.is_empty() {
+        "[Y] approve once   [A] allow this session   [N/Esc] reject"
+    } else {
+        "[↑/↓] scroll diff   [Y] approve once   [A] allow   [N/Esc] reject"
+    };
+    frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
+fn render_diff_line(hunk: &DiffHunk) -> Line<'static> {
+    let line_number = hunk
+        .new_line_no
+        .or(hunk.old_line_no)
+        .map(|line| format!("{:>4} ", line + 1))
+        .unwrap_or_else(|| "     ".to_string());
+    let (color, modifier) = match hunk.tag.as_str() {
+        "+" => (Color::Green, Modifier::BOLD),
+        "-" => (Color::Red, Modifier::BOLD),
+        _ => (Color::DarkGray, Modifier::empty()),
+    };
+    Line::from(vec![
+        Span::styled(line_number, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}{}", hunk.tag, hunk.line),
+            Style::default().fg(color).add_modifier(modifier),
+        ),
+    ])
 }
 
 pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {

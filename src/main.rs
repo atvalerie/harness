@@ -217,39 +217,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 terminal.draw(|f| ui::render(&app, f))?;
             }
             Some(app_event) = rx.recv() => {
-                match app_event {
-                    AppEvent::Key(key) => {
-                        if key.kind == crossterm::event::KeyEventKind::Press {
-                            handle_key_event(&mut app, key, tx.clone());
-                        }
-                    }
-                    AppEvent::Mouse(mouse) => {
-                        match mouse.kind {
-                            crossterm::event::MouseEventKind::ScrollUp => {
-                                if app.state == EngineState::AwaitingHitlApproval {
-                                    app.modal_scroll = app.modal_scroll.saturating_sub(3);
-                                } else if app.show_models_modal {
-                                    app.models_scroll = app.models_scroll.saturating_sub(3);
-                                } else if app.show_sessions_modal {
-                                    app.sessions_selected = app.sessions_selected.saturating_sub(1);
-                                } else {
-                                    app.chat_scroll = app.chat_scroll.saturating_add(3);
-                                }
+                let mut current_event = app_event;
+                loop {
+                    match current_event {
+                        AppEvent::Key(key) => {
+                            if key.kind == crossterm::event::KeyEventKind::Press {
+                                handle_key_event(&mut app, key, tx.clone());
                             }
-                            crossterm::event::MouseEventKind::ScrollDown => {
-                                if app.state == EngineState::AwaitingHitlApproval {
-                                    app.modal_scroll = app.modal_scroll.saturating_add(3);
-                                } else if app.show_models_modal {
-                                    app.models_scroll = app.models_scroll.saturating_add(3);
-                                } else if app.show_sessions_modal {
-                                    if !app.available_sessions.is_empty() { app.sessions_selected = (app.sessions_selected + 1).min(app.available_sessions.len() - 1); }
-                                } else {
-                                    app.chat_scroll = app.chat_scroll.saturating_sub(3);
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        AppEvent::Mouse(mouse) => {
+                            match mouse.kind {
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    if app.state == EngineState::AwaitingHitlApproval {
+                                        app.modal_scroll = app.modal_scroll.saturating_sub(5);
+                                    } else if app.show_models_modal {
+                                        app.models_scroll = app.models_scroll.saturating_sub(5);
+                                    } else if app.show_sessions_modal {
+                                        app.sessions_selected = app.sessions_selected.saturating_sub(1);
+                                    } else {
+                                        app.chat_scroll = app.chat_scroll.saturating_add(5);
+                                    }
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown => {
+                                    if app.state == EngineState::AwaitingHitlApproval {
+                                        app.modal_scroll = app.modal_scroll.saturating_add(5);
+                                    } else if app.show_models_modal {
+                                        app.models_scroll = app.models_scroll.saturating_add(5);
+                                    } else if app.show_sessions_modal {
+                                        if !app.available_sessions.is_empty() { app.sessions_selected = (app.sessions_selected + 1).min(app.available_sessions.len() - 1); }
+                                    } else {
+                                        app.chat_scroll = app.chat_scroll.saturating_sub(5);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     AppEvent::Resize(_, _) => {}
                     AppEvent::Stream { epoch, signal } => {
                         app.handle_stream_signal(epoch, signal, tx.clone());
@@ -278,7 +280,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.handle_compaction_result(res, tx.clone());
                     }
                 }
+
+                match rx.try_recv() {
+                    Ok(next) => current_event = next,
+                    Err(_) => break,
+                }
             }
+        }
         }
 
         if app.should_quit {
