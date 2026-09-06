@@ -91,9 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(config, api_key);
     let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
     for tool in mcp_tools { app.tool_registry.register(tool); }
-    if app.config.auto_resume_session {
-        app.load_session();
-    }
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     // 6. Spawn input event listener thread

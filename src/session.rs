@@ -26,6 +26,11 @@ pub fn default_session_path(name: &str) -> Option<PathBuf> {
     AppConfig::config_dir().map(|dir| dir.join("sessions").join(format!("{}.json", name)))
 }
 
+pub fn new_session_path(prefix: &str) -> Option<PathBuf> {
+    let name = format!("{}-{}", prefix, chrono::Local::now().format("%Y%m%d-%H%M%S-%3f"));
+    default_session_path(&name)
+}
+
 pub fn load(path: &Path) -> Option<SessionSnapshot> {
     fs::read_to_string(path).ok().and_then(|content| serde_json::from_str(&content).ok())
 }

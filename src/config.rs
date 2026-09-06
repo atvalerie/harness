@@ -64,8 +64,6 @@ pub struct AppConfig {
     pub auto_compact: bool,
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold_tokens: u64,
-    #[serde(default = "default_true")]
-    pub auto_resume_session: bool,
     #[serde(default = "default_session_name")]
     pub session_name: String,
     #[serde(default)]
@@ -97,7 +95,6 @@ Operational Guidelines:\n\
             model_profiles: BTreeMap::new(),
             auto_compact: default_auto_compact(),
             auto_compact_threshold_tokens: default_auto_compact_threshold(),
-            auto_resume_session: true,
             session_name: "default".to_string(),
             mcp_servers: BTreeMap::new(),
         }

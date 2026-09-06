@@ -88,7 +88,7 @@ impl App {
     pub fn new(config: AppConfig, api_key: String) -> Self {
         let client = AiClient::from_config(api_key.clone(), &config);
         let tool_registry = ToolRegistry::new();
-        let session_path = session::default_session_path(&config.session_name);
+        let session_path = session::new_session_path(&config.session_name);
 
         Self {
             config,
@@ -150,6 +150,7 @@ impl App {
             self.config.provider = snapshot.provider;
             self.config.model = snapshot.model;
             self.client.update_provider(ProviderKind::parse(&self.config.provider), self.config.base_url.clone());
+            self.session_path = Some(info.path.clone());
             self.chat_scroll = 0;
             self.session_messages_at_save = self.messages.len();
             self.show_sessions_modal = false;
@@ -238,17 +239,6 @@ impl App {
             timestamp: now,
         });
         self.chat_scroll = 0; // Stick to bottom
-    }
-
-    pub fn load_session(&mut self) {
-        if let Some(path) = &self.session_path {
-            if let Some(snapshot) = session::load(path) {
-                self.messages = snapshot.messages;
-                self.chat_scroll = 0;
-                self.session_messages_at_save = self.messages.len();
-                self.add_message("system", format!("Resumed session for {} / {}.", snapshot.provider, snapshot.model));
-            }
-        }
     }
 
     pub fn flush_session(&mut self) -> Result<(), String> {
