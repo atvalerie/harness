@@ -20,6 +20,7 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
             "/baseurl <url|default> - set provider base URL",
             "/reasoning <on|off|budget> - configure active model reasoning",
             "/autocompact <on|off|tokens> - configure automatic compaction",
+            "/session <save|clear|path> - manage resumable session",
             "/model <name> - switch active model",
             "/compact - summarize history to reclaim context",
             "/thinking <tokens> - set reasoning budget",

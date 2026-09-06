@@ -3,6 +3,7 @@ use crate::client::{AiClient, ProviderKind};
 use crate::config::AppConfig;
 use crate::events::{AppEvent, StreamSignal};
 use crate::tools::{ToolPreview, ToolRegistry};
+use crate::session::{self, SessionSnapshot};
 use serde_json::json;
 use std::collections::HashSet;
 use tokio::sync::mpsc::UnboundedSender;
@@ -17,7 +18,7 @@ pub enum EngineState {
     ExecutingTool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: String, // "user", "model", "thought", "tool", "system"
     pub content: String,
@@ -75,12 +76,15 @@ pub struct App {
     pub should_quit: bool,
     pub pending_generation_after_compaction: bool,
     pub pending_prompt_after_compaction: Option<String>,
+    pub session_path: Option<std::path::PathBuf>,
+    pub session_messages_at_save: usize,
 }
 
 impl App {
     pub fn new(config: AppConfig, api_key: String) -> Self {
         let client = AiClient::from_config(api_key.clone(), &config);
         let tool_registry = ToolRegistry::new();
+        let session_path = session::default_session_path(&config.session_name);
 
         Self {
             config,
@@ -113,6 +117,8 @@ impl App {
             should_quit: false,
             pending_generation_after_compaction: false,
             pending_prompt_after_compaction: None,
+            session_path,
+            session_messages_at_save: 0,
         }
     }
 
@@ -128,6 +134,28 @@ impl App {
             timestamp: now,
         });
         self.chat_scroll = 0; // Stick to bottom
+        if self.messages.len().saturating_sub(self.session_messages_at_save) >= 20 {
+            let _ = self.flush_session();
+        }
+    }
+
+    pub fn load_session(&mut self) {
+        if let Some(path) = &self.session_path {
+            if let Some(snapshot) = session::load(path) {
+                self.messages = snapshot.messages;
+                self.chat_scroll = 0;
+                self.session_messages_at_save = self.messages.len();
+                self.add_message("system", format!("Resumed session for {} / {}.", snapshot.provider, snapshot.model));
+            }
+        }
+    }
+
+    pub fn flush_session(&mut self) -> Result<(), String> {
+        let Some(path) = &self.session_path else { return Ok(()) };
+        let snapshot = SessionSnapshot { provider: self.config.provider.clone(), model: self.config.model.clone(), messages: self.messages.clone() };
+        session::save(path, &snapshot)?;
+        self.session_messages_at_save = self.messages.len();
+        Ok(())
     }
 
     pub fn handle_enter(&mut self, tx: UnboundedSender<AppEvent>) {
@@ -172,6 +200,7 @@ impl App {
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
                     - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
                     - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
+                    - /session <save|clear|path> : Manage the low-write resumable session\n\
                     - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
                     - /sys <instruction> : Update system prompt\n\
                     - /key <api_key> : Save the active provider API key\n\
@@ -264,6 +293,22 @@ impl App {
                     self.set_status(format!("Automatic compaction threshold set to {} tokens", self.config.auto_compact_threshold_tokens));
                 } else {
                     self.add_message("system", "Usage: /autocompact <on|off|token-threshold>");
+                }
+            }
+            "/session" => {
+                match arg.to_ascii_lowercase().as_str() {
+                    "save" => match self.flush_session() {
+                        Ok(()) => self.add_message("system", "Session saved."),
+                        Err(error) => self.add_message("system", format!("Session save failed: {}", error)),
+                    },
+                    "clear" => {
+                        self.messages.clear();
+                        self.session_messages_at_save = 0;
+                        let _ = self.flush_session();
+                        self.add_message("system", "Session cleared and saved.");
+                    }
+                    "path" => self.add_message("system", format!("Session path: {}", self.session_path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "disabled".to_string()))),
+                    _ => self.add_message("system", "Usage: /session <save|clear|path>"),
                 }
             }
             "/temp" => {

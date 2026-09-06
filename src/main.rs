@@ -4,6 +4,8 @@ mod config;
 mod events;
 mod tools;
 mod ui;
+mod session;
+mod mcp;
 
 use app::{App, EngineState};
 use config::AppConfig;
@@ -24,8 +26,8 @@ fn reset_terminal() {
     let _ = execute!(stdout(), crossterm::cursor::Show);
 }
 
-fn prompt_for_api_key_if_missing(provider: &str) -> io::Result<String> {
-    if let Some(key) = AppConfig::get_api_key_for(provider) {
+fn prompt_for_api_key_if_missing(config: &AppConfig) -> io::Result<String> {
+    if let Some(key) = config.get_api_key_for_active_provider() {
         return Ok(key);
     }
 
@@ -70,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Check or prompt for API Key
     let config = AppConfig::load();
-    let api_key = match prompt_for_api_key_if_missing(&config.provider) {
+    let api_key = match prompt_for_api_key_if_missing(&config) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -87,6 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Initialize App state and channels
     let mut app = App::new(config, api_key);
+    let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
+    for tool in mcp_tools { app.tool_registry.register(tool); }
+    if app.config.auto_resume_session {
+        app.load_session();
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
 
     // 6. Spawn input event listener thread
@@ -185,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 8. Clean terminal restoration
+    let _ = app.flush_session();
     reset_terminal();
     Ok(())
 }
@@ -351,7 +359,7 @@ fn handle_key_event(
             if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
                 let commands = [
                     "/help", "/models", "/model", "/compact",
-                    "/thinking", "/reasoning", "/autocompact", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
+                    "/thinking", "/reasoning", "/autocompact", "/session", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
                     "/clear", "/save", "/quit",
                 ];
                 let prefix = app.input_buffer.to_lowercase();

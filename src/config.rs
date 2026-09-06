@@ -20,6 +20,17 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub temperature: Option<f32>,
@@ -53,6 +64,12 @@ pub struct AppConfig {
     pub auto_compact: bool,
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold_tokens: u64,
+    #[serde(default = "default_true")]
+    pub auto_resume_session: bool,
+    #[serde(default = "default_session_name")]
+    pub session_name: String,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 impl Default for AppConfig {
@@ -80,6 +97,9 @@ Operational Guidelines:\n\
             model_profiles: BTreeMap::new(),
             auto_compact: default_auto_compact(),
             auto_compact_threshold_tokens: default_auto_compact_threshold(),
+            auto_resume_session: true,
+            session_name: "default".to_string(),
+            mcp_servers: BTreeMap::new(),
         }
     }
 }
@@ -93,6 +113,8 @@ fn default_fallback_models() -> Vec<String> {
 fn default_max_retries() -> u32 { 3 }
 fn default_auto_compact() -> bool { true }
 fn default_auto_compact_threshold() -> u64 { 100_000 }
+fn default_true() -> bool { true }
+fn default_session_name() -> String { "default".to_string() }
 
 fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
     let mut providers = BTreeMap::new();
@@ -212,6 +234,16 @@ impl AppConfig {
         }
 
         None
+    }
+
+    pub fn get_api_key_for_active_provider(&self) -> Option<String> {
+        if let Some(variable) = self.active_provider_config().api_key_env {
+            if let Ok(key) = std::env::var(variable) {
+                let trimmed = key.trim();
+                if !trimmed.is_empty() { return Some(trimmed.to_string()); }
+            }
+        }
+        Self::get_api_key_for(&self.provider)
     }
 
     pub fn set_api_key(key: &str) -> Result<(), String> {
