@@ -236,18 +236,15 @@ fn handle_key_event(
             KeyCode::Enter => app.select_model_from_catalog(),
             KeyCode::Up => {
                 app.models_selected = app.models_selected.saturating_sub(1);
-                app.models_scroll = app.models_scroll.saturating_sub(1);
             }
             KeyCode::Down => {
                 if !app.available_models.is_empty() { app.models_selected = (app.models_selected + 1).min(app.available_models.len() - 1); }
-                app.models_scroll = app.models_scroll.saturating_add(1);
             }
             KeyCode::PageUp => {
-                app.models_scroll = app.models_scroll.saturating_sub(10);
+                app.models_selected = app.models_selected.saturating_sub(10);
             }
             KeyCode::PageDown => {
                 if !app.available_models.is_empty() { app.models_selected = (app.models_selected + 10).min(app.available_models.len() - 1); }
-                app.models_scroll = app.models_scroll.saturating_add(10);
             }
             KeyCode::Char('r') | KeyCode::Char('R') => app.toggle_selected_reasoning(),
             KeyCode::Char('[') => app.adjust_selected_thinking(-256),

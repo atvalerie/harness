@@ -147,6 +147,13 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled("[S] save config  [Esc] close", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
     ]));
 
+    let selected_offset = 3usize.saturating_add(
+        app.available_models
+            .iter()
+            .take(app.models_selected)
+            .map(|model| 2 + usize::from(!model.description.is_empty()))
+            .sum::<usize>(),
+    );
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
@@ -155,7 +162,7 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .wrap(Wrap { trim: false })
-        .scroll((app.models_scroll as u16, 0));
+        .scroll((selected_offset as u16, 0));
 
     frame.render_widget(paragraph, popup_area);
 }
