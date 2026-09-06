@@ -40,5 +40,4 @@ Configuration is saved with `/save` under the platform config directory. A compa
 
 Useful commands include `/provider`, `/baseurl`, `/model`, `/reasoning`, `/autocompact`, `/session save`, `/session path`, `/models`, and `/save`.
 
-Session files are written atomically only every 20 messages and on exit/manual save; they are not rewritten for every token or streaming chunk.
-
+Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk.

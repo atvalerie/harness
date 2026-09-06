@@ -134,9 +134,6 @@ impl App {
             timestamp: now,
         });
         self.chat_scroll = 0; // Stick to bottom
-        if self.messages.len().saturating_sub(self.session_messages_at_save) >= 20 {
-            let _ = self.flush_session();
-        }
     }
 
     pub fn load_session(&mut self) {
@@ -180,6 +177,7 @@ impl App {
         }
 
         self.add_message("user", text);
+        let _ = self.flush_session();
         self.trigger_generation(tx);
     }
 
@@ -609,6 +607,7 @@ impl App {
                     self.set_status(format!("Done ({})", reason));
                 }
                 self.stream_start_time = None;
+                let _ = self.flush_session();
             }
             StreamSignal::Notice(message) => {
                 self.set_status(&message);
@@ -720,6 +719,7 @@ impl App {
             content: serde_json::to_string(&response_part).unwrap_or_default(),
             timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
         });
+        let _ = self.flush_session();
 
         // Resume generation so model can synthesize answer from tool result
         self.state = EngineState::Idle;
@@ -922,6 +922,7 @@ impl App {
                     self.add_message("user", prompt);
                 }
                 self.state = EngineState::Idle;
+                let _ = self.flush_session();
                 if continue_generation { self.trigger_generation(tx); }
             }
             Err(e) => {
