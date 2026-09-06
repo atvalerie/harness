@@ -17,6 +17,7 @@ pub struct AiClient {
     base_url: String,
     provider: ProviderKind,
     headers: BTreeMap<String, String>,
+    include_stream_usage: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +50,10 @@ impl AiClient {
 
     pub fn from_config(api_key: String, config: &AppConfig) -> Self {
         let provider = config.active_provider_config();
-        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()), provider.headers)
+        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()), provider.headers, provider.stream_usage)
     }
 
-    pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>) -> Self {
+    pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>, include_stream_usage: bool) -> Self {
         Self {
             client: Client::builder()
                 .tcp_nodelay(true)
@@ -66,12 +67,14 @@ impl AiClient {
             api_key,
             provider,
             headers,
+            include_stream_usage,
         }
     }
 
-    pub fn update_provider(&mut self, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>) {
+    pub fn update_provider(&mut self, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>, include_stream_usage: bool) {
         self.provider = provider;
         self.headers = headers;
+        self.include_stream_usage = include_stream_usage;
         self.base_url = base_url.unwrap_or_else(|| match provider {
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta".to_string(),
             ProviderKind::OpenAiCompatible => "https://api.openai.com/v1".to_string(),
@@ -289,7 +292,7 @@ impl AiClient {
         'models: for (model_index, candidate) in models.iter().enumerate() {
             for attempt in 0..=max_retries {
                 let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-                let payload = openai::request_payload(candidate, request, true);
+                let payload = openai::request_payload(candidate, request, true, self.include_stream_usage);
                 let response = self.authorize(self.client.post(&url).json(&payload)).send().await;
                 match response {
                     Ok(response) if response.status().is_success() => {
@@ -319,7 +322,7 @@ impl AiClient {
 
     async fn generate_openai(&self, model: &str, request: &GenerateContentRequest) -> Result<String, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let response = self.authorize(self.client.post(&url).json(&openai::request_payload(model, request, false))).send().await.map_err(|e| format!("Request failed: {}", e))?;
+        let response = self.authorize(self.client.post(&url).json(&openai::request_payload(model, request, false, false))).send().await.map_err(|e| format!("Request failed: {}", e))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() { return Err(format_api_error(Some(status.as_u16()), &body)); }

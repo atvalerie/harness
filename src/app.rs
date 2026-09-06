@@ -194,7 +194,7 @@ impl App {
             self.config.select_provider(&snapshot.provider);
             self.config.model = snapshot.model;
             let provider_config = self.config.active_provider_config();
-            self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
+            self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage);
             if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                 self.client.update_api_key(api_key);
             }
@@ -274,6 +274,7 @@ impl App {
             fallback_models: Vec::new(),
             api_key_env: None,
             headers: std::collections::BTreeMap::new(),
+            stream_usage: true,
         });
         if let Some(position) = provider.fallback_models.iter().position(|candidate| candidate == &model) {
             provider.fallback_models.remove(position);
@@ -399,7 +400,7 @@ impl App {
                     self.config.select_provider(arg);
                     let provider_config = self.config.active_provider_config();
                     let provider = ProviderKind::parse(&provider_config.kind);
-                    self.client.update_provider(provider, provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
+                    self.client.update_provider(provider, provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage);
                     if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                         self.client.update_api_key(api_key);
                     }
@@ -419,7 +420,7 @@ impl App {
                         self.config.base_url = base_url.clone();
                     }
                     let provider_config = self.config.active_provider_config();
-                    self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
+                    self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage);
                     self.set_status("Provider base URL updated");
                     self.add_message("system", "Provider base URL updated. Use /save to persist it.");
                 }

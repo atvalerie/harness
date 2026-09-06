@@ -56,7 +56,9 @@ Configuration is saved with `/save` under the platform config directory. A compa
 }
 ```
 
-Any entry under `providers` becomes a selectable provider by name. Set `kind` to `gemini` for Gemini's native API; all other kinds use the OpenAI-compatible `/chat/completions` protocol. Set `base_url`, `api_key_env`, `model`, `models`, `fallback_models`, and optional `headers` per provider. OpenAI-compatible providers may omit `api_key_env` for local servers that do not require authentication. Select one with `/provider <name>` or `--provider <name>`.
+Any entry under `providers` becomes a selectable provider by name. Set `kind` to `gemini` for Gemini's native API; all other kinds use the OpenAI-compatible `/chat/completions` protocol. Set `base_url`, `api_key_env`, `model`, `models`, `fallback_models`, optional `headers`, and `stream_usage` per provider. OpenAI-compatible providers may omit `api_key_env` for local servers that do not require authentication. Select one with `/provider <name>` or `--provider <name>`.
+
+OpenCode Zen is included as the `opencode-zen` provider. Set `OPENCODE_API_KEY`, run `/provider opencode-zen`, then `/models`: the harness queries Zen's live `https://opencode.ai/zen/v1/models` catalog instead of baking the changing model list into the executable. The built-in model is only a bootstrap choice; use the model picker to choose the current free model(s). Zen's optional streaming usage event is disabled for this provider for compatibility with gateways that reject `stream_options`.
 
 Useful commands include `/provider`, `/baseurl`, `/config path`, `/config open`, `/model`, `/reasoning`, `/autocompact`, `/session save`, `/session path`, `/models`, and `/save`.
 

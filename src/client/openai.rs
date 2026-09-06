@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::UnboundedSender;
 
-pub fn request_payload(model: &str, request: &GenerateContentRequest, stream: bool) -> Value {
+pub fn request_payload(model: &str, request: &GenerateContentRequest, stream: bool, include_usage: bool) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = &request.system_instruction {
         messages.extend(content_messages(system));
@@ -26,7 +26,7 @@ pub fn request_payload(model: &str, request: &GenerateContentRequest, stream: bo
             }
         }
     }
-    if stream { payload["stream_options"] = json!({ "include_usage": true }); }
+    if stream && include_usage { payload["stream_options"] = json!({ "include_usage": true }); }
     if let Some(tools) = &request.tools {
         let declarations = tools.iter().flat_map(|tool| tool.function_declarations.iter()).map(|f| json!({
             "type": "function",
@@ -137,10 +137,13 @@ mod tests {
             safety_settings: None,
             tools: None,
         };
-        let payload = request_payload("test-model", &request, true);
+        let payload = request_payload("test-model", &request, true, true);
         assert_eq!(payload["model"], "test-model");
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hello");
         assert_eq!(payload["stream_options"]["include_usage"], true);
+
+        let payload_without_usage = request_payload("test-model", &request, true, false);
+        assert!(payload_without_usage.get("stream_options").is_none());
     }
 }

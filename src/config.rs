@@ -26,6 +26,10 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Whether streaming requests should ask for a final usage event.
+    /// Some OpenAI-compatible gateways reject this optional field.
+    #[serde(default = "default_true")]
+    pub stream_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +149,7 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
         fallback_models: default_fallback_models(),
         api_key_env: Some("GEMINI_API_KEY".to_string()),
         headers: BTreeMap::new(),
+        stream_usage: true,
     });
     providers.insert("openai".to_string(), ProviderConfig {
         kind: "openai-compatible".to_string(),
@@ -154,6 +159,21 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
         fallback_models: Vec::new(),
         api_key_env: Some("OPENAI_API_KEY".to_string()),
         headers: BTreeMap::new(),
+        stream_usage: true,
+    });
+    providers.insert("opencode-zen".to_string(), ProviderConfig {
+        kind: "openai-compatible".to_string(),
+        base_url: Some("https://opencode.ai/zen/v1".to_string()),
+        model: Some("ling-3.0-flash-fin-free".to_string()),
+        // The live /models catalog is the source of truth. This single model
+        // is only a bootstrap choice for the first request before discovery.
+        models: Vec::new(),
+        fallback_models: Vec::new(),
+        api_key_env: Some("OPENCODE_API_KEY".to_string()),
+        headers: BTreeMap::new(),
+        // Zen documents a few models that emit non-standard SSE when this is
+        // requested, so keep the provider-compatible default disabled.
+        stream_usage: false,
     });
     providers
 }
@@ -168,6 +188,7 @@ impl AppConfig {
             fallback_models: self.fallback_models.clone(),
             api_key_env: None,
             headers: BTreeMap::new(),
+            stream_usage: true,
         })
     }
 
@@ -213,12 +234,19 @@ impl AppConfig {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(cfg) = serde_json::from_str::<AppConfig>(&content) {
-                        return Self::migrate_legacy_gemini_defaults(cfg);
+                        return Self::with_builtin_providers(Self::migrate_legacy_gemini_defaults(cfg));
                     }
                 }
             }
         }
         Self::default()
+    }
+
+    fn with_builtin_providers(mut config: Self) -> Self {
+        for (name, provider) in default_provider_configs() {
+            config.providers.entry(name).or_insert(provider);
+        }
+        config
     }
 
     fn migrate_legacy_gemini_defaults(mut config: Self) -> Self {
@@ -372,6 +400,16 @@ mod tests {
     }
 
     #[test]
+    fn zen_uses_live_model_catalog() {
+        let config = AppConfig::default();
+        let zen = &config.providers["opencode-zen"];
+        assert_eq!(zen.base_url.as_deref(), Some("https://opencode.ai/zen/v1"));
+        assert!(zen.models.is_empty());
+        assert!(zen.fallback_models.is_empty());
+        assert!(!zen.stream_usage);
+    }
+
+    #[test]
     fn migrates_old_generated_gemini_defaults() {
         let mut config = AppConfig::default();
         config.model = "gemini-3.8-flash".to_string();
@@ -398,6 +436,7 @@ mod tests {
             fallback_models: vec!["llama3.2:3b".to_string()],
             api_key_env: Some("OLLAMA_API_KEY".to_string()),
             headers: BTreeMap::new(),
+            stream_usage: true,
         });
 
         config.select_provider("local");
