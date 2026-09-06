@@ -288,7 +288,7 @@ impl App {
                     - /models : Fetch live models & pricing from the active provider\n\
                     - /provider <gemini|openai> : Select API protocol/provider\n\
                     - /baseurl <url|default> : Set a custom OpenAI-compatible API base URL\n\
-                    - /model <name> : Switch active model (e.g. /model gemini-3.8-flash)\n\
+                    - /model <name> : Switch active model (e.g. /model gemini-3.6-flash)\n\
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
                     - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
                     - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
