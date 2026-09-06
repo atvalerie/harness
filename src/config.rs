@@ -11,14 +11,20 @@ const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    #[serde(default = "default_provider")]
+    #[serde(default = "default_provider_kind")]
     pub kind: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
     pub fallback_models: Vec<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +118,7 @@ Operational Guidelines:\n\
 }
 
 fn default_provider() -> String { "gemini".to_string() }
+fn default_provider_kind() -> String { "openai-compatible".to_string() }
 
 fn default_fallback_models() -> Vec<String> {
     vec![
@@ -132,14 +139,20 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
     providers.insert("gemini".to_string(), ProviderConfig {
         kind: "gemini".to_string(),
         base_url: None,
+        model: Some(DEFAULT_GEMINI_MODEL.to_string()),
+        models: Vec::new(),
         fallback_models: default_fallback_models(),
         api_key_env: Some("GEMINI_API_KEY".to_string()),
+        headers: BTreeMap::new(),
     });
     providers.insert("openai".to_string(), ProviderConfig {
         kind: "openai-compatible".to_string(),
         base_url: None,
+        model: None,
+        models: Vec::new(),
         fallback_models: Vec::new(),
         api_key_env: Some("OPENAI_API_KEY".to_string()),
+        headers: BTreeMap::new(),
     });
     providers
 }
@@ -147,16 +160,30 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
 impl AppConfig {
     pub fn active_provider_config(&self) -> ProviderConfig {
         self.providers.get(&self.provider).cloned().unwrap_or_else(|| ProviderConfig {
-            kind: self.provider.clone(),
+            kind: default_provider_kind(),
             base_url: self.base_url.clone(),
+            model: None,
+            models: Vec::new(),
             fallback_models: self.fallback_models.clone(),
             api_key_env: None,
+            headers: BTreeMap::new(),
         })
+    }
+
+    pub fn select_provider(&mut self, name: &str) {
+        self.provider = name.trim().to_string();
+        if let Some(model) = self.providers.get(&self.provider).and_then(|provider| provider.model.clone()) {
+            self.model = model;
+        }
     }
 
     pub fn effective_fallback_models(&self) -> Vec<String> {
         let profile = self.active_provider_config();
         if profile.fallback_models.is_empty() { self.fallback_models.clone() } else { profile.fallback_models }
+    }
+
+    pub fn configured_models(&self) -> Vec<String> {
+        self.active_provider_config().models
     }
 
     pub fn model_profile_key(&self) -> String { format!("{}:{}", self.provider, self.model) }
@@ -243,10 +270,12 @@ impl AppConfig {
 
     pub fn get_api_key_for(provider: &str) -> Option<String> {
         // 1. Check environment variable first
-        let variables = if provider.eq_ignore_ascii_case("openai") || provider.eq_ignore_ascii_case("openai-compatible") {
-            ["OPENAI_API_KEY", "GEMINI_API_KEY"]
+        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("openai") || provider.eq_ignore_ascii_case("openai-compatible") {
+            vec!["OPENAI_API_KEY", "GEMINI_API_KEY"]
+        } else if provider.eq_ignore_ascii_case("gemini") {
+            vec!["GEMINI_API_KEY", "OPENAI_API_KEY"]
         } else {
-            ["GEMINI_API_KEY", "OPENAI_API_KEY"]
+            Vec::new()
         };
         for variable in variables {
             if let Ok(key) = std::env::var(variable) {
@@ -325,7 +354,8 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_fallback_models, AppConfig};
+    use super::{default_fallback_models, AppConfig, ProviderConfig};
+    use std::collections::BTreeMap;
 
     #[test]
     fn defaults_target_free_tier_models() {
@@ -348,5 +378,25 @@ mod tests {
         assert_eq!(migrated.model, "gemini-3.5-flash-lite");
         assert_eq!(migrated.fallback_models, default_fallback_models());
         assert_eq!(migrated.providers["gemini"].fallback_models, default_fallback_models());
+    }
+
+    #[test]
+    fn custom_provider_selects_its_model() {
+        let mut config = AppConfig::default();
+        config.providers.insert("local".to_string(), ProviderConfig {
+            kind: "openai-compatible".to_string(),
+            base_url: Some("http://localhost:11434/v1".to_string()),
+            model: Some("qwen3:8b".to_string()),
+            models: vec!["qwen3:8b".to_string()],
+            fallback_models: vec!["llama3.2:3b".to_string()],
+            api_key_env: Some("OLLAMA_API_KEY".to_string()),
+            headers: BTreeMap::new(),
+        });
+
+        config.select_provider("local");
+        assert_eq!(config.provider, "local");
+        assert_eq!(config.model, "qwen3:8b");
+        assert_eq!(config.active_provider_config().base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(config.effective_fallback_models(), vec!["llama3.2:3b"]);
     }
 }

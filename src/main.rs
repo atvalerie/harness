@@ -8,6 +8,7 @@ mod session;
 mod mcp;
 
 use app::{App, EngineState};
+use client::ProviderKind;
 use config::AppConfig;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -28,6 +29,16 @@ struct CliArgs {
     base_url: Option<String>,
 }
 
+fn resolve_api_key(config: &AppConfig) -> io::Result<String> {
+    if let Some(key) = config.get_api_key_for_active_provider() {
+        return Ok(key);
+    }
+    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible {
+        return Ok(String::new());
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))
+}
+
 fn parse_cli_args() -> Result<CliArgs, String> {
     let mut args = std::env::args().skip(1);
     let mut cli = CliArgs { prompt: None, chat: false, provider: None, model: None, base_url: None };
@@ -38,7 +49,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--provider" => cli.provider = Some(args.next().ok_or_else(|| "--provider requires a value".to_string())?),
             "--model" => cli.model = Some(args.next().ok_or_else(|| "--model requires a value".to_string())?),
             "--base-url" => cli.base_url = Some(args.next().ok_or_else(|| "--base-url requires a value".to_string())?),
-            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" | --chat [--provider gemini|openai] [--model MODEL] [--base-url URL]".to_string()),
+            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" | --chat [--provider NAME] [--model MODEL] [--base-url URL]".to_string()),
             unknown => return Err(format!("Unknown argument '{}'. Use --help.", unknown)),
         }
     }
@@ -48,10 +59,14 @@ fn parse_cli_args() -> Result<CliArgs, String> {
 async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let Some(prompt) = cli.prompt else { return Err("Missing prompt. Use -p \"prompt\" or launch without arguments for the TUI.".into()) };
     let mut config = AppConfig::load();
-    if let Some(provider) = cli.provider { config.provider = provider; }
+    if let Some(provider) = cli.provider { config.select_provider(&provider); }
     if let Some(model) = cli.model { config.model = model; }
-    if let Some(base_url) = cli.base_url { config.base_url = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) }; }
-    let api_key = config.get_api_key_for_active_provider().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))?;
+    if let Some(base_url) = cli.base_url {
+        let value = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) };
+        if let Some(provider) = config.providers.get_mut(&config.provider) { provider.base_url = value; }
+        else { config.base_url = value; }
+    }
+    let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
     app.add_message("user", prompt);
     let request = app.build_request();
@@ -66,10 +81,14 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // normal line-input and echo flags before reading stdin.
     let _ = crossterm::terminal::disable_raw_mode();
     let mut config = AppConfig::load();
-    if let Some(provider) = cli.provider { config.provider = provider; }
+    if let Some(provider) = cli.provider { config.select_provider(&provider); }
     if let Some(model) = cli.model { config.model = model; }
-    if let Some(base_url) = cli.base_url { config.base_url = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) }; }
-    let api_key = config.get_api_key_for_active_provider().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))?;
+    if let Some(base_url) = cli.base_url {
+        let value = if base_url.eq_ignore_ascii_case("default") { None } else { Some(base_url) };
+        if let Some(provider) = config.providers.get_mut(&config.provider) { provider.base_url = value; }
+        else { config.base_url = value; }
+    }
+    let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
     let stdin = io::stdin();
     let mut line = String::new();
@@ -112,6 +131,9 @@ fn reset_terminal() {
 fn prompt_for_api_key_if_missing(config: &AppConfig) -> io::Result<String> {
     if let Some(key) = config.get_api_key_for_active_provider() {
         return Ok(key);
+    }
+    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible {
+        return Ok(String::new());
     }
 
     println!();

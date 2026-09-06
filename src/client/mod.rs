@@ -5,7 +5,8 @@ mod openai;
 use crate::events::StreamSignal;
 use crate::config::AppConfig;
 use types::{GenerateContentRequest, ListModelsResponse, ModelInfo};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
+use std::collections::BTreeMap;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{sleep, Duration};
 
@@ -15,6 +16,7 @@ pub struct AiClient {
     api_key: String,
     base_url: String,
     provider: ProviderKind,
+    headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,23 +28,31 @@ pub enum ProviderKind {
 impl ProviderKind {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "openai" | "openai-compatible" | "openai_compatible" => Self::OpenAiCompatible,
-            _ => Self::Gemini,
+            "gemini" | "google" | "google-gemini" => Self::Gemini,
+            _ => Self::OpenAiCompatible,
         }
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self { Self::Gemini => "gemini", Self::OpenAiCompatible => "openai-compatible" }
-    }
 }
 
 impl AiClient {
-    pub fn from_config(api_key: String, config: &AppConfig) -> Self {
-        let provider = config.active_provider_config();
-        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()))
+    fn authorize(&self, mut request: RequestBuilder) -> RequestBuilder {
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        if self.provider == ProviderKind::OpenAiCompatible && !self.api_key.is_empty() {
+            request.bearer_auth(&self.api_key)
+        } else {
+            request
+        }
     }
 
-    pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>) -> Self {
+    pub fn from_config(api_key: String, config: &AppConfig) -> Self {
+        let provider = config.active_provider_config();
+        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()), provider.headers)
+    }
+
+    pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>) -> Self {
         Self {
             client: Client::builder()
                 .tcp_nodelay(true)
@@ -55,11 +65,13 @@ impl AiClient {
             }),
             api_key,
             provider,
+            headers,
         }
     }
 
-    pub fn update_provider(&mut self, provider: ProviderKind, base_url: Option<String>) {
+    pub fn update_provider(&mut self, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>) {
         self.provider = provider;
+        self.headers = headers;
         self.base_url = base_url.unwrap_or_else(|| match provider {
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta".to_string(),
             ProviderKind::OpenAiCompatible => "https://api.openai.com/v1".to_string(),
@@ -87,7 +99,7 @@ impl AiClient {
         'models: for (model_index, candidate) in models.iter().enumerate() {
             for attempt in 0..=max_retries {
                 let url = format!("{}/models/{}:streamGenerateContent?alt=sse&key={}", self.base_url, clean_model(candidate), self.api_key);
-                match self.client.post(&url).header("Content-Type", "application/json").json(request).send().await {
+                match self.authorize(self.client.post(&url).header("Content-Type", "application/json")).json(request).send().await {
                     Ok(response) if response.status().is_success() => {
                         if model_index > 0 { let _ = tx.send(StreamSignal::Notice(format!("Using fallback model {}", candidate))); }
                         sse::stream_sse_response(response, tx).await;
@@ -137,9 +149,7 @@ impl AiClient {
         );
 
         let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
+            .authorize(self.client.post(&url).header("Content-Type", "application/json"))
             .json(request)
             .send()
             .await
@@ -280,7 +290,7 @@ impl AiClient {
             for attempt in 0..=max_retries {
                 let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
                 let payload = openai::request_payload(candidate, request, true);
-                let response = self.client.post(&url).bearer_auth(&self.api_key).json(&payload).send().await;
+                let response = self.authorize(self.client.post(&url).json(&payload)).send().await;
                 match response {
                     Ok(response) if response.status().is_success() => {
                         if model_index > 0 { let _ = tx.send(StreamSignal::Notice(format!("Using fallback model {}", candidate))); }
@@ -309,7 +319,7 @@ impl AiClient {
 
     async fn generate_openai(&self, model: &str, request: &GenerateContentRequest) -> Result<String, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let response = self.client.post(&url).bearer_auth(&self.api_key).json(&openai::request_payload(model, request, false)).send().await.map_err(|e| format!("Request failed: {}", e))?;
+        let response = self.authorize(self.client.post(&url).json(&openai::request_payload(model, request, false))).send().await.map_err(|e| format!("Request failed: {}", e))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() { return Err(format_api_error(Some(status.as_u16()), &body)); }
@@ -319,7 +329,7 @@ impl AiClient {
 
     async fn list_openai_models(&self) -> Result<Vec<ModelInfo>, String> {
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let response = self.client.get(&url).bearer_auth(&self.api_key).send().await.map_err(|e| format!("Failed to list models: {}", e))?;
+        let response = self.authorize(self.client.get(&url)).send().await.map_err(|e| format!("Failed to list models: {}", e))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() { return Err(format_api_error(Some(status.as_u16()), &body)); }
@@ -357,6 +367,7 @@ mod tests {
         assert_eq!(ProviderKind::parse("gemini"), ProviderKind::Gemini);
         assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAiCompatible);
         assert_eq!(ProviderKind::parse("openai-compatible"), ProviderKind::OpenAiCompatible);
+        assert_eq!(ProviderKind::parse("local"), ProviderKind::OpenAiCompatible);
     }
 }
 

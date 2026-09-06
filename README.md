@@ -18,7 +18,11 @@ Configuration is saved with `/save` under the platform config directory. A compa
     "local": {
       "kind": "openai-compatible",
       "base_url": "http://localhost:11434/v1",
-      "api_key_env": "OLLAMA_API_KEY"
+      "api_key_env": "OLLAMA_API_KEY",
+      "model": "qwen3:8b",
+      "models": ["qwen3:8b", "llama3.2:3b"],
+      "fallback_models": ["llama3.2:3b"],
+      "headers": { "X-Provider-Client": "gemini-harness" }
     }
   },
   "model_profiles": {
@@ -43,6 +47,8 @@ Configuration is saved with `/save` under the platform config directory. A compa
   }
 }
 ```
+
+Any entry under `providers` becomes a selectable provider by name. Set `kind` to `gemini` for Gemini's native API; all other kinds use the OpenAI-compatible `/chat/completions` protocol. Set `base_url`, `api_key_env`, `model`, `models`, `fallback_models`, and optional `headers` per provider. OpenAI-compatible providers may omit `api_key_env` for local servers that do not require authentication. Select one with `/provider <name>` or `--provider <name>`.
 
 Useful commands include `/provider`, `/baseurl`, `/model`, `/reasoning`, `/autocompact`, `/session save`, `/session path`, `/models`, and `/save`.
 

@@ -34,7 +34,7 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
         let commands = [
             "/help - show available commands",
             "/models - query live models & pricing",
-            "/provider <gemini|openai> - select API provider",
+            "/provider <name> - select configured provider",
             "/baseurl <url|default> - set provider base URL",
             "/reasoning <on|off|budget> - configure active model reasoning",
             "/autocompact <on|off|tokens> - configure automatic compaction",

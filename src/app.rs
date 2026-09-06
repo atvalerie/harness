@@ -147,9 +147,13 @@ impl App {
         let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else { return };
         if let Some(snapshot) = session::load(&info.path) {
             self.messages = snapshot.messages;
-            self.config.provider = snapshot.provider;
+            self.config.select_provider(&snapshot.provider);
             self.config.model = snapshot.model;
-            self.client.update_provider(ProviderKind::parse(&self.config.provider), self.config.base_url.clone());
+            let provider_config = self.config.active_provider_config();
+            self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
+            if let Some(api_key) = self.config.get_api_key_for_active_provider() {
+                self.client.update_api_key(api_key);
+            }
             self.session_path = Some(info.path.clone());
             self.chat_scroll = 0;
             self.session_messages_at_save = self.messages.len();
@@ -219,10 +223,13 @@ impl App {
         let Some(model) = self.selected_model_id() else { return };
         let provider_name = self.config.provider.clone();
         let provider = self.config.providers.entry(provider_name.clone()).or_insert_with(|| crate::config::ProviderConfig {
-            kind: provider_name.clone(),
+            kind: "openai-compatible".to_string(),
             base_url: self.config.base_url.clone(),
+            model: None,
+            models: Vec::new(),
             fallback_models: Vec::new(),
             api_key_env: None,
+            headers: std::collections::BTreeMap::new(),
         });
         if let Some(position) = provider.fallback_models.iter().position(|candidate| candidate == &model) {
             provider.fallback_models.remove(position);
@@ -286,8 +293,8 @@ impl App {
                     "Available Commands:\n\
                     - /compact : Summarize conversation history to reclaim context window\n\
                     - /models : Fetch live models & pricing from the active provider\n\
-                    - /provider <gemini|openai> : Select API protocol/provider\n\
-                    - /baseurl <url|default> : Set a custom OpenAI-compatible API base URL\n\
+                    - /provider <name> : Select a configured provider\n\
+                    - /baseurl <url|default> : Set the active provider base URL\n\
                     - /model <name> : Switch active model (e.g. /model gemini-3.5-flash-lite)\n\
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
                     - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
@@ -309,8 +316,34 @@ impl App {
             "/models" => {
                 self.add_message("system", format!("Fetching models from {}...", self.config.provider));
                 let client = self.client.clone();
+                let configured_models = self.config.configured_models();
                 tokio::spawn(async move {
-                    let res = client.list_models().await;
+                    let res = match client.list_models().await {
+                        Ok(mut models) => {
+                            for id in configured_models {
+                                if !models.iter().any(|model| model.id == id) {
+                                    models.push(crate::client::types::ModelInfo {
+                                        id: id.clone(),
+                                        display_name: id,
+                                        description: "Configured provider model".to_string(),
+                                        input_price_per_m: None,
+                                        output_price_per_m: None,
+                                        input_token_limit: None,
+                                    });
+                                }
+                            }
+                            Ok(models)
+                        }
+                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().map(|id| crate::client::types::ModelInfo {
+                            display_name: id.clone(),
+                            id,
+                            description: "Configured provider model (API model listing unavailable)".to_string(),
+                            input_price_per_m: None,
+                            output_price_per_m: None,
+                            input_token_limit: None,
+                        }).collect()),
+                        Err(error) => Err(error),
+                    };
                     let _ = tx.send(AppEvent::ModelsFetched(res));
                 });
             }
@@ -318,19 +351,30 @@ impl App {
                 if arg.is_empty() {
                     self.add_message("system", format!("Current provider: {}", self.config.provider));
                 } else {
-                    let provider = ProviderKind::parse(arg);
-                    self.config.provider = provider.as_str().to_string();
-                    self.client.update_provider(provider, self.config.base_url.clone());
+                    self.config.select_provider(arg);
+                    let provider_config = self.config.active_provider_config();
+                    let provider = ProviderKind::parse(&provider_config.kind);
+                    self.client.update_provider(provider, provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
+                    if let Some(api_key) = self.config.get_api_key_for_active_provider() {
+                        self.client.update_api_key(api_key);
+                    }
                     self.set_status(format!("Provider set to {}", self.config.provider));
                     self.add_message("system", format!("Provider set to {}", self.config.provider));
                 }
             }
             "/baseurl" => {
                 if arg.is_empty() {
-                    self.add_message("system", format!("Current base URL: {}", self.config.base_url.as_deref().unwrap_or("provider default")));
+                    let base_url = self.config.active_provider_config().base_url.or_else(|| self.config.base_url.clone());
+                    self.add_message("system", format!("Current base URL: {}", base_url.as_deref().unwrap_or("provider default")));
                 } else {
-                    self.config.base_url = if arg.eq_ignore_ascii_case("default") { None } else { Some(arg.to_string()) };
-                    self.client.update_provider(ProviderKind::parse(&self.config.provider), self.config.base_url.clone());
+                    let base_url = if arg.eq_ignore_ascii_case("default") { None } else { Some(arg.to_string()) };
+                    if let Some(provider) = self.config.providers.get_mut(&self.config.provider) {
+                        provider.base_url = base_url.clone();
+                    } else {
+                        self.config.base_url = base_url.clone();
+                    }
+                    let provider_config = self.config.active_provider_config();
+                    self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers);
                     self.set_status("Provider base URL updated");
                     self.add_message("system", "Provider base URL updated. Use /save to persist it.");
                 }
