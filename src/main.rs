@@ -61,6 +61,10 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // `--chat` may be launched after the TUI was force-terminated. In that
+    // case Windows can leave the console in raw/no-echo mode, so restore the
+    // normal line-input and echo flags before reading stdin.
+    let _ = crossterm::terminal::disable_raw_mode();
     let mut config = AppConfig::load();
     if let Some(provider) = cli.provider { config.provider = provider; }
     if let Some(model) = cli.model { config.model = model; }
