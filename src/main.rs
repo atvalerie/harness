@@ -8,7 +8,7 @@ mod session;
 mod mcp;
 
 use app::{App, EngineState};
-use client::{is_zen_responses_model_id, ProviderKind};
+use client::{is_zen_unsupported_model_id, ProviderKind};
 use config::AppConfig;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -300,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let current_model = app.config.model.clone();
                                     let free_fallbacks = app.available_models.iter()
                                         .filter(|model| model.id.to_ascii_lowercase().ends_with("-free"))
-                                        .filter(|model| !is_zen_responses_model_id(&model.id))
+                                        .filter(|model| !is_zen_unsupported_model_id(&model.id))
                                         .map(|model| model.id.clone())
                                         .filter(|model| model != &current_model)
                                         .take(5)

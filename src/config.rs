@@ -14,6 +14,9 @@ const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 pub struct ProviderConfig {
     #[serde(default = "default_provider_kind")]
     pub kind: String,
+    /// Wire protocol: auto, chat-completions, or responses.
+    #[serde(default = "default_provider_protocol")]
+    pub protocol: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -124,6 +127,7 @@ Operational Guidelines:\n\
 
 fn default_provider() -> String { "gemini".to_string() }
 fn default_provider_kind() -> String { "openai-compatible".to_string() }
+fn default_provider_protocol() -> String { "auto".to_string() }
 
 fn default_fallback_models() -> Vec<String> {
     vec![
@@ -143,6 +147,7 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
     let mut providers = BTreeMap::new();
     providers.insert("gemini".to_string(), ProviderConfig {
         kind: "gemini".to_string(),
+        protocol: "auto".to_string(),
         base_url: None,
         model: Some(DEFAULT_GEMINI_MODEL.to_string()),
         models: Vec::new(),
@@ -153,6 +158,7 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
     });
     providers.insert("openai".to_string(), ProviderConfig {
         kind: "openai-compatible".to_string(),
+        protocol: "auto".to_string(),
         base_url: None,
         model: None,
         models: Vec::new(),
@@ -163,6 +169,7 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
     });
     providers.insert("opencode-zen".to_string(), ProviderConfig {
         kind: "openai-compatible".to_string(),
+        protocol: "auto".to_string(),
         base_url: Some("https://opencode.ai/zen/v1".to_string()),
         model: Some("ling-3.0-flash-fin-free".to_string()),
         // The live /models catalog is the source of truth. This single model
@@ -182,6 +189,7 @@ impl AppConfig {
     pub fn active_provider_config(&self) -> ProviderConfig {
         self.providers.get(&self.provider).cloned().unwrap_or_else(|| ProviderConfig {
             kind: default_provider_kind(),
+            protocol: default_provider_protocol(),
             base_url: self.base_url.clone(),
             model: None,
             models: Vec::new(),
@@ -430,6 +438,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.providers.insert("local".to_string(), ProviderConfig {
             kind: "openai-compatible".to_string(),
+            protocol: "auto".to_string(),
             base_url: Some("http://localhost:11434/v1".to_string()),
             model: Some("qwen3:8b".to_string()),
             models: vec!["qwen3:8b".to_string()],

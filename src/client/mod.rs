@@ -18,12 +18,30 @@ pub struct AiClient {
     provider: ProviderKind,
     headers: BTreeMap<String, String>,
     include_stream_usage: bool,
+    protocol: ProviderProtocol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Gemini,
     OpenAiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProtocol {
+    Auto,
+    ChatCompletions,
+    Responses,
+}
+
+impl ProviderProtocol {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "responses" | "response" | "openai-responses" => Self::Responses,
+            "chat-completions" | "chat" | "completions" | "openai-compatible" => Self::ChatCompletions,
+            _ => Self::Auto,
+        }
+    }
 }
 
 impl ProviderKind {
@@ -50,10 +68,10 @@ impl AiClient {
 
     pub fn from_config(api_key: String, config: &AppConfig) -> Self {
         let provider = config.active_provider_config();
-        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()), provider.headers, provider.stream_usage)
+        Self::with_provider(api_key, ProviderKind::parse(&provider.kind), provider.base_url.or_else(|| config.base_url.clone()), provider.headers, provider.stream_usage, ProviderProtocol::parse(&provider.protocol))
     }
 
-    pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>, include_stream_usage: bool) -> Self {
+    pub fn with_provider(api_key: String, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>, include_stream_usage: bool, protocol: ProviderProtocol) -> Self {
         Self {
             client: Client::builder()
                 .tcp_nodelay(true)
@@ -68,13 +86,15 @@ impl AiClient {
             provider,
             headers,
             include_stream_usage,
+            protocol,
         }
     }
 
-    pub fn update_provider(&mut self, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>, include_stream_usage: bool) {
+    pub fn update_provider(&mut self, provider: ProviderKind, base_url: Option<String>, headers: BTreeMap<String, String>, include_stream_usage: bool, protocol: ProviderProtocol) {
         self.provider = provider;
         self.headers = headers;
         self.include_stream_usage = include_stream_usage;
+        self.protocol = protocol;
         self.base_url = base_url.unwrap_or_else(|| match provider {
             ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta".to_string(),
             ProviderKind::OpenAiCompatible => "https://api.openai.com/v1".to_string(),
@@ -290,19 +310,29 @@ impl AiClient {
         if models.is_empty() { models.push(clean_model(model).to_string()); }
         let mut last_error = String::new();
         'models: for (model_index, candidate) in models.iter().enumerate() {
-            if self.is_zen() && is_zen_responses_model_id(candidate) {
-                let error = format!("Zen model {} uses the Responses API; select a Chat Completions model.", candidate);
+            if self.is_zen() && is_zen_unsupported_model_id(candidate) {
+                let error = format!("Zen model {} uses an unsupported protocol for this harness; choose a Chat Completions or Responses model.", candidate);
                 let _ = tx.send(StreamSignal::Error(error));
                 return;
             }
             for attempt in 0..=max_retries {
-                let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-                let payload = openai::request_payload(candidate, request, true, self.include_stream_usage);
+                let use_responses = self.uses_responses(candidate);
+                let endpoint = if use_responses { "responses" } else { "chat/completions" };
+                let url = format!("{}/{}", self.base_url.trim_end_matches('/'), endpoint);
+                let payload = if use_responses {
+                    openai::responses_request_payload(candidate, request, true)
+                } else {
+                    openai::request_payload(candidate, request, true, self.include_stream_usage)
+                };
                 let response = self.authorize(self.client.post(&url).json(&payload)).send().await;
                 match response {
                     Ok(response) if response.status().is_success() => {
                         if model_index > 0 { let _ = tx.send(StreamSignal::Notice(format!("Using fallback model {}", candidate))); }
-                        openai::stream_response(response, tx).await;
+                        if use_responses {
+                            openai::stream_responses_response(response, tx).await;
+                        } else {
+                            openai::stream_response(response, tx).await;
+                        }
                         return;
                     }
                     Ok(response) => {
@@ -326,8 +356,14 @@ impl AiClient {
     }
 
     async fn generate_openai(&self, model: &str, request: &GenerateContentRequest) -> Result<String, String> {
-        if self.is_zen() && is_zen_responses_model_id(model) {
-            return Err(format!("Zen model {} uses the Responses API; select a Chat Completions model.", model));
+        if self.uses_responses(model) {
+            let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+            let response = self.authorize(self.client.post(&url).json(&openai::responses_request_payload(model, request, false))).send().await.map_err(|e| format!("Request failed: {}", e))?;
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() { return Err(format_api_error(Some(status.as_u16()), &body)); }
+            let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+            return openai::responses_text(&json).ok_or_else(|| "No text output produced by Responses API".to_string());
         }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = self.authorize(self.client.post(&url).json(&openai::request_payload(model, request, false, false))).send().await.map_err(|e| format!("Request failed: {}", e))?;
@@ -347,7 +383,7 @@ impl AiClient {
         let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("Failed to deserialize models list: {}", e))?;
         Ok(data.get("data").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|entry| {
             let id = entry.get("id").and_then(|v| v.as_str())?;
-            if self.is_zen() && is_zen_responses_model_id(id) { return None; }
+            if self.is_zen() && is_zen_unsupported_model_id(id) { return None; }
             let description = entry.get("description").and_then(|v| v.as_str()).unwrap_or("OpenAI-compatible model").to_string();
             let input_price_per_m = openrouter_price_per_m(entry, "prompt");
             let output_price_per_m = openrouter_price_per_m(entry, "completion");
@@ -366,18 +402,31 @@ impl AiClient {
     fn is_zen(&self) -> bool {
         self.base_url.to_ascii_lowercase().contains("opencode.ai/zen/")
     }
+
+    fn uses_responses(&self, model: &str) -> bool {
+        match self.protocol {
+            ProviderProtocol::Responses => true,
+            ProviderProtocol::ChatCompletions => false,
+            ProviderProtocol::Auto => self.is_zen() && is_zen_responses_model_id(model),
+        }
+    }
 }
 
 /// Zen publishes one model catalog for several wire protocols. These model
-/// families are documented as Responses, Anthropic Messages, or Gemini-native
-/// endpoints rather than Chat Completions, which is the protocol handled here.
+/// families are documented as Responses rather than Chat Completions.
 pub fn is_zen_responses_model_id(model: &str) -> bool {
     let model = clean_model(model).to_ascii_lowercase();
     model.starts_with("gpt-")
-        || model.starts_with("claude-")
-        || model.starts_with("gemini-")
         || model.starts_with("grok-")
         || model.starts_with("muse-spark-")
+}
+
+/// These Zen families use Anthropic Messages or Gemini-native endpoints. They
+/// are hidden from the OpenAI-compatible picker until those adapters exist.
+pub fn is_zen_unsupported_model_id(model: &str) -> bool {
+    let model = clean_model(model).to_ascii_lowercase();
+    model.starts_with("claude-")
+        || model.starts_with("gemini-")
         || model.starts_with("qwen3.")
 }
 
@@ -410,7 +459,7 @@ fn backoff(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_zen_responses_model_id, openrouter_price_per_m, ProviderKind};
+    use super::{is_zen_responses_model_id, is_zen_unsupported_model_id, openrouter_price_per_m, ProviderKind, ProviderProtocol};
     use serde_json::json;
 
     #[test]
@@ -419,6 +468,8 @@ mod tests {
         assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAiCompatible);
         assert_eq!(ProviderKind::parse("openai-compatible"), ProviderKind::OpenAiCompatible);
         assert_eq!(ProviderKind::parse("local"), ProviderKind::OpenAiCompatible);
+        assert_eq!(ProviderProtocol::parse("responses"), ProviderProtocol::Responses);
+        assert_eq!(ProviderProtocol::parse("chat-completions"), ProviderProtocol::ChatCompletions);
     }
 
     #[test]
@@ -432,6 +483,8 @@ mod tests {
     fn recognizes_zen_models_that_need_another_protocol() {
         assert!(is_zen_responses_model_id("muse-spark-1.3-contributor-free"));
         assert!(is_zen_responses_model_id("gpt-5.5"));
+        assert!(is_zen_unsupported_model_id("claude-opus-5"));
+        assert!(is_zen_unsupported_model_id("gemini-3.8-flash"));
         assert!(!is_zen_responses_model_id("mimo-v2.5-free"));
     }
 }

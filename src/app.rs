@@ -194,7 +194,7 @@ impl App {
             self.config.select_provider(&snapshot.provider);
             self.config.model = snapshot.model;
             let provider_config = self.config.active_provider_config();
-            self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage);
+            self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage, crate::client::ProviderProtocol::parse(&provider_config.protocol));
             if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                 self.client.update_api_key(api_key);
             }
@@ -268,6 +268,7 @@ impl App {
         let provider_name = self.config.provider.clone();
         let provider = self.config.providers.entry(provider_name.clone()).or_insert_with(|| crate::config::ProviderConfig {
             kind: "openai-compatible".to_string(),
+            protocol: "auto".to_string(),
             base_url: self.config.base_url.clone(),
             model: None,
             models: Vec::new(),
@@ -374,10 +375,10 @@ impl App {
                     let res = match client.list_models().await {
                         Ok(mut models) => {
                             if free_only {
-                                models.retain(|model| is_free_model_id(&model.id) && !crate::client::is_zen_responses_model_id(&model.id));
+                                models.retain(|model| is_free_model_id(&model.id));
                             }
                             for id in configured_models {
-                                if free_only && (!is_free_model_id(&id) || crate::client::is_zen_responses_model_id(&id)) {
+                                if free_only && (!is_free_model_id(&id) || crate::client::is_zen_unsupported_model_id(&id)) {
                                     continue;
                                 }
                                 if !models.iter().any(|model| model.id == id) {
@@ -401,7 +402,7 @@ impl App {
                             output_price_per_m: None,
                             input_token_limit: None,
                         }]),
-                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().filter(|id| !free_only || (is_free_model_id(id) && !crate::client::is_zen_responses_model_id(id))).map(|id| crate::client::types::ModelInfo {
+                        Err(_error) if !configured_models.is_empty() => Ok(configured_models.into_iter().filter(|id| !free_only || (is_free_model_id(id) && !crate::client::is_zen_unsupported_model_id(id))).map(|id| crate::client::types::ModelInfo {
                             display_name: id.clone(),
                             id,
                             description: "Configured provider model (API model listing unavailable)".to_string(),
@@ -419,7 +420,7 @@ impl App {
                 for (name, provider) in &self.config.providers {
                     let marker = if name == &self.config.provider { "*" } else { " " };
                     let model = provider.model.as_deref().unwrap_or("(choose a model)");
-                    lines.push(format!("{} {:<18} kind={}  model={}", marker, name, provider.kind, model));
+                    lines.push(format!("{} {:<18} kind={} protocol={}  model={}", marker, name, provider.kind, provider.protocol, model));
                 }
                 if !self.config.providers.contains_key(&self.config.provider) {
                     lines.push(format!("* {:<18} kind={}  model={}", self.config.provider, "openai-compatible", self.config.model));
@@ -435,7 +436,7 @@ impl App {
                     self.config.select_provider(arg);
                     let provider_config = self.config.active_provider_config();
                     let provider = ProviderKind::parse(&provider_config.kind);
-                    self.client.update_provider(provider, provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage);
+                    self.client.update_provider(provider, provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage, crate::client::ProviderProtocol::parse(&provider_config.protocol));
                     if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                         self.client.update_api_key(api_key);
                     }
@@ -455,7 +456,7 @@ impl App {
                         self.config.base_url = base_url.clone();
                     }
                     let provider_config = self.config.active_provider_config();
-                    self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage);
+                    self.client.update_provider(ProviderKind::parse(&provider_config.kind), provider_config.base_url.or_else(|| self.config.base_url.clone()), provider_config.headers, provider_config.stream_usage, crate::client::ProviderProtocol::parse(&provider_config.protocol));
                     self.set_status("Provider base URL updated");
                     self.add_message("system", "Provider base URL updated. Use /save to persist it.");
                 }
