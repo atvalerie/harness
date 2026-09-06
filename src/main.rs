@@ -24,17 +24,17 @@ fn reset_terminal() {
     let _ = execute!(stdout(), crossterm::cursor::Show);
 }
 
-fn prompt_for_api_key_if_missing() -> io::Result<String> {
-    if let Some(key) = AppConfig::get_api_key() {
+fn prompt_for_api_key_if_missing(provider: &str) -> io::Result<String> {
+    if let Some(key) = AppConfig::get_api_key_for(provider) {
         return Ok(key);
     }
 
     println!();
     println!("===========================================================");
-    println!("       Gemini High-Performance Native TUI Harness          ");
+    println!("       Multi-Provider High-Performance Native TUI Harness  ");
     println!("===========================================================");
-    println!("No GEMINI_API_KEY detected in environment or native OS vault.");
-    print!("Please enter your Google AI Studio Gemini API Key: ");
+    println!("No API key detected in environment or native OS vault.");
+    print!("Please enter your provider API key: ");
     io::stdout().flush()?;
 
     let mut input_key = String::new();
@@ -69,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // 2. Check or prompt for API Key
-    let api_key = match prompt_for_api_key_if_missing() {
+    let config = AppConfig::load();
+    let api_key = match prompt_for_api_key_if_missing(&config.provider) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -77,10 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // 3. Load App Configuration
-    let config = AppConfig::load();
-
-    // 4. Initialize Terminal in Raw Mode & Alternate Screen
+    // 3. Initialize Terminal in Raw Mode & Alternate Screen
     enable_raw_mode()?;
     let mut stdout_handle = stdout();
     execute!(stdout_handle, EnterAlternateScreen, EnableMouseCapture)?;
@@ -353,7 +351,7 @@ fn handle_key_event(
             if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
                 let commands = [
                     "/help", "/models", "/model", "/compact",
-                    "/thinking", "/temp", "/sys", "/key", "/copy",
+                    "/thinking", "/temp", "/sys", "/key", "/provider", "/baseurl", "/copy",
                     "/clear", "/save", "/quit",
                 ];
                 let prefix = app.input_buffer.to_lowercase();

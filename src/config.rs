@@ -9,6 +9,10 @@ const KEYRING_USER: &str = "api_key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
     pub model: String,
     #[serde(default = "default_fallback_models")]
     pub fallback_models: Vec<String>,
@@ -22,6 +26,8 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            provider: default_provider(),
+            base_url: None,
             model: "gemini-3.8-flash".to_string(),
             fallback_models: default_fallback_models(),
             max_retries: default_max_retries(),
@@ -41,6 +47,8 @@ Operational Guidelines:\n\
         }
     }
 }
+
+fn default_provider() -> String { "gemini".to_string() }
 
 fn default_fallback_models() -> Vec<String> {
     vec!["gemini-2.5-flash-lite".to_string(), "gemini-2.5-flash".to_string()]
@@ -89,12 +97,19 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn get_api_key() -> Option<String> {
+    pub fn get_api_key_for(provider: &str) -> Option<String> {
         // 1. Check environment variable first
-        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+        let variables = if provider.eq_ignore_ascii_case("openai") || provider.eq_ignore_ascii_case("openai-compatible") {
+            ["OPENAI_API_KEY", "GEMINI_API_KEY"]
+        } else {
+            ["GEMINI_API_KEY", "OPENAI_API_KEY"]
+        };
+        for variable in variables {
+            if let Ok(key) = std::env::var(variable) {
+                let trimmed = key.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
             }
         }
 

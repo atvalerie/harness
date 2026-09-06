@@ -1,5 +1,5 @@
 use crate::client::types::{Content, GenerationConfig, Part, SafetySetting, ThinkingConfig};
-use crate::client::GeminiClient;
+use crate::client::{AiClient, ProviderKind};
 use crate::config::AppConfig;
 use crate::events::{AppEvent, StreamSignal};
 use crate::tools::{ToolPreview, ToolRegistry};
@@ -33,7 +33,7 @@ pub struct PendingToolCall {
 
 pub struct App {
     pub config: AppConfig,
-    pub client: GeminiClient,
+    pub client: AiClient,
     pub tool_registry: ToolRegistry,
     pub state: EngineState,
     pub messages: Vec<ChatMessage>,
@@ -76,7 +76,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: AppConfig, api_key: String) -> Self {
-        let client = GeminiClient::new(api_key);
+        let client = AiClient::from_config(api_key.clone(), &config);
         let tool_registry = ToolRegistry::new();
 
         Self {
@@ -160,12 +160,14 @@ impl App {
                 self.add_message("system", 
                     "Available Commands:\n\
                     - /compact : Summarize conversation history to reclaim context window\n\
-                    - /models : Fetch live models & pricing from Gemini API\n\
+                    - /models : Fetch live models & pricing from the active provider\n\
+                    - /provider <gemini|openai> : Select API protocol/provider\n\
+                    - /baseurl <url|default> : Set a custom OpenAI-compatible API base URL\n\
                     - /model <name> : Switch active model (e.g. /model gemini-3.8-flash)\n\
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
                     - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
                     - /sys <instruction> : Update system prompt\n\
-                    - /key <api_key> : Save a new Gemini API key\n\
+                    - /key <api_key> : Save the active provider API key\n\
                     - /copy : Copy last assistant response to system clipboard (or Ctrl+Y)\n\
                     - /clear : Clear conversation history\n\
                     - /save : Save config to disk\n\
@@ -176,12 +178,33 @@ impl App {
                 self.compact_history(tx);
             }
             "/models" => {
-                self.add_message("system", "Fetching dynamic model list & pricing from Google AI Studio...");
+                self.add_message("system", format!("Fetching models from {}...", self.config.provider));
                 let client = self.client.clone();
                 tokio::spawn(async move {
                     let res = client.list_models().await;
                     let _ = tx.send(AppEvent::ModelsFetched(res));
                 });
+            }
+            "/provider" => {
+                if arg.is_empty() {
+                    self.add_message("system", format!("Current provider: {}", self.config.provider));
+                } else {
+                    let provider = ProviderKind::parse(arg);
+                    self.config.provider = provider.as_str().to_string();
+                    self.client.update_provider(provider, self.config.base_url.clone());
+                    self.set_status(format!("Provider set to {}", self.config.provider));
+                    self.add_message("system", format!("Provider set to {}", self.config.provider));
+                }
+            }
+            "/baseurl" => {
+                if arg.is_empty() {
+                    self.add_message("system", format!("Current base URL: {}", self.config.base_url.as_deref().unwrap_or("provider default")));
+                } else {
+                    self.config.base_url = if arg.eq_ignore_ascii_case("default") { None } else { Some(arg.to_string()) };
+                    self.client.update_provider(ProviderKind::parse(&self.config.provider), self.config.base_url.clone());
+                    self.set_status("Provider base URL updated");
+                    self.add_message("system", "Provider base URL updated. Use /save to persist it.");
+                }
             }
             "/model" => {
                 if arg.is_empty() {
@@ -221,13 +244,13 @@ impl App {
             }
             "/key" => {
                 if arg.is_empty() {
-                    self.add_message("system", "Usage: /key <your_gemini_api_key>");
+                    self.add_message("system", "Usage: /key <your_provider_api_key>");
                 } else {
                     match AppConfig::set_api_key(arg) {
                         Ok(()) => {
                             self.client.update_api_key(arg.to_string());
                             self.set_status("API key updated successfully");
-                            self.add_message("system", "Gemini API key updated and stored securely.");
+                            self.add_message("system", "Provider API key updated and stored securely.");
                         }
                         Err(e) => {
                             self.add_message("system", format!("Failed to store key: {}", e));
@@ -755,9 +778,11 @@ impl App {
 
         let client = self.client.clone();
         let model = self.config.model.clone();
+        let fallback_models = self.config.fallback_models.clone();
+        let max_retries = self.config.max_retries;
 
         tokio::spawn(async move {
-            let res = client.generate_content(&model, &request).await;
+            let res = client.generate_content_with_fallback(&model, &fallback_models, max_retries, &request).await;
             let _ = tx.send(AppEvent::CompactionFinished(res));
         });
     }
