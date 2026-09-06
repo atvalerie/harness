@@ -49,7 +49,7 @@ Useful commands include `/provider`, `/baseurl`, `/model`, `/reasoning`, `/autoc
 For scripting, use headless mode:
 
 ```text
-gemini-harness.exe -p "Summarize this" --model gemini-3.6-flash
+gemini-harness.exe -p "Summarize this" --model gemini-3.5-flash-lite
 ```
 
 Headless mode writes only the model response to stdout; diagnostics and failures go to stderr.
