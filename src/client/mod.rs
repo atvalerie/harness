@@ -46,6 +46,7 @@ impl AiClient {
         Self {
             client: Client::builder()
                 .tcp_nodelay(true)
+                .timeout(Duration::from_secs(120))
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.unwrap_or_else(|| match provider {

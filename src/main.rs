@@ -69,13 +69,25 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let api_key = config.get_api_key_for_active_provider().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No provider API key found in the environment or keyring"))?;
     let mut app = App::new(config, api_key);
     let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = input.next_line().await? {
+    loop {
+        let line = tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            result = input.next_line() => result?,
+        };
+        let Some(line) = line else { break };
         let prompt = line.trim();
         if prompt.is_empty() { continue; }
         if prompt.eq_ignore_ascii_case("/quit") || prompt.eq_ignore_ascii_case("/exit") { break; }
         app.add_message("user", prompt.to_string());
         let request = app.build_request();
-        match app.client.generate_content_with_fallback(&app.config.model, &app.config.effective_fallback_models(), app.config.max_retries, &request).await {
+        let model = app.config.model.clone();
+        let fallback_models = app.config.effective_fallback_models();
+        let max_retries = app.config.max_retries;
+        let result = tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            result = app.client.generate_content_with_fallback(&model, &fallback_models, max_retries, &request) => result,
+        };
+        match result {
             Ok(response) => {
                 println!("{}", response);
                 app.add_message("model", response);
