@@ -15,8 +15,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use events::AppEvent;
+use events::{AppEvent, StreamSignal};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use serde_json::{json, Value};
 use std::io::{self, stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,6 +30,13 @@ struct CliArgs {
     model: Option<String>,
     base_url: Option<String>,
     config_path: Option<PathBuf>,
+    output_format: OutputFormat,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Jsonl,
 }
 
 fn resolve_api_key(config: &AppConfig) -> io::Result<String> {
@@ -54,6 +62,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         model: None,
         base_url: None,
         config_path: None,
+        output_format: OutputFormat::Text,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -63,7 +72,14 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--model" => cli.model = Some(args.next().ok_or_else(|| "--model requires a value".to_string())?),
             "--base-url" => cli.base_url = Some(args.next().ok_or_else(|| "--base-url requires a value".to_string())?),
             "--config" => cli.config_path = Some(PathBuf::from(args.next().ok_or_else(|| "--config requires a path".to_string())?)),
-            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" | --chat [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]".to_string()),
+            "--format" => {
+                cli.output_format = match args.next().ok_or_else(|| "--format requires text or jsonl".to_string())?.as_str() {
+                    "text" => OutputFormat::Text,
+                    "jsonl" => OutputFormat::Jsonl,
+                    value => return Err(format!("Unknown output format '{}'. Use text or jsonl.", value)),
+                }
+            }
+            "-h" | "--help" => return Err("Usage: gemini-harness.exe -p \"prompt\" [--format text|jsonl] | --chat [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]".to_string()),
             unknown => return Err(format!("Unknown argument '{}'. Use --help.", unknown)),
         }
     }
@@ -98,6 +114,9 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
     app.add_message("user", prompt);
+    if cli.output_format == OutputFormat::Jsonl {
+        return run_headless_jsonl(&app).await;
+    }
     let request = app.build_request();
     let result = app
         .client
@@ -109,6 +128,100 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     println!("{}", result);
+    Ok(())
+}
+
+fn emit_jsonl(run_id: &str, sequence: &mut u64, event: &str, data: Value) -> io::Result<()> {
+    let record = json!({
+        "version": 1,
+        "sequence": *sequence,
+        "run_id": run_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "event": event,
+        "data": data,
+    });
+    *sequence += 1;
+    println!("{}", record);
+    io::stdout().flush()
+}
+
+async fn run_headless_jsonl(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    let run_id = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        std::process::id()
+    );
+    let mut sequence = 0;
+    emit_jsonl(
+        &run_id,
+        &mut sequence,
+        "run_started",
+        json!({"provider": app.config.provider, "model": app.config.model}),
+    )?;
+    emit_jsonl(
+        &run_id,
+        &mut sequence,
+        "user_message",
+        json!({"content": app.messages.last().map(|message| message.content.clone()).unwrap_or_default()}),
+    )?;
+
+    let request = app.build_request();
+    let model = app.config.model.clone();
+    let fallback_models = app.config.effective_fallback_models();
+    let max_retries = app.config.max_retries;
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+    let client = app.client.clone();
+    tokio::spawn(async move {
+        client
+            .stream_generate_content(&model, &fallback_models, max_retries, &request, stream_tx)
+            .await;
+    });
+
+    let mut final_status = "ok";
+    while let Some(signal) = stream_rx.recv().await {
+        let (event, data) = match signal {
+            StreamSignal::ThoughtDelta(delta) => (
+                "reasoning_delta",
+                json!({"delta": delta, "visibility": "provider_summary"}),
+            ),
+            StreamSignal::TextDelta(delta) => ("text_delta", json!({"delta": delta})),
+            StreamSignal::ToolCall {
+                id,
+                name,
+                args,
+                thought_signature,
+            } => (
+                "tool_call",
+                json!({"id": id, "name": name, "args": args, "thought_signature": thought_signature}),
+            ),
+            StreamSignal::Usage {
+                prompt_tokens,
+                candidates_tokens,
+                total_tokens,
+            } => (
+                "usage",
+                json!({"prompt_tokens": prompt_tokens, "candidates_tokens": candidates_tokens, "total_tokens": total_tokens}),
+            ),
+            StreamSignal::Finished { finish_reason } => (
+                "run_finished",
+                json!({"status": "ok", "finish_reason": finish_reason}),
+            ),
+            StreamSignal::Notice(message) => ("notice", json!({"message": message})),
+            StreamSignal::Error(error) => {
+                final_status = "error";
+                ("error", json!({"message": error}))
+            }
+        };
+        emit_jsonl(&run_id, &mut sequence, event, data)?;
+    }
+    if final_status != "ok" {
+        emit_jsonl(
+            &run_id,
+            &mut sequence,
+            "run_finished",
+            json!({"status": final_status}),
+        )?;
+    }
     Ok(())
 }
 

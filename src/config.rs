@@ -110,6 +110,7 @@ impl Default for AppConfig {
 You have direct access to native tools for filesystem inspection, safe command execution, and live web grounding:\n\
 - `web_search(query)`: Query the live internet using DuckDuckGo HTML Lite to look up current documentation, breaking news, libraries, or release notes.\n\
 - `web_fetch(url)`: Fetch and extract clean article text and code from web pages.\n\
+- `search_files(query, path, glob)`: Search the repository with ripgrep and return bounded file/line matches.\n\
 - `read_file(path)`: Inspect existing source files and directory contents.\n\
 - `write_file(path, content)`: Propose file writes and edits. The harness automatically generates unified diffs for the user to review in an interactive HITL modal.\n\
 - `run_command(command)`: Run host shell commands. Always preview the exact command before requesting execution.\n\n\
@@ -304,8 +305,14 @@ impl AppConfig {
             config.system_instruction.push_str(
                 "\n\nTool selection rules:\n\
 - Use `read_file` for source and text inspection. Request `start_line` and `max_lines` when you need a bounded chunk; do not use shell commands to print files or count lines.\n\
+- Use `search_files` for repository-wide pattern searches; use `run_command` for builds, tests, git, and commands that must execute.\n\
 - Use `run_command` for builds, tests, git, and other commands that must execute. Its working directory is persistent across tool calls, so `cd` and `Set-Location` affect subsequent tools.\n\
 - `run_command` accepts an optional `shell` of `auto`, `powershell`, or `cmd` on Windows; leave it as `auto` unless syntax requires a specific shell.",
+            );
+        }
+        if !config.system_instruction.contains("search_files(query") {
+            config.system_instruction.push_str(
+                "\n- Use `search_files(query, path, glob)` for repository-wide searches instead of shell pipelines.",
             );
         }
         config

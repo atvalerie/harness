@@ -7,9 +7,30 @@ use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub provider: String,
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub usage: Vec<UsageRecord>,
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub timestamp: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub candidates_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated: bool,
+    pub duration_ms: u64,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,9 +69,25 @@ pub fn save(path: &Path, snapshot: &SessionSnapshot) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|e| format!("Failed to create session directory: {}", e))?;
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| format!("Failed to serialize session: {}", e))?;
-    let temp = path.with_extension("json.tmp");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.json");
+    let temp = path.with_file_name(format!(".{}.{}.tmp", file_name, std::process::id()));
     fs::write(&temp, json).map_err(|e| format!("Failed to write session: {}", e))?;
-    fs::rename(&temp, path).map_err(|e| format!("Failed to commit session: {}", e))
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(_error) if cfg!(windows) && path.exists() => {
+            // Windows does not replace an existing destination with rename.
+            // The destination is exact and the new snapshot is already fully
+            // written, so replace it as a fallback.
+            fs::remove_file(path)
+                .map_err(|remove_error| format!("Failed to replace session: {}", remove_error))?;
+            fs::rename(&temp, path)
+                .map_err(|rename_error| format!("Failed to commit session: {}", rename_error))
+        }
+        Err(error) => Err(format!("Failed to commit session: {}", error)),
+    }
 }
 
 pub fn list() -> Vec<SessionInfo> {
@@ -93,4 +130,18 @@ pub fn list() -> Vec<SessionInfo> {
         .collect::<Vec<_>>();
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionSnapshot;
+
+    #[test]
+    fn loads_legacy_snapshot_with_usage_defaults() {
+        let snapshot: SessionSnapshot =
+            serde_json::from_str(r#"{"provider":"gemini","model":"test","messages":[]}"#)
+                .expect("legacy session should remain readable");
+        assert_eq!(snapshot.schema_version, 1);
+        assert!(snapshot.usage.is_empty());
+    }
 }

@@ -139,11 +139,11 @@ pub struct ResponsePart {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageMetadata {
     #[serde(rename = "promptTokenCount")]
-    pub prompt_token_count: Option<u32>,
+    pub prompt_token_count: Option<u64>,
     #[serde(rename = "candidatesTokenCount")]
-    pub candidates_token_count: Option<u32>,
+    pub candidates_token_count: Option<u64>,
     #[serde(rename = "totalTokenCount")]
-    pub total_token_count: Option<u32>,
+    pub total_token_count: Option<u64>,
 }
 
 // Models API types

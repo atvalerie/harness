@@ -1,5 +1,6 @@
 pub mod fs;
 pub mod grounding;
+pub mod search;
 pub mod shell;
 
 use crate::client::types::{FunctionDeclaration, GeminiToolDeclaration};
@@ -68,6 +69,9 @@ impl ToolRegistry {
         reg.register(Arc::new(fs::ReadFileTool::new(reg.working_dir.clone())));
         reg.register(Arc::new(fs::WriteFileTool::new(reg.working_dir.clone())));
         reg.register(Arc::new(shell::RunCommandTool::new(
+            reg.working_dir.clone(),
+        )));
+        reg.register(Arc::new(search::SearchFilesTool::new(
             reg.working_dir.clone(),
         )));
 

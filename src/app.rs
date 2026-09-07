@@ -2,7 +2,7 @@ use crate::client::types::{Content, GenerationConfig, Part, SafetySetting, Think
 use crate::client::{AiClient, ProviderKind};
 use crate::config::AppConfig;
 use crate::events::{AppEvent, StreamSignal};
-use crate::session::{self, SessionSnapshot};
+use crate::session::{self, SessionSnapshot, UsageRecord};
 use crate::tools::{ToolPreview, ToolRegistry};
 use serde_json::json;
 use std::collections::HashSet;
@@ -48,14 +48,17 @@ pub struct App {
     pub input_history_idx: Option<usize>,
 
     // Active token metrics
-    pub prompt_tokens: u32,
-    pub candidates_tokens: u32,
-    pub total_tokens: u32,
+    pub prompt_tokens: u64,
+    pub candidates_tokens: u64,
+    pub total_tokens: u64,
 
     // Streaming state
     pub active_stream_task: Option<JoinHandle<()>>,
     pub current_thought_buffer: String,
     pub current_response_buffer: String,
+    pub usage_records: Vec<UsageRecord>,
+    request_usage_received: bool,
+    request_started_at: Option<std::time::Instant>,
 
     // HITL Modal State
     pub pending_tool_call: Option<PendingToolCall>,
@@ -216,6 +219,9 @@ impl App {
             active_stream_task: None,
             current_thought_buffer: String::new(),
             current_response_buffer: String::new(),
+            usage_records: Vec::new(),
+            request_usage_received: false,
+            request_started_at: None,
             pending_tool_call: None,
             pending_tool_executions: 0,
             session_allowed_tools: HashSet::new(),
@@ -289,6 +295,7 @@ impl App {
         };
         if let Some(snapshot) = session::load(&info.path) {
             self.messages = snapshot.messages;
+            self.usage_records = snapshot.usage;
             self.config.select_provider(&snapshot.provider);
             self.config.model = snapshot.model;
             let provider_config = self.config.active_provider_config();
@@ -442,13 +449,51 @@ impl App {
             return Ok(());
         };
         let snapshot = SessionSnapshot {
+            schema_version: 1,
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
             messages: self.messages.clone(),
+            usage: self.usage_records.clone(),
         };
         session::save(path, &snapshot)?;
         self.session_messages_at_save = self.messages.len();
         Ok(())
+    }
+
+    fn record_request_usage(&mut self, status: &str) {
+        let Some(started_at) = self.request_started_at.take() else {
+            return;
+        };
+        let estimated_output =
+            ((self.current_thought_buffer.len() + self.current_response_buffer.len()) as u64 / 4)
+                .max(1);
+        let prompt_tokens = if self.request_usage_received {
+            self.prompt_tokens
+        } else {
+            self.estimated_context_tokens()
+        };
+        let candidates_tokens = if self.request_usage_received {
+            self.candidates_tokens
+        } else {
+            estimated_output
+        };
+        let total_tokens = if self.request_usage_received && self.total_tokens > 0 {
+            self.total_tokens
+        } else {
+            prompt_tokens.saturating_add(candidates_tokens)
+        };
+        self.usage_records.push(UsageRecord {
+            timestamp: chrono::Local::now().to_rfc3339(),
+            provider: self.config.provider.clone(),
+            model: self.config.model.clone(),
+            prompt_tokens,
+            candidates_tokens,
+            total_tokens,
+            estimated: !self.request_usage_received,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            status: status.to_string(),
+        });
+        self.request_usage_received = false;
     }
 
     pub fn handle_enter(&mut self, tx: UnboundedSender<AppEvent>) {
@@ -496,6 +541,7 @@ impl App {
                     - /thinking <budget> : Set thinking token budget (0 to disable, 1024, 2048, 4096)\n\
                     - /reasoning <on|off|budget> : Toggle or set reasoning for the active model\n\
                     - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
+                    - /usage : Show persisted token usage for this session\n\
                     - /session <save|clear|path> : Manage the low-write resumable session\n\
                     - /sessions : Browse, resume, export, or delete sessions\n\
                     - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
@@ -900,12 +946,34 @@ impl App {
             }
             "/clear" => {
                 self.messages.clear();
+                self.usage_records.clear();
                 self.chat_scroll = 0;
                 self.prompt_tokens = 0;
                 self.candidates_tokens = 0;
                 self.total_tokens = 0;
                 self.set_status("Session cleared");
                 self.add_message("system", "Conversation history cleared.");
+                let _ = self.flush_session();
+            }
+            "/usage" => {
+                let prompt: u64 = self.usage_records.iter().map(|r| r.prompt_tokens).sum();
+                let candidates: u64 = self.usage_records.iter().map(|r| r.candidates_tokens).sum();
+                let total: u64 = self.usage_records.iter().map(|r| r.total_tokens).sum();
+                self.add_message(
+                    "system",
+                    format!(
+                        "Session usage: {} requests, {} input + {} output = {} tokens{}",
+                        self.usage_records.len(),
+                        prompt,
+                        candidates,
+                        total,
+                        if self.usage_records.iter().any(|record| record.estimated) {
+                            " (some estimated)"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
             }
             "/save" => match self.config.save() {
                 Ok(()) => {
@@ -1024,6 +1092,11 @@ impl App {
         self.set_status(format!("Streaming ({})", self.config.model));
         self.current_thought_buffer.clear();
         self.current_response_buffer.clear();
+        self.prompt_tokens = 0;
+        self.candidates_tokens = 0;
+        self.total_tokens = 0;
+        self.request_usage_received = false;
+        self.request_started_at = Some(std::time::Instant::now());
         self.stream_start_time = Some(std::time::Instant::now());
         self.candidate_chunks_count = 0;
         self.current_tps = 0.0;
@@ -1058,14 +1131,15 @@ impl App {
             .iter()
             .map(|message| message.content.len())
             .sum();
-        ((message_chars + self.config.system_instruction.len()) as u64 / 4)
-            .max(self.total_tokens as u64)
+        ((message_chars + self.config.system_instruction.len()) as u64 / 4).max(self.total_tokens)
     }
 
     pub fn cancel_generation(&mut self) {
         if let Some(handle) = self.active_stream_task.take() {
             handle.abort();
         }
+
+        self.record_request_usage("cancelled");
 
         if !self.current_thought_buffer.is_empty() {
             let thought = std::mem::take(&mut self.current_thought_buffer);
@@ -1076,6 +1150,8 @@ impl App {
             let resp = std::mem::take(&mut self.current_response_buffer);
             self.add_message("model", resp);
         }
+
+        let _ = self.flush_session();
 
         self.state = EngineState::Idle;
         self.pending_tool_executions = 0;
@@ -1172,6 +1248,7 @@ impl App {
                 self.prompt_tokens = prompt_tokens;
                 self.candidates_tokens = candidates_tokens;
                 self.total_tokens = total_tokens;
+                self.request_usage_received = true;
 
                 if let Some(start) = self.stream_start_time {
                     let elapsed = start.elapsed().as_secs_f64();
@@ -1181,6 +1258,8 @@ impl App {
                 }
             }
             StreamSignal::Finished { finish_reason } => {
+                self.record_request_usage("ok");
+
                 if !self.current_thought_buffer.is_empty() {
                     let thought = std::mem::take(&mut self.current_thought_buffer);
                     self.add_message("thought", thought);
@@ -1204,6 +1283,17 @@ impl App {
                 self.add_message("system", message);
             }
             StreamSignal::Error(err) => {
+                self.record_request_usage("error");
+
+                if !self.current_thought_buffer.is_empty() {
+                    let thought = std::mem::take(&mut self.current_thought_buffer);
+                    self.add_message("thought", thought);
+                }
+                if !self.current_response_buffer.is_empty() {
+                    let response = std::mem::take(&mut self.current_response_buffer);
+                    self.add_message("model", response);
+                }
+                let _ = self.flush_session();
                 self.add_message("system", format!("Error: {}", err));
                 self.state = EngineState::Idle;
                 self.set_status("Stream ended with error.");

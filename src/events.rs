@@ -9,9 +9,9 @@ pub enum StreamSignal {
         thought_signature: Option<String>,
     },
     Usage {
-        prompt_tokens: u32,
-        candidates_tokens: u32,
-        total_tokens: u32,
+        prompt_tokens: u64,
+        candidates_tokens: u64,
+        total_tokens: u64,
     },
     Finished {
         finish_reason: Option<String>,

@@ -72,6 +72,18 @@ gemini-harness.exe -p "Summarize this" --model gemini-3.5-flash-lite
 
 Headless mode writes only the model response to stdout; diagnostics and failures go to stderr.
 
+For integrations that need streaming, use JSON Lines mode. Each line is a
+versioned event with a sequence number, run ID, timestamp, and event payload:
+
+```text
+gemini-harness.exe -p "Summarize this" --format jsonl
+```
+
+Events include `run_started`, `user_message`, `reasoning_delta`, `text_delta`,
+`tool_call`, `usage`, `notice`, `error`, and `run_finished`. Reasoning events
+represent provider-emitted reasoning summaries when available; they are not a
+guarantee of hidden chain-of-thought access.
+
 For a persistent text-only back-and-forth session:
 
 ```text
@@ -81,3 +93,5 @@ gemini-harness.exe --chat
 Enter one prompt per line. Use `/exit` or `/quit` to end the session. The conversation is saved using the same turn-boundary session persistence as the TUI.
 
 Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk.
+They also retain per-request token usage, including whether a record was
+provider-reported or estimated. Use `/usage` inside the TUI to inspect totals.

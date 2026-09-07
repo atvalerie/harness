@@ -265,12 +265,12 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
                                 entry.0 = Some(id.to_string());
                             }
                             if let Some(name) =
-                                call.pointer("function.name").and_then(Value::as_str)
+                                call.pointer("/function/name").and_then(Value::as_str)
                             {
                                 entry.1.push_str(name);
                             }
                             if let Some(args) =
-                                call.pointer("function.arguments").and_then(Value::as_str)
+                                call.pointer("/function/arguments").and_then(Value::as_str)
                             {
                                 entry.2.push_str(args);
                             }
@@ -412,7 +412,7 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
                             }
                         }
                         "response.completed" => {
-                            if let Some(usage) = value.pointer("response.usage") {
+                            if let Some(usage) = value.pointer("/response/usage") {
                                 emit_responses_usage(usage, &tx);
                             }
                             emit_responses_tools(&mut tools, &tx);
@@ -423,7 +423,7 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
                         }
                         "response.failed" | "error" => {
                             let message = value
-                                .pointer("response.error.message")
+                                .pointer("/response/error/message")
                                 .and_then(Value::as_str)
                                 .or_else(|| value.get("message").and_then(Value::as_str))
                                 .unwrap_or("Responses API request failed");
@@ -505,15 +505,15 @@ fn emit_responses_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
     let prompt = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
     let completion = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
     let total = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(prompt as u64 + completion as u64) as u32;
+        .unwrap_or(prompt + completion);
     let _ = tx.send(StreamSignal::Usage {
         prompt_tokens: prompt,
         candidates_tokens: completion,
@@ -541,15 +541,15 @@ fn emit_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
     let prompt = usage
         .get("prompt_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
     let completion = usage
         .get("completion_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
     let total = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(prompt as u64 + completion as u64) as u32;
+        .unwrap_or(prompt + completion);
     let _ = tx.send(StreamSignal::Usage {
         prompt_tokens: prompt,
         candidates_tokens: completion,

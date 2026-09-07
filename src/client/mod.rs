@@ -513,7 +513,7 @@ impl AiClient {
         }
         let json: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
-        json.pointer("choices.0.message.content")
+        json.pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|s| !s.is_empty())
@@ -683,6 +683,20 @@ mod tests {
         assert!(is_zen_unsupported_model_id("claude-opus-5"));
         assert!(is_zen_unsupported_model_id("gemini-3.8-flash"));
         assert!(!is_zen_responses_model_id("mimo-v2.5-free"));
+    }
+
+    #[test]
+    fn uses_standard_json_pointer_for_chat_completion_text() {
+        let response = json!({
+            "choices": [{"message": {"content": "hello"}}]
+        });
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/content")
+                .and_then(|value| value.as_str()),
+            Some("hello")
+        );
+        assert!(response.pointer("choices.0.message.content").is_none());
     }
 }
 

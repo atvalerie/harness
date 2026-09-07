@@ -6,11 +6,19 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub struct SseParser {
     buffer: Vec<u8>,
+    finished: bool,
 }
 
 impl SseParser {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Vec::new(),
+            finished: false,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 
     /// Process an arbitrary incoming chunk of bytes from the HTTP stream.
@@ -43,6 +51,7 @@ impl SseParser {
                 }
 
                 if json_str == "[DONE]" {
+                    self.finished = true;
                     let _ = tx.send(StreamSignal::Finished {
                         finish_reason: Some("STOP".to_string()),
                     });
@@ -91,6 +100,7 @@ impl SseParser {
                                 }
 
                                 if let Some(finish_reason) = cand.finish_reason {
+                                    self.finished = true;
                                     let _ = tx.send(StreamSignal::Finished {
                                         finish_reason: Some(finish_reason),
                                     });
@@ -113,6 +123,7 @@ impl SseParser {
 pub async fn stream_sse_response(response: Response, tx: UnboundedSender<StreamSignal>) {
     let mut parser = SseParser::new();
     let mut stream = response.bytes_stream();
+    let mut failed = false;
 
     while let Some(chunk_res) = stream.next().await {
         match chunk_res {
@@ -120,9 +131,20 @@ pub async fn stream_sse_response(response: Response, tx: UnboundedSender<StreamS
                 parser.process_chunk(&chunk, &tx);
             }
             Err(e) => {
+                failed = true;
                 let _ = tx.send(StreamSignal::Error(format!("Network stream error: {}", e)));
                 break;
             }
+        }
+    }
+    if !failed {
+        // Some gateways close the connection without a trailing newline or a
+        // finishReason. Flush the final line and guarantee a terminal event.
+        parser.process_chunk(b"\n", &tx);
+        if !parser.is_finished() {
+            let _ = tx.send(StreamSignal::Finished {
+                finish_reason: Some("STOP".to_string()),
+            });
         }
     }
 }
