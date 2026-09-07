@@ -24,6 +24,7 @@ pub enum StreamSignal {
 #[allow(dead_code)]
 pub enum AppEvent {
     Key(crossterm::event::KeyEvent),
+    Paste(String),
     Mouse(crossterm::event::MouseEvent),
     Resize(u16, u16),
     Stream {

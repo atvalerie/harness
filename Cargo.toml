@@ -17,4 +17,4 @@ scraper = "0.20"
 directories = "5.0"
 async-trait = "0.1"
 chrono = "0.4"
-
+base64 = "0.22"

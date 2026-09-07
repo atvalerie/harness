@@ -16,14 +16,15 @@ pub fn render(app: &App, frame: &mut Frame) {
         .constraints([
             Constraint::Length(1), // Clean borderless status bar
             Constraint::Min(5),    // Main chat log viewport
-            Constraint::Length(3), // Input prompt box
+            Constraint::Length(input::input_height(app, frame.area().width)), // Growing prompt box
         ])
         .split(frame.area());
 
     // 1. Render Status Bar
     status::render_status(app, frame, chunks[0]);
 
-    if app.pending_tool_call.is_some() {
+    if app.state == crate::app::EngineState::AwaitingHitlApproval && app.pending_tool_call.is_some()
+    {
         // Keep simple command approvals compact, but make file mutations large
         // enough to inspect their diff without trusting the model blindly.
         let panel_area = chunks[1].union(chunks[2]);
@@ -57,5 +58,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // Modal Overlays
     modal::render_models_modal(app, frame, frame.area());
+    modal::render_thinking_modal(app, frame, frame.area());
+    modal::render_plan_modal(app, frame, frame.area());
     modal::render_sessions_modal(app, frame, frame.area());
 }

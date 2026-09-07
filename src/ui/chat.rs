@@ -55,6 +55,34 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                         Style::default().fg(Color::White),
                     )]));
                 }
+                for (index, attachment) in msg.attachments.iter().enumerate() {
+                    let (kind, details) = match attachment.kind.as_str() {
+                        "text" => {
+                            let text = attachment.text.as_deref().unwrap_or("");
+                            ("text", format!("{} chars", text.chars().count()))
+                        }
+                        "image" => (
+                            "image",
+                            attachment
+                                .mime_type
+                                .as_deref()
+                                .unwrap_or("image")
+                                .to_string(),
+                        ),
+                        other => (other, String::new()),
+                    };
+                    let label = format!(
+                        "  [attachment {}: {} | {} | {}]",
+                        index + 1,
+                        kind,
+                        attachment.name,
+                        details
+                    );
+                    lines.push(Line::from(vec![Span::styled(
+                        label,
+                        Style::default().fg(Color::Yellow),
+                    )]));
+                }
             }
             "model" => {
                 lines.push(Line::from(""));
@@ -99,12 +127,16 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
-                for l in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", l),
-                        Style::default().fg(Color::Yellow),
-                    )]));
+                let max_chars = area.width.saturating_sub(6).max(12) as usize;
+                let compact = msg.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut visible = compact.chars().take(max_chars).collect::<String>();
+                if compact.chars().count() > max_chars {
+                    visible.push('…');
                 }
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {}", visible),
+                    Style::default().fg(Color::Yellow),
+                )]));
             }
             "system" => {
                 lines.push(Line::from(""));
@@ -154,6 +186,24 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
         )]));
         let md_stream_lines = parse_markdown(&app.current_response_buffer, "  ");
         lines.extend(md_stream_lines);
+    }
+
+    if app.state != crate::app::EngineState::Idle
+        && app.state != crate::app::EngineState::AwaitingHitlApproval
+        && app.current_thought_buffer.is_empty()
+        && app.current_response_buffer.is_empty()
+    {
+        let label = match app.state {
+            crate::app::EngineState::Compacting => "compacting context",
+            crate::app::EngineState::ExecutingTool => "running tool",
+            _ => "waiting for response",
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} {}…", crate::ui::status::spinner(app), label),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
     }
 
     // Bottom breathing room

@@ -25,6 +25,17 @@ pub enum Part {
         #[serde(skip_serializing_if = "Option::is_none")]
         thought: Option<bool>,
     },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: InlineDataPayload,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineDataPayload {
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +56,11 @@ pub struct FunctionResponsePayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
+    #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     #[serde(rename = "thinkingBudget")]
-    pub thinking_budget: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

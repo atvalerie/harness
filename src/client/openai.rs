@@ -70,10 +70,22 @@ pub fn responses_request_payload(
             Some("system") => "system",
             _ => "user",
         };
-        let mut text = String::new();
+        let text_type = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        let mut content_items = Vec::new();
         for part in &content.parts {
             match part {
-                Part::Text { text: value, .. } => text.push_str(value),
+                Part::Text { text: value, .. } => content_items.push(json!({
+                    "type": text_type,
+                    "text": value,
+                })),
+                Part::InlineData { inline_data } => content_items.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{}", inline_data.mime_type, inline_data.data),
+                })),
                 Part::FunctionCall { function_call, .. } => {
                     input.push(json!({
                         "type": "function_call",
@@ -91,16 +103,8 @@ pub fn responses_request_payload(
                 }
             }
         }
-        if !text.is_empty() {
-            let text_type = if role == "assistant" {
-                "output_text"
-            } else {
-                "input_text"
-            };
-            input.push(json!({
-                "role": role,
-                "content": [{ "type": text_type, "text": text }],
-            }));
+        if !content_items.is_empty() {
+            input.push(json!({ "role": role, "content": content_items }));
         }
     }
 
@@ -168,10 +172,22 @@ fn content_messages(content: &Content) -> Vec<Value> {
     };
     let mut messages = Vec::new();
     let mut text = String::new();
+    let mut content_items = Vec::new();
+    let mut has_image = false;
     let mut tool_calls = Vec::new();
     for part in &content.parts {
         match part {
-            Part::Text { text: value, .. } => text.push_str(value),
+            Part::Text { text: value, .. } => {
+                text.push_str(value);
+                content_items.push(json!({ "type": "text", "text": value }));
+            }
+            Part::InlineData { inline_data } => {
+                has_image = true;
+                content_items.push(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{}", inline_data.mime_type, inline_data.data) },
+                }));
+            }
             Part::FunctionCall { function_call, .. } => tool_calls.push(json!({
                 "id": function_call.id.clone().unwrap_or_else(|| format!("call_{}", function_call.name)),
                 "type": "function",
@@ -187,8 +203,13 @@ fn content_messages(content: &Content) -> Vec<Value> {
             }
         }
     }
-    if !text.is_empty() || tool_calls.is_empty() && messages.is_empty() {
-        let mut message = json!({ "role": role, "content": text });
+    if !text.is_empty() || has_image || tool_calls.is_empty() && messages.is_empty() {
+        let content = if !has_image {
+            json!(text)
+        } else {
+            json!(content_items)
+        };
+        let mut message = json!({ "role": role, "content": content });
         if !tool_calls.is_empty() {
             message["tool_calls"] = json!(tool_calls);
         }

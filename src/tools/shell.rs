@@ -3,6 +3,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use super::{working_dir_path, SharedWorkingDir, Tool, ToolPreview};
 
@@ -40,6 +41,22 @@ impl Tool for RunCommandTool {
                     "type": "string",
                     "enum": ["auto", "powershell", "cmd", "sh"],
                     "description": "Optional shell backend. Use auto unless the command requires a specific shell."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 900,
+                    "description": "Optional execution timeout; defaults to 120 seconds"
+                },
+                "max_output_chars": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 100000,
+                    "description": "Optional output cap; keeps both the beginning and end when exceeded"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Start and detach the command instead of waiting for completion"
                 }
             },
             "required": ["command"]
@@ -75,6 +92,20 @@ impl Tool for RunCommandTool {
 
         let starting_dir = working_dir_path(&self.cwd);
         let requested_shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("auto");
+        let timeout_seconds = args
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120)
+            .clamp(1, 900);
+        let max_output_chars = args
+            .get("max_output_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8_000)
+            .clamp(1_000, 100_000) as usize;
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         #[cfg(target_os = "windows")]
         let mut cmd = {
@@ -117,9 +148,25 @@ impl Tool for RunCommandTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        if background {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            let child = cmd.spawn().map_err(|e| {
+                format!(
+                    "Failed to start background command '{}': {}",
+                    command_str, e
+                )
+            })?;
+            return Ok(format!(
+                "Started background command (pid={}): {}",
+                child.id().unwrap_or(0),
+                command_str
+            ));
+        }
+
+        cmd.kill_on_drop(true);
+        let output = timeout(Duration::from_secs(timeout_seconds), cmd.output())
             .await
+            .map_err(|_| format!("Command timed out after {} seconds", timeout_seconds))?
             .map_err(|e| format!("Failed to spawn command '{}': {}", command_str, e))?;
 
         let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -150,16 +197,30 @@ impl Tool for RunCommandTool {
             }
         }
 
-        if out.len() > 8000 {
-            let truncated = out.chars().take(8000).collect::<String>();
-            Ok(format!(
-                "{}\n[Output truncated at 8,000 characters]",
-                truncated
-            ))
+        if out.chars().count() > max_output_chars {
+            Ok(format_bounded_output(&out, max_output_chars))
         } else {
             Ok(out)
         }
     }
+}
+
+fn format_bounded_output(output: &str, limit: usize) -> String {
+    let head_len = limit * 2 / 3;
+    let tail_len = limit.saturating_sub(head_len);
+    let head = output.chars().take(head_len).collect::<String>();
+    let tail = output
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{}\n[Output truncated to {} characters; tail preserved]\n{}",
+        head, limit, tail
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -214,12 +275,21 @@ fn split_cwd_marker(stdout: &str) -> (String, Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_cwd_marker;
+    use super::{format_bounded_output, split_cwd_marker};
 
     #[test]
     fn extracts_persistent_directory_without_leaking_marker() {
         let (output, cwd) = split_cwd_marker("hello\r\n\r\n__GEMINI_HARNESS_CWD__C:\\work\r\n");
         assert_eq!(output, "hello");
         assert_eq!(cwd.unwrap().to_string_lossy(), "C:\\work");
+    }
+
+    #[test]
+    fn output_cap_keeps_head_and_tail() {
+        let output = "0123456789";
+        let bounded = format_bounded_output(output, 6);
+        assert!(bounded.contains("0123"));
+        assert!(bounded.contains("89"));
+        assert!(bounded.contains("tail preserved"));
     }
 }

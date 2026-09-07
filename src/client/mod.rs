@@ -6,6 +6,10 @@ use crate::config::AppConfig;
 use crate::events::StreamSignal;
 use reqwest::{Client, RequestBuilder};
 use std::collections::BTreeMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{sleep, Duration};
 use types::{GenerateContentRequest, ListModelsResponse, ModelInfo};
@@ -19,6 +23,8 @@ pub struct AiClient {
     headers: BTreeMap<String, String>,
     include_stream_usage: bool,
     protocol: ProviderProtocol,
+    zen_session_id: Arc<String>,
+    zen_request_counter: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,11 +66,40 @@ impl AiClient {
         for (name, value) in &self.headers {
             request = request.header(name, value);
         }
-        if self.provider == ProviderKind::OpenAiCompatible && !self.api_key.is_empty() {
-            request.bearer_auth(&self.api_key)
-        } else {
-            request
+
+        if self.provider == ProviderKind::OpenAiCompatible {
+            if self.is_zen() {
+                // OpenCode's free Zen route uses these identity headers to
+                // recognize requests from an OpenCode-compatible client.
+                let request_id = self.zen_request_counter.fetch_add(1, Ordering::Relaxed);
+                request = request
+                    .header("x-opencode-session", self.zen_session_id.as_str())
+                    .header(
+                        "x-opencode-request",
+                        format!("gemini-harness-{}", request_id),
+                    )
+                    .header("x-opencode-client", "cli")
+                    .header(
+                        "User-Agent",
+                        concat!("opencode/gemini-harness/", env!("CARGO_PKG_VERSION")),
+                    );
+
+                // `public` is OpenCode's anonymous/free-tier sentinel. The
+                // Zen gateway distinguishes it from a missing Authorization
+                // header.
+                return if self.api_key.is_empty() {
+                    request.bearer_auth("public")
+                } else {
+                    request.bearer_auth(&self.api_key)
+                };
+            }
+
+            if !self.api_key.is_empty() {
+                return request.bearer_auth(&self.api_key);
+            }
         }
+
+        request
     }
 
     pub fn from_config(api_key: String, config: &AppConfig) -> Self {
@@ -104,6 +139,15 @@ impl AiClient {
             headers,
             include_stream_usage,
             protocol,
+            zen_session_id: Arc::new(format!(
+                "gemini-harness-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )),
+            zen_request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 

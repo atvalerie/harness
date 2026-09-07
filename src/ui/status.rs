@@ -23,22 +23,13 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         EngineState::ExecutingTool => ("TOOL-EXEC", Color::Black, Color::LightCyan),
     };
 
-    let thinking_str = if app.config.thinking_budget > 0 {
-        format!("{} tok", app.config.thinking_budget)
-    } else {
-        "off".to_string()
-    };
+    let thinking_str = app.thinking_mode(&app.config.model);
 
     // Context tracking
-    let context_limit = app
-        .available_models
-        .iter()
-        .find(|m| m.id == app.config.model)
-        .and_then(|m| m.input_token_limit)
-        .unwrap_or(1_048_576);
+    let context_limit = app.context_limit();
 
     let context_pct = if context_limit > 0 {
-        (app.total_tokens as f64 / context_limit as f64) * 100.0
+        (app.context_tokens as f64 / context_limit as f64) * 100.0
     } else {
         0.0
     };
@@ -49,7 +40,13 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         String::new()
     };
 
-    let status_info = app.status_message.as_deref().unwrap_or("ready");
+    let activity = match app.state {
+        EngineState::Streaming | EngineState::Compacting | EngineState::ExecutingTool => {
+            format!("{} ", spinner(app))
+        }
+        EngineState::AwaitingHitlApproval => "! ".to_string(),
+        EngineState::Idle => String::new(),
+    };
 
     let line = Line::from(vec![
         Span::styled(
@@ -67,6 +64,7 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
+        Span::styled(activity, Style::default().fg(Color::LightCyan)),
         Span::styled(
             &app.config.model,
             Style::default()
@@ -87,8 +85,13 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled("ctx: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
-                "{}/{} ({:.1}%)",
-                app.total_tokens,
+                "{}{}/{} ({:.1}%)",
+                if app.context_tokens_estimated {
+                    "~"
+                } else {
+                    ""
+                },
+                app.context_tokens,
                 format_compact_number(context_limit),
                 context_pct
             ),
@@ -100,10 +103,15 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         ),
         Span::styled(tps_str, Style::default().fg(Color::LightCyan)),
         Span::raw(" │ "),
-        Span::styled(status_info, Style::default().fg(Color::DarkGray)),
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
+}
+
+pub fn spinner(app: &App) -> char {
+    const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+    let index = ((app.ui_started_at.elapsed().as_millis() / 100) as usize) % FRAMES.len();
+    FRAMES[index]
 }
 
 fn format_compact_number(n: u64) -> String {

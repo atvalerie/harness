@@ -150,7 +150,8 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
     let header = if app.models_searching {
         format!("Search: /{}", app.models_filter)
     } else {
-        "[Enter] use  [/] search  [R] reasoning  [[]/[]] thinking  [T] temperature  [-/+] max tokens  [F] fallback".to_string()
+        "[Enter] use  [K] thinking picker  [R] toggle  [T] temp  [-/+] max tokens  [F] fallback"
+            .to_string()
     };
     frame.render_widget(Paragraph::new(header), header_area);
 
@@ -177,9 +178,7 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
             let reasoning = profile
                 .and_then(|p| p.reasoning_enabled)
                 .unwrap_or(app.config.thinking_budget > 0);
-            let budget = profile
-                .and_then(|p| p.thinking_budget)
-                .unwrap_or(app.config.thinking_budget);
+            let thinking_mode = app.thinking_mode(&m.id);
             let temperature = profile
                 .and_then(|p| p.temperature)
                 .unwrap_or(app.config.temperature);
@@ -225,9 +224,9 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
             ]));
             if is_selected {
                 lines.push(Line::from(format!(
-                    "    profile: reasoning={} budget={} temp={:.1} max_tokens={} fallback={}",
+                    "    profile: thinking={} reasoning={} temp={:.1} max_tokens={} fallback={}",
+                    thinking_mode,
                     if reasoning { "on" } else { "off" },
-                    budget,
                     temperature,
                     max_tokens,
                     if fallback { "yes" } else { "no" }
@@ -261,6 +260,131 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
         "[S] save config  [/] search  [Esc] close"
     };
     frame.render_widget(Paragraph::new(footer), footer_area);
+}
+
+pub fn render_thinking_modal(app: &App, frame: &mut Frame, area: Rect) {
+    if !app.show_thinking_modal {
+        return;
+    }
+    let popup_area = centered_rect(52, 45, area);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Thinking / Reasoning ")
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let model = app
+        .thinking_target_model
+        .clone()
+        .unwrap_or_else(|| app.config.model.clone());
+    let choices = app.thinking_choices(&model);
+    let mut lines = vec![Line::from(format!(
+        "Model: {}  (persisted per provider/model)",
+        model
+    ))];
+    for (index, name) in choices.iter().enumerate() {
+        let selected = index == app.thinking_selected;
+        let description = match *name {
+            "off" => "No extended reasoning",
+            "minimal" => "Minimal reasoning effort",
+            "low" => "Low reasoning effort",
+            "medium" => "Balanced reasoning effort",
+            "high" => "High reasoning effort",
+            "xhigh" => "Extra-high reasoning effort",
+            _ => "Provider-defined reasoning effort",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "◆ " } else { "  " },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{:8}", name),
+                Style::default()
+                    .fg(if selected { Color::Yellow } else { Color::Cyan })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(description, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let footer = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(1),
+        width: inner.width,
+        height: 1.min(inner.height),
+    };
+    frame.render_widget(
+        Paragraph::new("[↑/↓] choose  [Enter] apply  [Esc] cancel"),
+        footer,
+    );
+}
+
+pub fn render_plan_modal(app: &App, frame: &mut Frame, area: Rect) {
+    if !app.show_plan_modal {
+        return;
+    }
+    let popup_area = centered_rect(62, 38, area);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Plan Ready ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let options = [
+        (
+            "Execute plan",
+            "Approve the structured plan and allow mutation tools.",
+        ),
+        (
+            "Keep planning",
+            "Ask the model to refine the plan or resolve questions.",
+        ),
+    ];
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "The model produced a structured plan.",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (index, (title, description)) in options.iter().enumerate() {
+        let selected = index == app.plan_modal_selected;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "> " } else { "  " },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{}: {}", index + 1, title),
+                Style::default()
+                    .fg(if selected { Color::Yellow } else { Color::Cyan })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(format!("     {}", description)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Esc keeps plan mode active without sending another turn.",
+    ));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let footer = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(1),
+        width: inner.width,
+        height: 1.min(inner.height),
+    };
+    frame.render_widget(
+        Paragraph::new("[Up/Down] choose  [Enter] select  [1/2] quick select  [Esc] close"),
+        footer,
+    );
 }
 
 pub fn render_sessions_modal(app: &App, frame: &mut Frame, area: Rect) {

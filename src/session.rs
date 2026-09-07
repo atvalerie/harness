@@ -1,5 +1,6 @@
 use crate::app::ChatMessage;
 use crate::config::AppConfig;
+use crate::tools::TodoItem;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,18 @@ pub struct SessionSnapshot {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub usage: Vec<UsageRecord>,
+    /// The project context is optional so snapshots from older releases stay
+    /// readable and portable.
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
+    #[serde(default)]
+    pub project_instructions: Option<String>,
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
+    #[serde(default)]
+    pub plan_mode: bool,
 }
 
 fn default_schema_version() -> u32 {
@@ -143,5 +156,6 @@ mod tests {
                 .expect("legacy session should remain readable");
         assert_eq!(snapshot.schema_version, 1);
         assert!(snapshot.usage.is_empty());
+        assert!(snapshot.working_dir.is_none());
     }
 }

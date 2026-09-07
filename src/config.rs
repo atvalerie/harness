@@ -86,10 +86,16 @@ pub struct AppConfig {
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub model_profiles: BTreeMap<String, ModelProfile>,
+    /// Last selected model for each provider, so switching providers and
+    /// restarting the harness return to the user's actual choices.
+    #[serde(default)]
+    pub last_models: BTreeMap<String, String>,
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold_tokens: u64,
+    #[serde(default = "default_todo_change_mode")]
+    pub todo_change_mode: String,
     #[serde(default = "default_session_name")]
     pub session_name: String,
     #[serde(default)]
@@ -122,8 +128,10 @@ Operational Guidelines:\n\
 5. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.".to_string(),
             providers: default_provider_configs(),
             model_profiles: BTreeMap::new(),
+            last_models: BTreeMap::new(),
             auto_compact: default_auto_compact(),
             auto_compact_threshold_tokens: default_auto_compact_threshold(),
+            todo_change_mode: default_todo_change_mode(),
             session_name: "default".to_string(),
             mcp_servers: BTreeMap::new(),
         }
@@ -156,6 +164,9 @@ fn default_auto_compact() -> bool {
 }
 fn default_auto_compact_threshold() -> u64 {
     100_000
+}
+fn default_todo_change_mode() -> String {
+    "next_turn".to_string()
 }
 fn default_true() -> bool {
     true
@@ -234,14 +245,21 @@ impl AppConfig {
     }
 
     pub fn select_provider(&mut self, name: &str) {
+        self.last_models
+            .insert(self.provider.clone(), self.model.clone());
         self.provider = name.trim().to_string();
-        if let Some(model) = self
-            .providers
-            .get(&self.provider)
-            .and_then(|provider| provider.model.clone())
-        {
+        if let Some(model) = self.last_models.get(&self.provider).cloned().or_else(|| {
+            self.providers
+                .get(&self.provider)
+                .and_then(|provider| provider.model.clone())
+        }) {
             self.model = model;
         }
+    }
+
+    pub fn remember_model(&mut self) {
+        self.last_models
+            .insert(self.provider.clone(), self.model.clone());
     }
 
     pub fn effective_fallback_models(&self) -> Vec<String> {
@@ -377,9 +395,21 @@ impl AppConfig {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Serialization error: {}", e))?;
 
-        fs::write(&path, json).map_err(|e| format!("Failed to write config file: {}", e))?;
-
-        Ok(())
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.json");
+        let temp = path.with_file_name(format!(".{}.{}.tmp", file_name, std::process::id()));
+        fs::write(&temp, json).map_err(|e| format!("Failed to write config file: {}", e))?;
+        match fs::rename(&temp, &path) {
+            Ok(()) => Ok(()),
+            Err(_error) if cfg!(windows) && path.exists() => {
+                fs::remove_file(&path)
+                    .map_err(|e| format!("Failed to replace config file: {}", e))?;
+                fs::rename(&temp, &path).map_err(|e| format!("Failed to commit config file: {}", e))
+            }
+            Err(error) => Err(format!("Failed to commit config file: {}", error)),
+        }
     }
 
     pub fn get_api_key_for(provider: &str) -> Option<String> {
