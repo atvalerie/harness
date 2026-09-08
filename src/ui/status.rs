@@ -24,15 +24,26 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let thinking_str = app.thinking_mode(&app.config.model);
+    let temperature_text = if app
+        .config
+        .active_provider_config()
+        .kind
+        .eq_ignore_ascii_case("codex")
+    {
+        "n/a".to_string()
+    } else {
+        format!("{:.1}", app.config.temperature)
+    };
 
     // Context tracking
     let context_limit = app.context_limit();
 
-    let context_pct = if context_limit > 0 {
-        (app.context_tokens as f64 / context_limit as f64) * 100.0
-    } else {
-        0.0
-    };
+    let context_pct = context_limit
+        .map(|limit| (app.context_tokens as f64 / limit.max(1) as f64) * 100.0)
+        .unwrap_or(0.0);
+    let context_limit_text = context_limit
+        .map(format_compact_number)
+        .unwrap_or_else(|| "?".to_string());
 
     let tps_str = if app.state == EngineState::Streaming || app.current_tps > 0.0 {
         format!(" │ {:.1} tps", app.current_tps)
@@ -50,7 +61,7 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
 
     let line = Line::from(vec![
         Span::styled(
-            " HARNESS ",
+            " HOLIDAY ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -77,10 +88,7 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(thinking_str, Style::default().fg(Color::Magenta)),
         Span::raw(" │ "),
         Span::styled("temp: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{:.1}", app.config.temperature),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(temperature_text, Style::default().fg(Color::Yellow)),
         Span::raw(" │ "),
         Span::styled("ctx: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -92,7 +100,7 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                     ""
                 },
                 app.context_tokens,
-                format_compact_number(context_limit),
+                context_limit_text,
                 context_pct
             ),
             Style::default().fg(if context_pct > 80.0 {

@@ -37,6 +37,9 @@ pub enum AppEvent {
         result: Result<String, String>,
     },
     SystemNotification(String),
-    ModelsFetched(Result<Vec<crate::client::types::ModelInfo>, String>),
+    ModelsFetched {
+        result: Result<Vec<crate::client::types::ModelInfo>, String>,
+        interactive: bool,
+    },
     CompactionFinished(Result<String, String>),
 }

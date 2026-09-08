@@ -1,9 +1,11 @@
 mod openai;
+mod providers;
 pub mod sse;
 pub mod types;
 
 use crate::config::AppConfig;
 use crate::events::StreamSignal;
+use providers::{adapter_for, ModelCatalogShape, ProviderAdapter};
 use reqwest::{Client, RequestBuilder};
 use std::collections::BTreeMap;
 use std::sync::{
@@ -19,10 +21,11 @@ pub struct AiClient {
     client: Client,
     api_key: String,
     base_url: String,
-    provider: ProviderKind,
     headers: BTreeMap<String, String>,
     include_stream_usage: bool,
     protocol: ProviderProtocol,
+    codex_account_id: String,
+    adapter: Arc<dyn ProviderAdapter>,
     zen_session_id: Arc<String>,
     zen_request_counter: Arc<AtomicU64>,
 }
@@ -31,6 +34,7 @@ pub struct AiClient {
 pub enum ProviderKind {
     Gemini,
     OpenAiCompatible,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +60,7 @@ impl ProviderKind {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "gemini" | "google" | "google-gemini" => Self::Gemini,
+            "codex" | "chatgpt" | "openai-codex" => Self::Codex,
             _ => Self::OpenAiCompatible,
         }
     }
@@ -66,40 +71,15 @@ impl AiClient {
         for (name, value) in &self.headers {
             request = request.header(name, value);
         }
-
-        if self.provider == ProviderKind::OpenAiCompatible {
-            if self.is_zen() {
-                // OpenCode's free Zen route uses these identity headers to
-                // recognize requests from an OpenCode-compatible client.
-                let request_id = self.zen_request_counter.fetch_add(1, Ordering::Relaxed);
-                request = request
-                    .header("x-opencode-session", self.zen_session_id.as_str())
-                    .header(
-                        "x-opencode-request",
-                        format!("gemini-harness-{}", request_id),
-                    )
-                    .header("x-opencode-client", "cli")
-                    .header(
-                        "User-Agent",
-                        concat!("opencode/gemini-harness/", env!("CARGO_PKG_VERSION")),
-                    );
-
-                // `public` is OpenCode's anonymous/free-tier sentinel. The
-                // Zen gateway distinguishes it from a missing Authorization
-                // header.
-                return if self.api_key.is_empty() {
-                    request.bearer_auth("public")
-                } else {
-                    request.bearer_auth(&self.api_key)
-                };
-            }
-
-            if !self.api_key.is_empty() {
-                return request.bearer_auth(&self.api_key);
-            }
-        }
-
-        request
+        let request_id = self.zen_request_counter.fetch_add(1, Ordering::Relaxed);
+        self.adapter.authorize(
+            request,
+            &self.api_key,
+            &self.codex_account_id,
+            self.zen_session_id.as_str(),
+            request_id,
+            &self.base_url,
+        )
     }
 
     pub fn from_config(api_key: String, config: &AppConfig) -> Self {
@@ -111,6 +91,9 @@ impl AiClient {
             provider.headers,
             provider.stream_usage,
             ProviderProtocol::parse(&provider.protocol),
+            AppConfig::get_codex_auth()
+                .map(|auth| auth.account_id)
+                .unwrap_or_default(),
         )
     }
 
@@ -121,6 +104,7 @@ impl AiClient {
         headers: BTreeMap<String, String>,
         include_stream_usage: bool,
         protocol: ProviderProtocol,
+        codex_account_id: String,
     ) -> Self {
         Self {
             client: Client::builder()
@@ -128,19 +112,16 @@ impl AiClient {
                 .timeout(Duration::from_secs(120))
                 .build()
                 .unwrap_or_default(),
-            base_url: base_url.unwrap_or_else(|| match provider {
-                ProviderKind::Gemini => {
-                    "https://generativelanguage.googleapis.com/v1beta".to_string()
-                }
-                ProviderKind::OpenAiCompatible => "https://api.openai.com/v1".to_string(),
-            }),
+            base_url: base_url
+                .unwrap_or_else(|| adapter_for(provider).default_base_url().to_string()),
             api_key,
-            provider,
             headers,
             include_stream_usage,
             protocol,
+            codex_account_id,
+            adapter: adapter_for(provider),
             zen_session_id: Arc::new(format!(
-                "gemini-harness-{}-{}",
+                "holiday-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -158,15 +139,14 @@ impl AiClient {
         headers: BTreeMap<String, String>,
         include_stream_usage: bool,
         protocol: ProviderProtocol,
+        codex_account_id: String,
     ) {
-        self.provider = provider;
         self.headers = headers;
         self.include_stream_usage = include_stream_usage;
         self.protocol = protocol;
-        self.base_url = base_url.unwrap_or_else(|| match provider {
-            ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            ProviderKind::OpenAiCompatible => "https://api.openai.com/v1".to_string(),
-        });
+        self.adapter = adapter_for(provider);
+        self.base_url = base_url.unwrap_or_else(|| self.adapter.default_base_url().to_string());
+        self.codex_account_id = codex_account_id;
     }
 
     pub fn update_api_key(&mut self, new_key: String) {
@@ -181,7 +161,7 @@ impl AiClient {
         request: &GenerateContentRequest,
         tx: UnboundedSender<StreamSignal>,
     ) {
-        if self.provider == ProviderKind::OpenAiCompatible {
+        if self.is_openai_protocol_provider() {
             self.stream_openai(model, fallback_models, max_retries, request, tx)
                 .await;
             return;
@@ -264,7 +244,7 @@ impl AiClient {
         model: &str,
         request: &GenerateContentRequest,
     ) -> Result<String, String> {
-        if self.provider == ProviderKind::OpenAiCompatible {
+        if self.is_openai_protocol_provider() {
             return self.generate_openai(model, request).await;
         }
         let clean_model = if model.starts_with("models/") {
@@ -329,7 +309,7 @@ impl AiClient {
         request: &GenerateContentRequest,
     ) -> Result<String, String> {
         let mut models = model_candidates(model, fallback_models);
-        if self.provider == ProviderKind::OpenAiCompatible {
+        if self.is_openai_protocol_provider() {
             models.retain(|candidate| !candidate.to_ascii_lowercase().starts_with("gemini"));
             if models.is_empty() {
                 models.push(clean_model(model).to_string());
@@ -363,7 +343,7 @@ impl AiClient {
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, String> {
-        if self.provider == ProviderKind::OpenAiCompatible {
+        if self.is_openai_protocol_provider() {
             return self.list_openai_models().await;
         }
         let url = format!("{}/models?key={}", self.base_url, self.api_key);
@@ -411,11 +391,32 @@ impl AiClient {
                     input_price_per_m: input_price,
                     output_price_per_m: output_price,
                     input_token_limit: entry.input_token_limit,
+                    reasoning_levels: Vec::new(),
                 });
             }
         }
 
         Ok(models)
+    }
+
+    pub async fn usage_summary(&self) -> Result<String, String> {
+        let Some(path) = self.adapter.usage_path() else {
+            return Err("This provider does not expose account usage".to_string());
+        };
+        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path);
+        let response = self
+            .authorize(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|error| format!("Failed to fetch provider usage: {error}"))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format_api_error(Some(status.as_u16()), &body));
+        }
+        let data: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|error| format!("Failed to parse provider usage: {error}"))?;
+        self.adapter.format_usage(&data)
     }
 }
 
@@ -436,7 +437,7 @@ impl AiClient {
         let mut last_error = String::new();
         'models: for (model_index, candidate) in models.iter().enumerate() {
             if self.is_zen() && is_zen_unsupported_model_id(candidate) {
-                let error = format!("Zen model {} uses an unsupported protocol for this harness; choose a Chat Completions or Responses model.", candidate);
+                let error = format!("Zen model {} uses an unsupported protocol for Holiday; choose a Chat Completions or Responses model.", candidate);
                 let _ = tx.send(StreamSignal::Error(error));
                 return;
             }
@@ -449,7 +450,9 @@ impl AiClient {
                 };
                 let url = format!("{}/{}", self.base_url.trim_end_matches('/'), endpoint);
                 let payload = if use_responses {
-                    openai::responses_request_payload(candidate, request, true)
+                    let mut payload = openai::responses_request_payload(candidate, request, true);
+                    self.adapter.customize_responses_payload(&mut payload);
+                    payload
                 } else {
                     openai::request_payload(candidate, request, true, self.include_stream_usage)
                 };
@@ -521,12 +524,10 @@ impl AiClient {
     ) -> Result<String, String> {
         if self.uses_responses(model) {
             let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+            let mut payload = openai::responses_request_payload(model, request, false);
+            self.adapter.customize_responses_payload(&mut payload);
             let response = self
-                .authorize(
-                    self.client
-                        .post(&url)
-                        .json(&openai::responses_request_payload(model, request, false)),
-                )
+                .authorize(self.client.post(&url).json(&payload))
                 .send()
                 .await
                 .map_err(|e| format!("Request failed: {}", e))?;
@@ -565,7 +566,7 @@ impl AiClient {
     }
 
     async fn list_openai_models(&self) -> Result<Vec<ModelInfo>, String> {
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let url = self.adapter.models_url(&self.base_url);
         let response = self
             .authorize(self.client.get(&url))
             .send()
@@ -578,28 +579,83 @@ impl AiClient {
         }
         let data: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to deserialize models list: {}", e))?;
-        Ok(data
-            .get("data")
-            .and_then(|v| v.as_array())
+        let entries = data
+            .get(match self.adapter.model_catalog_shape() {
+                ModelCatalogShape::Codex => "models",
+                ModelCatalogShape::OpenAi => "data",
+                ModelCatalogShape::Gemini => "models",
+            })
+            .and_then(|value| value.as_array());
+        Ok(entries
             .into_iter()
             .flatten()
             .filter_map(|entry| {
-                let id = entry.get("id").and_then(|v| v.as_str())?;
+                let id = entry
+                    .get(match self.adapter.model_catalog_shape() {
+                        ModelCatalogShape::Codex => "slug",
+                        ModelCatalogShape::OpenAi => "id",
+                        ModelCatalogShape::Gemini => "name",
+                    })
+                    .or_else(|| entry.get("id"))
+                    .and_then(|value| value.as_str())?;
+                if self.adapter.model_catalog_shape() == ModelCatalogShape::Codex
+                    && entry
+                        .get("visibility")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|visibility| visibility != "list")
+                {
+                    return None;
+                }
+                if self.adapter.model_catalog_shape() == ModelCatalogShape::Codex
+                    && entry
+                        .get("supported_in_api")
+                        .and_then(|value| value.as_bool())
+                        == Some(false)
+                {
+                    return None;
+                }
                 if self.is_zen() && is_zen_unsupported_model_id(id) {
                     return None;
                 }
                 let description = entry
                     .get("description")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("OpenAI-compatible model")
+                    .unwrap_or(
+                        if self.adapter.model_catalog_shape() == ModelCatalogShape::Codex {
+                            "Codex model"
+                        } else {
+                            "OpenAI-compatible model"
+                        },
+                    )
                     .to_string();
                 let input_price_per_m = openrouter_price_per_m(entry, "prompt");
                 let output_price_per_m = openrouter_price_per_m(entry, "completion");
-                let input_token_limit = entry.get("context_length").and_then(|v| v.as_u64());
+                let input_token_limit = entry
+                    .get("context_length")
+                    .or_else(|| entry.get("context_window"))
+                    .or_else(|| entry.get("max_context_window"))
+                    .and_then(|value| value.as_u64());
+                let reasoning_levels = entry
+                    .get("supported_reasoning_levels")
+                    .and_then(|value| value.as_array())
+                    .map(|levels| {
+                        levels
+                            .iter()
+                            .filter_map(|level| {
+                                level
+                                    .get("effort")
+                                    .or_else(|| level.get("level"))
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_string)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 Some(ModelInfo {
                     id: id.to_string(),
                     display_name: entry
-                        .get("name")
+                        .get("display_name")
+                        .or_else(|| entry.get("name"))
                         .and_then(|v| v.as_str())
                         .unwrap_or(id)
                         .to_string(),
@@ -607,6 +663,7 @@ impl AiClient {
                     input_price_per_m,
                     output_price_per_m,
                     input_token_limit,
+                    reasoning_levels,
                 })
             })
             .collect())
@@ -618,17 +675,19 @@ impl AiClient {
             .contains("opencode.ai/zen/")
     }
 
+    fn is_openai_protocol_provider(&self) -> bool {
+        self.adapter.is_openai_protocol()
+    }
+
     fn uses_responses(&self, model: &str) -> bool {
-        match self.protocol {
-            ProviderProtocol::Responses => true,
-            ProviderProtocol::ChatCompletions => false,
-            ProviderProtocol::Auto => self.is_zen() && is_zen_responses_model_id(model),
-        }
+        self.adapter
+            .uses_responses(self.protocol, model, &self.base_url)
     }
 }
 
 /// Zen publishes one model catalog for several wire protocols. These model
 /// families are documented as Responses rather than Chat Completions.
+#[allow(dead_code)]
 pub fn is_zen_responses_model_id(model: &str) -> bool {
     let model = clean_model(model).to_ascii_lowercase();
     model.starts_with("gpt-") || model.starts_with("grok-") || model.starts_with("muse-spark-")
@@ -703,6 +762,7 @@ mod tests {
             ProviderKind::OpenAiCompatible
         );
         assert_eq!(ProviderKind::parse("local"), ProviderKind::OpenAiCompatible);
+        assert_eq!(ProviderKind::parse("codex"), ProviderKind::Codex);
         assert_eq!(
             ProviderProtocol::parse("responses"),
             ProviderProtocol::Responses

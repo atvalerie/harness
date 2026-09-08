@@ -17,7 +17,7 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     {
         lines.push(Line::from(vec![
             Span::styled(
-                "Gemini Developer Harness",
+                "Welcome to Holiday",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -27,10 +27,29 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                 Style::default().fg(Color::Cyan),
             ),
         ]));
-        lines.push(Line::from(vec![Span::styled(
-            "Ready. Type /help for commands or enter a prompt.",
-            Style::default().fg(Color::DarkGray),
-        )]));
+        if app.config.get_api_key_for_active_provider().is_some() {
+            lines.push(Line::from(vec![Span::styled(
+                "Ready. Type /help for commands or enter a prompt.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        } else {
+            lines.push(Line::from(vec![Span::styled(
+                "You can explore without an API key.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "For ChatGPT/Codex, run `holiday --login browser` or `holiday --login device`, then choose the codex provider.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "For API keys, use /key <provider_api_key> or set the provider's environment variable.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "Type /help for commands or enter a prompt.",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
     }
 
     for msg in &app.messages {

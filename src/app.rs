@@ -519,12 +519,11 @@ impl App {
         }
     }
 
-    pub fn context_limit(&self) -> u64 {
+    pub fn context_limit(&self) -> Option<u64> {
         self.available_models
             .iter()
             .find(|model| model.id == self.config.model)
             .and_then(|model| model.input_token_limit)
-            .unwrap_or(1_048_576)
     }
 
     pub fn refresh_client_from_config(&mut self) {
@@ -537,10 +536,35 @@ impl App {
             provider_config.headers,
             provider_config.stream_usage,
             crate::client::ProviderProtocol::parse(&provider_config.protocol),
+            AppConfig::get_codex_auth()
+                .map(|auth| auth.account_id)
+                .unwrap_or_default(),
         );
         if let Some(api_key) = self.config.get_api_key_for_active_provider() {
             self.client.update_api_key(api_key);
         }
+    }
+
+    /// Refresh the active provider's model catalog without blocking the UI.
+    /// The catalog is also the source of truth for model context limits.
+    pub fn prefetch_models(&self, tx: UnboundedSender<AppEvent>) {
+        self.spawn_models_fetch(tx, false);
+    }
+
+    fn spawn_models_fetch(&self, tx: UnboundedSender<AppEvent>, interactive: bool) {
+        let client = self.client.clone();
+        let configured_models = self.config.configured_models();
+        let bootstrap_model = self.config.model.clone();
+        let free_only = self.config.provider.eq_ignore_ascii_case("opencode-zen")
+            && self.config.get_api_key_for_active_provider().is_none();
+
+        tokio::spawn(async move {
+            let result = fetch_models(client, configured_models, bootstrap_model, free_only).await;
+            let _ = tx.send(AppEvent::ModelsFetched {
+                result,
+                interactive,
+            });
+        });
     }
 
     fn refresh_context_estimate(&mut self) {
@@ -740,7 +764,10 @@ impl App {
             if effort == "none" {
                 return "off".to_string();
             }
-            if matches!(effort, "minimal" | "low" | "medium" | "high") {
+            if matches!(
+                effort,
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
                 return effort.to_string();
             }
         }
@@ -757,6 +784,29 @@ impl App {
 
     pub fn thinking_choices(&self, model: &str) -> Vec<&'static str> {
         let provider_kind = self.config.active_provider_config().kind;
+        if provider_kind.eq_ignore_ascii_case("codex") {
+            if let Some(levels) = self
+                .available_models
+                .iter()
+                .find(|entry| entry.id == model)
+                .map(|entry| entry.reasoning_levels.as_slice())
+                .filter(|levels| !levels.is_empty())
+            {
+                let mut choices = vec!["off"];
+                for level in levels {
+                    match level.as_str() {
+                        "low" if !choices.contains(&"low") => choices.push("low"),
+                        "medium" if !choices.contains(&"medium") => choices.push("medium"),
+                        "high" if !choices.contains(&"high") => choices.push("high"),
+                        "xhigh" if !choices.contains(&"xhigh") => choices.push("xhigh"),
+                        "max" if !choices.contains(&"max") => choices.push("max"),
+                        _ => {}
+                    }
+                }
+                return choices;
+            }
+            return vec!["off", "low", "medium", "high", "xhigh", "max"];
+        }
         if provider_kind.eq_ignore_ascii_case("gemini") {
             let model = model.to_ascii_lowercase();
             if model.contains("gemini-3.1-flash-lite-image") {
@@ -788,6 +838,8 @@ impl App {
             "low" => (true, 1024, Some("low")),
             "medium" | "med" => (true, 8192, Some("medium")),
             "high" => (true, 24576, Some("high")),
+            "xhigh" => (true, 65536, Some("xhigh")),
+            "max" => (true, 131072, Some("max")),
             _ => return,
         };
         let key = format!("{}:{}", self.config.provider, model);
@@ -1311,10 +1363,11 @@ impl App {
                     - /baseurl <url|default> : Set the active provider base URL\n\
                     - /config <path|open|dir> : Inspect or open the active config file\n\
                     - /model <name> : Switch active model (e.g. /model gemini-3.5-flash-lite)\n\
-                    - /thinking [off|minimal|low|medium|high] : Open the model-aware thinking picker\n\
-                    - /reasoning [on|off|low|medium|high] : Set reasoning effort for the active model\n\
+                    - /thinking [off|low|medium|high|xhigh|max] : Open the model-aware thinking picker\n\
+                    - /reasoning [on|off|low|medium|high|xhigh|max] : Set reasoning effort for the active model\n\
                     - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
                     - /usage : Show persisted token usage for this session\n\
+                    - /limits : Show the active provider's usage windows\n\
                     - /context : Show next-request context and model limit\n\
                     - /status : Show engine/provider/session state\n\
                     - /pwd : Show the restored project working directory\n\
@@ -1434,9 +1487,6 @@ impl App {
                     "system",
                     format!("Fetching models from {}...", self.config.provider),
                 );
-                let client = self.client.clone();
-                let configured_models = self.config.configured_models();
-                let bootstrap_model = self.config.model.clone();
                 let free_only = self.config.provider.eq_ignore_ascii_case("opencode-zen")
                     && self.config.get_api_key_for_active_provider().is_none();
                 if free_only {
@@ -1445,65 +1495,7 @@ impl App {
                         "No Zen API key detected; showing -free models only.",
                     );
                 }
-                tokio::spawn(async move {
-                    let res = match client.list_models().await {
-                        Ok(mut models) => {
-                            if free_only {
-                                models.retain(|model| is_free_model_id(&model.id));
-                            }
-                            for id in configured_models {
-                                if free_only
-                                    && (!is_free_model_id(&id)
-                                        || crate::client::is_zen_unsupported_model_id(&id))
-                                {
-                                    continue;
-                                }
-                                if !models.iter().any(|model| model.id == id) {
-                                    models.push(crate::client::types::ModelInfo {
-                                        id: id.clone(),
-                                        display_name: id,
-                                        description: "Configured provider model".to_string(),
-                                        input_price_per_m: None,
-                                        output_price_per_m: None,
-                                        input_token_limit: None,
-                                    });
-                                }
-                            }
-                            Ok(models)
-                        }
-                        Err(_error) if free_only && configured_models.is_empty() => {
-                            Ok(vec![crate::client::types::ModelInfo {
-                                display_name: bootstrap_model.clone(),
-                                id: bootstrap_model,
-                                description: "Bootstrap free model (live catalog unavailable)"
-                                    .to_string(),
-                                input_price_per_m: None,
-                                output_price_per_m: None,
-                                input_token_limit: None,
-                            }])
-                        }
-                        Err(_error) if !configured_models.is_empty() => Ok(configured_models
-                            .into_iter()
-                            .filter(|id| {
-                                !free_only
-                                    || (is_free_model_id(id)
-                                        && !crate::client::is_zen_unsupported_model_id(id))
-                            })
-                            .map(|id| crate::client::types::ModelInfo {
-                                display_name: id.clone(),
-                                id,
-                                description:
-                                    "Configured provider model (API model listing unavailable)"
-                                        .to_string(),
-                                input_price_per_m: None,
-                                output_price_per_m: None,
-                                input_token_limit: None,
-                            })
-                            .collect()),
-                        Err(error) => Err(error),
-                    };
-                    let _ = tx.send(AppEvent::ModelsFetched(res));
-                });
+                self.spawn_models_fetch(tx, true);
             }
             "/providers" => {
                 let mut lines = vec!["Available providers:".to_string()];
@@ -1525,7 +1517,7 @@ impl App {
                         self.config.provider, "openai-compatible", self.config.model
                     ));
                 }
-                lines.push("Supported kinds: gemini, openai-compatible (custom endpoints, OpenRouter, Zen, local servers)".to_string());
+                lines.push("Supported kinds: gemini, codex (ChatGPT OAuth/device login), openai-compatible (custom endpoints, OpenRouter, Zen, local servers)".to_string());
                 lines.push("Use /provider <name> to switch.".to_string());
                 self.add_message("system", lines.join("\n"));
             }
@@ -1548,6 +1540,9 @@ impl App {
                         provider_config.headers,
                         provider_config.stream_usage,
                         crate::client::ProviderProtocol::parse(&provider_config.protocol),
+                        AppConfig::get_codex_auth()
+                            .map(|auth| auth.account_id)
+                            .unwrap_or_default(),
                     );
                     if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                         self.client.update_api_key(api_key);
@@ -1593,6 +1588,9 @@ impl App {
                         provider_config.headers,
                         provider_config.stream_usage,
                         crate::client::ProviderProtocol::parse(&provider_config.protocol),
+                        AppConfig::get_codex_auth()
+                            .map(|auth| auth.account_id)
+                            .unwrap_or_default(),
                     );
                     self.set_status("Provider base URL updated");
                     self.add_message(
@@ -1961,16 +1959,34 @@ impl App {
                     ),
                 );
             }
+            "/limits" => {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let message = client
+                        .usage_summary()
+                        .await
+                        .unwrap_or_else(|error| format!("Unable to fetch Codex usage: {error}"));
+                    let _ = tx.send(AppEvent::SystemNotification(message));
+                });
+                self.add_message("system", "Fetching provider usage limits...");
+            }
             "/context" => {
                 let limit = self.context_limit();
+                let limit_text = limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let percentage = limit
+                    .map(|value| (self.context_tokens as f64 / value.max(1) as f64) * 100.0)
+                    .map(|value| format!("{value:.1}%"))
+                    .unwrap_or_else(|| "unknown".to_string());
                 self.add_message(
                     "system",
                     format!(
-                        "Next-request context: {} / {} tokens ({}; {:.1}%). Last request: {} input + {} output = {} total.",
+                        "Next-request context: {} / {} tokens ({}; {}). Last request: {} input + {} output = {} total.",
                         self.context_tokens,
-                        limit,
+                        limit_text,
                         if self.context_tokens_estimated { "estimated" } else { "provider reported" },
-                        (self.context_tokens as f64 / limit.max(1) as f64) * 100.0,
+                        percentage,
                         self.prompt_tokens,
                         self.candidates_tokens,
                         self.total_tokens
@@ -1978,6 +1994,10 @@ impl App {
                 );
             }
             "/status" => {
+                let context_limit = self
+                    .context_limit()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
                 self.add_message(
                     "system",
                     format!(
@@ -1986,7 +2006,7 @@ impl App {
                         self.config.provider,
                         self.config.model,
                         self.context_tokens,
-                        self.context_limit(),
+                        context_limit,
                         if self.context_tokens_estimated {
                             " (estimated)"
                         } else {
@@ -2175,8 +2195,9 @@ impl App {
             .active_model_profile()
             .max_output_tokens
             .unwrap_or(8192) as u64;
-        let context_limit = self.context_limit();
-        let output_would_overflow = context_estimate.saturating_add(output_budget) >= context_limit;
+        let output_would_overflow = self
+            .context_limit()
+            .is_some_and(|limit| context_estimate.saturating_add(output_budget) >= limit);
         if self.config.auto_compact
             && self.messages.len() > 2
             && (context_estimate >= self.config.auto_compact_threshold_tokens
@@ -2973,6 +2994,69 @@ impl App {
                 self.state = EngineState::Idle;
             }
         }
+    }
+}
+
+async fn fetch_models(
+    client: AiClient,
+    configured_models: Vec<String>,
+    bootstrap_model: String,
+    free_only: bool,
+) -> Result<Vec<crate::client::types::ModelInfo>, String> {
+    match client.list_models().await {
+        Ok(mut models) => {
+            if free_only {
+                models.retain(|model| is_free_model_id(&model.id));
+            }
+            for id in configured_models {
+                if free_only
+                    && (!is_free_model_id(&id) || crate::client::is_zen_unsupported_model_id(&id))
+                {
+                    continue;
+                }
+                if !models.iter().any(|model| model.id == id) {
+                    models.push(crate::client::types::ModelInfo {
+                        id: id.clone(),
+                        display_name: id,
+                        description: "Configured provider model".to_string(),
+                        input_price_per_m: None,
+                        output_price_per_m: None,
+                        input_token_limit: None,
+                        reasoning_levels: Vec::new(),
+                    });
+                }
+            }
+            Ok(models)
+        }
+        Err(_error) if free_only && configured_models.is_empty() => {
+            Ok(vec![crate::client::types::ModelInfo {
+                display_name: bootstrap_model.clone(),
+                id: bootstrap_model,
+                description: "Bootstrap free model (live catalog unavailable)".to_string(),
+                input_price_per_m: None,
+                output_price_per_m: None,
+                input_token_limit: None,
+                reasoning_levels: Vec::new(),
+            }])
+        }
+        Err(_error) if !configured_models.is_empty() => Ok(configured_models
+            .into_iter()
+            .filter(|id| {
+                !free_only
+                    || (is_free_model_id(id) && !crate::client::is_zen_unsupported_model_id(id))
+            })
+            .map(|id| crate::client::types::ModelInfo {
+                display_name: id.clone(),
+                id,
+                description: "Configured provider model (API model listing unavailable)"
+                    .to_string(),
+                input_price_per_m: None,
+                output_price_per_m: None,
+                input_token_limit: None,
+                reasoning_levels: Vec::new(),
+            })
+            .collect()),
+        Err(error) => Err(error),
     }
 }
 

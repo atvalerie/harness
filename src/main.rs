@@ -1,6 +1,7 @@
 mod agents;
 mod app;
 mod client;
+mod codex_auth;
 mod config;
 mod events;
 mod mcp;
@@ -39,6 +40,7 @@ struct CliArgs {
     config_path: Option<PathBuf>,
     output_format: OutputFormat,
     tool_policy: ToolPolicy,
+    login: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,14 +74,29 @@ fn resolve_api_key(config: &AppConfig) -> io::Result<String> {
     if let Some(key) = config.get_api_key_for_active_provider() {
         return Ok(key);
     }
-    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible
-    {
+    if matches!(
+        ProviderKind::parse(&config.active_provider_config().kind),
+        ProviderKind::OpenAiCompatible | ProviderKind::Codex
+    ) {
         return Ok(String::new());
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         "No provider API key found in the environment or keyring",
     ))
+}
+
+async fn refresh_codex_auth_if_available(config: &AppConfig) {
+    if !config.provider.eq_ignore_ascii_case("codex") {
+        return;
+    }
+    let Some(auth) = AppConfig::get_codex_auth() else {
+        return;
+    };
+    if auth.refresh_token.is_empty() {
+        return;
+    }
+    let _ = codex_auth::refresh(&auth).await;
 }
 
 fn resolve_session_selector(
@@ -130,6 +147,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         config_path: None,
         output_format: OutputFormat::Text,
         tool_policy: ToolPolicy::Ask,
+        login: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -194,6 +212,12 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                         .ok_or_else(|| "--tools requires ask, auto, or deny".to_string())?,
                 )?;
             }
+            "--login" => {
+                cli.login = Some(
+                    args.next()
+                        .ok_or_else(|| "--login requires browser or device".to_string())?,
+                );
+            }
             "-h" | "--help" => {
                 cli.help = true;
                 break;
@@ -232,6 +256,7 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             config.base_url = value;
         }
     }
+    refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
     if let Some(path) = resume_path {
@@ -272,6 +297,25 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", result);
     app.add_message("model", result);
     let _ = app.flush_session();
+    Ok(())
+}
+
+async fn run_login(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = codex_auth::parse_login_mode(Some(mode))?;
+    let auth = codex_auth::login(mode)
+        .await
+        .map_err(codex_auth::login_error)?;
+    let mut config = AppConfig::load();
+    config.select_provider("codex");
+    config.save().map_err(io::Error::other)?;
+    println!(
+        "Signed in to Codex{}.",
+        if auth.account_id.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", auth.account_id)
+        }
+    );
     Ok(())
 }
 
@@ -459,7 +503,7 @@ async fn run_headless_jsonl(
                 "notice",
                 json!({"message": message}),
             )?,
-            AppEvent::ModelsFetched(_)
+            AppEvent::ModelsFetched { .. }
             | AppEvent::Paste(_)
             | AppEvent::Key(_)
             | AppEvent::Mouse(_)
@@ -565,7 +609,7 @@ async fn run_text_generation(
                 }
             }
             AppEvent::SystemNotification(message) => eprintln!("{}", message),
-            AppEvent::ModelsFetched(_)
+            AppEvent::ModelsFetched { .. }
             | AppEvent::Paste(_)
             | AppEvent::Key(_)
             | AppEvent::Mouse(_)
@@ -609,6 +653,7 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             config.base_url = value;
         }
     }
+    refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
     if let Some(path) = resume_path {
@@ -647,10 +692,14 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                     AppEvent::CompactionFinished(result) => {
                         app.handle_compaction_result(result, command_tx.clone());
                     }
-                    AppEvent::ModelsFetched(Ok(models)) => {
+                    AppEvent::ModelsFetched {
+                        result: Ok(models), ..
+                    } => {
                         app.available_models = models;
                     }
-                    AppEvent::ModelsFetched(Err(error)) => {
+                    AppEvent::ModelsFetched {
+                        result: Err(error), ..
+                    } => {
                         eprintln!("error: failed to fetch models: {}", error);
                     }
                     _ => {}
@@ -693,45 +742,6 @@ fn reset_terminal() {
     let _ = execute!(stdout(), crossterm::cursor::Show);
 }
 
-fn prompt_for_api_key_if_missing(config: &AppConfig) -> io::Result<String> {
-    if let Some(key) = config.get_api_key_for_active_provider() {
-        return Ok(key);
-    }
-    if ProviderKind::parse(&config.active_provider_config().kind) == ProviderKind::OpenAiCompatible
-    {
-        return Ok(String::new());
-    }
-
-    println!();
-    println!("===========================================================");
-    println!("       Multi-Provider High-Performance Native TUI Harness  ");
-    println!("===========================================================");
-    println!("No API key detected in environment or native OS vault.");
-    print!("Please enter your provider API key: ");
-    io::stdout().flush()?;
-
-    let mut input_key = String::new();
-    io::stdin().read_line(&mut input_key)?;
-    let trimmed = input_key.trim();
-
-    if trimmed.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "API key cannot be empty. Exiting.",
-        ));
-    }
-
-    if let Err(e) = AppConfig::set_api_key(trimmed) {
-        eprintln!("Warning: could not persist key to keyring: {}", e);
-    } else {
-        println!("API key securely saved to OS vault / config directory.");
-    }
-
-    println!("Starting TUI...\n");
-    std::thread::sleep(Duration::from_millis(500));
-    Ok(trimmed.to_string())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args().map_err(|error| {
@@ -741,11 +751,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::Error::new(io::ErrorKind::InvalidInput, error)
     })?;
     if cli.help {
-        println!("Usage: gemini-harness.exe -p \"prompt\" [--format text|jsonl] [--tools ask|auto|deny] [--resume NAME|PATH | --continue] | --chat [--resume NAME|PATH | --continue] [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]");
+        println!("Usage: holiday.exe [--login browser|device] | -p \"prompt\" [--format text|jsonl] [--tools ask|auto|deny] [--resume NAME|PATH | --continue] | --chat [--resume NAME|PATH | --continue] [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]");
         return Ok(());
     }
     if let Some(path) = &cli.config_path {
-        std::env::set_var("GEMINI_HARNESS_CONFIG", path);
+        std::env::set_var("HOLIDAY_CONFIG", path);
+    }
+    if let Some(mode) = cli.login.as_deref() {
+        return run_login(mode).await;
     }
     if cli.prompt.is_some() {
         return run_headless(cli).await;
@@ -760,15 +773,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         original_hook(panic_info);
     }));
 
-    // 2. Check or prompt for API Key
+    // 2. Load configuration. The TUI is usable before a provider key is set;
+    // requests will report the provider's authentication error when submitted.
     let config = AppConfig::load();
-    let api_key = match prompt_for_api_key_if_missing(&config) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    refresh_codex_auth_if_available(&config).await;
+    let api_key = config.get_api_key_for_active_provider().unwrap_or_default();
 
     // 3. Initialize Terminal in Raw Mode & Alternate Screen
     enable_raw_mode()?;
@@ -789,6 +798,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.tool_registry.register(tool);
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    app.prefetch_models(tx.clone());
 
     // 6. Spawn input event listener thread
     let event_tx = tx.clone();
@@ -874,8 +884,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     AppEvent::SystemNotification(msg) => {
                         app.add_message("system", msg);
                     }
-                    AppEvent::ModelsFetched(res) => {
-                        match res {
+                    AppEvent::ModelsFetched { result, interactive } => {
+                        match result {
                             Ok(models) => {
                                 app.available_models = models;
                                 if app.config.provider.eq_ignore_ascii_case("opencode-zen")
@@ -900,12 +910,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.models_selected = app.available_models.iter().position(|model| model.id == app.config.model).unwrap_or(0);
                                 app.models_filter.clear();
                                 app.models_searching = false;
-                                app.show_models_modal = true;
+                                app.show_models_modal = interactive;
                                 app.models_scroll = 0;
-                                app.set_status("Fetched live models list.");
+                                app.set_status(if interactive {
+                                    "Fetched live models list."
+                                } else {
+                                    "Loaded provider model catalog."
+                                });
                             }
                             Err(e) => {
-                                app.add_message("system", format!("Failed to fetch models: {}", e));
+                                if interactive {
+                                    app.add_message("system", format!("Failed to fetch models: {}", e));
+                                } else {
+                                    app.set_status("Provider model catalog unavailable.");
+                                }
                             }
                         }
                     }

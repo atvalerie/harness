@@ -6,9 +6,19 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const KEYRING_SERVICE: &str = "gemini-harness";
+const KEYRING_SERVICE: &str = "holiday";
 const KEYRING_USER: &str = "api_key";
+const CODEX_ACCESS_USER: &str = "codex_access_token";
+const CODEX_REFRESH_USER: &str = "codex_refresh_token";
+const CODEX_ACCOUNT_USER: &str = "codex_account_id";
 const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexAuth {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub account_id: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -87,7 +97,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub model_profiles: BTreeMap<String, ModelProfile>,
     /// Last selected model for each provider, so switching providers and
-    /// restarting the harness return to the user's actual choices.
+    /// restarting Holiday returns to the user's actual choices.
     #[serde(default)]
     pub last_models: BTreeMap<String, String>,
     #[serde(default = "default_auto_compact")]
@@ -112,13 +122,13 @@ impl Default for AppConfig {
             max_retries: default_max_retries(),
             thinking_budget: 1024,
             temperature: 0.7,
-            system_instruction: "You are an expert autonomous developer and coding assistant running in high-performance Gemini TUI Harness.\n\n\
+            system_instruction: "You are an expert autonomous developer and coding assistant running in the Gemini TUI Holiday.\n\n\
 You have direct access to native tools for filesystem inspection, safe command execution, and live web grounding:\n\
 - `web_search(query)`: Query the live internet using DuckDuckGo HTML Lite to look up current documentation, breaking news, libraries, or release notes.\n\
 - `web_fetch(url)`: Fetch and extract clean article text and code from web pages.\n\
 - `search_files(query, path, glob)`: Search the repository with ripgrep and return bounded file/line matches.\n\
 - `read_file(path)`: Inspect existing source files and directory contents.\n\
-- `write_file(path, content)`: Propose file writes and edits. The harness automatically generates unified diffs for the user to review in an interactive HITL modal.\n\
+- `write_file(path, content)`: Propose file writes and edits. Holiday automatically generates unified diffs for the user to review in an interactive HITL modal.\n\
 - `run_command(command)`: Run host shell commands. Always preview the exact command before requesting execution.\n\n\
 Operational Guidelines:\n\
 1. Proactively use `web_search` and `web_fetch` whenever you need up-to-date documentation or external facts.\n\
@@ -206,6 +216,20 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
         },
     );
     providers.insert(
+        "codex".to_string(),
+        ProviderConfig {
+            kind: "codex".to_string(),
+            protocol: "responses".to_string(),
+            base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            models: Vec::new(),
+            fallback_models: Vec::new(),
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            headers: BTreeMap::new(),
+            stream_usage: false,
+        },
+    );
+    providers.insert(
         "opencode-zen".to_string(),
         ProviderConfig {
             kind: "openai-compatible".to_string(),
@@ -288,12 +312,11 @@ impl AppConfig {
     }
 
     pub fn config_dir() -> Option<PathBuf> {
-        ProjectDirs::from("com", "gemini", "gemini-harness")
-            .map(|dirs| dirs.config_dir().to_path_buf())
+        ProjectDirs::from("", "", "holiday").map(|dirs| dirs.config_dir().to_path_buf())
     }
 
     pub fn config_path() -> Option<PathBuf> {
-        if let Ok(path) = env::var("GEMINI_HARNESS_CONFIG") {
+        if let Ok(path) = env::var("HOLIDAY_CONFIG") {
             let path = PathBuf::from(path);
             if !path.as_os_str().is_empty() {
                 return Some(path);
@@ -414,7 +437,9 @@ impl AppConfig {
 
     pub fn get_api_key_for(provider: &str) -> Option<String> {
         // 1. Check environment variable first
-        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("openai")
+        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("codex") {
+            vec!["OPENAI_API_KEY"]
+        } else if provider.eq_ignore_ascii_case("openai")
             || provider.eq_ignore_ascii_case("openai-compatible")
         {
             vec!["OPENAI_API_KEY", "GEMINI_API_KEY"]
@@ -459,6 +484,13 @@ impl AppConfig {
     }
 
     pub fn get_api_key_for_active_provider(&self) -> Option<String> {
+        if self.provider.eq_ignore_ascii_case("codex") {
+            if let Some(auth) = Self::get_codex_auth() {
+                if !auth.access_token.is_empty() {
+                    return Some(auth.access_token);
+                }
+            }
+        }
         if let Some(variable) = self.active_provider_config().api_key_env {
             if let Ok(key) = std::env::var(variable) {
                 let trimmed = key.trim();
@@ -468,6 +500,62 @@ impl AppConfig {
             }
         }
         Self::get_api_key_for(&self.provider)
+    }
+
+    fn codex_secret_path(user: &str) -> Option<PathBuf> {
+        Self::config_dir().map(|dir| dir.join(format!(".{user}")))
+    }
+
+    fn get_secret(user: &str) -> Option<String> {
+        if let Ok(entry) = Entry::new(KEYRING_SERVICE, user) {
+            if let Ok(secret) = entry.get_password() {
+                let secret = secret.trim().to_string();
+                if !secret.is_empty() {
+                    return Some(secret);
+                }
+            }
+        }
+        Self::codex_secret_path(user).and_then(|path| {
+            fs::read_to_string(path)
+                .ok()
+                .map(|secret| secret.trim().to_string())
+                .filter(|secret| !secret.is_empty())
+        })
+    }
+
+    fn set_secret(user: &str, secret: &str) {
+        if let Ok(entry) = Entry::new(KEYRING_SERVICE, user) {
+            let _ = entry.set_password(secret);
+        }
+        if let Some(path) = Self::codex_secret_path(user) {
+            if let Some(dir) = path.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            let _ = fs::write(path, secret);
+        }
+    }
+
+    pub fn get_codex_auth() -> Option<CodexAuth> {
+        let access_token = Self::get_secret(CODEX_ACCESS_USER)?;
+        Some(CodexAuth {
+            access_token,
+            refresh_token: Self::get_secret(CODEX_REFRESH_USER).unwrap_or_default(),
+            account_id: Self::get_secret(CODEX_ACCOUNT_USER).unwrap_or_default(),
+        })
+    }
+
+    pub fn set_codex_auth(auth: &CodexAuth) -> Result<(), String> {
+        if auth.access_token.trim().is_empty() {
+            return Err("Codex access token cannot be empty".to_string());
+        }
+        Self::set_secret(CODEX_ACCESS_USER, auth.access_token.trim());
+        if !auth.refresh_token.trim().is_empty() {
+            Self::set_secret(CODEX_REFRESH_USER, auth.refresh_token.trim());
+        }
+        if !auth.account_id.trim().is_empty() {
+            Self::set_secret(CODEX_ACCOUNT_USER, auth.account_id.trim());
+        }
+        Ok(())
     }
 
     pub fn set_api_key(key: &str) -> Result<(), String> {

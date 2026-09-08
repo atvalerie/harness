@@ -7,7 +7,7 @@ use tokio::time::{timeout, Duration};
 
 use super::{working_dir_path, SharedWorkingDir, Tool, ToolPreview};
 
-const CWD_MARKER: &str = "__GEMINI_HARNESS_CWD__";
+const CWD_MARKER: &str = "__HOLIDAY_CWD__";
 
 pub struct RunCommandTool {
     cwd: SharedWorkingDir,
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn extracts_persistent_directory_without_leaking_marker() {
-        let (output, cwd) = split_cwd_marker("hello\r\n\r\n__GEMINI_HARNESS_CWD__C:\\work\r\n");
+        let (output, cwd) = split_cwd_marker("hello\r\n\r\n__HOLIDAY_CWD__C:\\work\r\n");
         assert_eq!(output, "hello");
         assert_eq!(cwd.unwrap().to_string_lossy(), "C:\\work");
     }

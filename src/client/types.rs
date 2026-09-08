@@ -189,6 +189,8 @@ pub struct ModelInfo {
     pub input_price_per_m: Option<f64>,
     pub output_price_per_m: Option<f64>,
     pub input_token_limit: Option<u64>,
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
 }
 
 #[cfg(test)]

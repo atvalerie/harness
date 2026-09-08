@@ -299,7 +299,7 @@ async fn connect_server(
         transport: Mutex::new(transport),
         next_id: AtomicU64::new(1),
     });
-    timeout(Duration::from_secs(10), connection.request("initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"gemini-harness","version":env!("CARGO_PKG_VERSION")}}))).await.map_err(|_| "initialize timed out".to_string())??;
+    timeout(Duration::from_secs(10), connection.request("initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"holiday","version":env!("CARGO_PKG_VERSION")}}))).await.map_err(|_| "initialize timed out".to_string())??;
     timeout(
         Duration::from_secs(10),
         connection.notify("notifications/initialized", json!({})),

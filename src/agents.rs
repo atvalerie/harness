@@ -199,7 +199,7 @@ async fn agent_loop(
             system_instruction: Some(Content {
                 role: Some("system".to_string()),
                 parts: vec![Part::Text {
-                    text: "You are a focused subagent inside a developer harness. Work only on the assigned task, be concise, state assumptions, and return a useful report for the parent agent. You do not have permission to mutate files or execute host commands.".to_string(),
+                    text: "You are a focused subagent inside the Holiday developer application. Work only on the assigned task, be concise, state assumptions, and return a useful report for the parent agent. You do not have permission to mutate files or execute host commands.".to_string(),
                     thought: None,
                 }],
             }),
