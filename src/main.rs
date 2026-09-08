@@ -458,6 +458,7 @@ async fn run_headless_jsonl(
                 }
             }
             AppEvent::ToolExecutionResult {
+                epoch,
                 tool_name,
                 call_id,
                 result,
@@ -467,7 +468,7 @@ async fn run_headless_jsonl(
                     Err(error) => json!({"tool": tool_name, "error": error}),
                 };
                 emit_jsonl(&run_id, &mut sequence, "tool_result", result_data)?;
-                app.handle_tool_result(tool_name, call_id, result, event_tx.clone());
+                app.handle_tool_result(epoch, tool_name, call_id, result, event_tx.clone());
                 if app.state == EngineState::AwaitingHitlApproval {
                     emit_jsonl(
                         &run_id,
@@ -592,12 +593,13 @@ async fn run_text_generation(
                 }
             }
             AppEvent::ToolExecutionResult {
+                epoch,
                 tool_name,
                 call_id,
                 result,
             } => {
                 println!("\n[tool finished: {}]", tool_name);
-                app.handle_tool_result(tool_name, call_id, result, tx.clone());
+                app.handle_tool_result(epoch, tool_name, call_id, result, tx.clone());
                 if app.state == EngineState::Streaming {
                     saw_finished = false;
                 }
@@ -878,8 +880,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     AppEvent::Stream { epoch, signal } => {
                         app.handle_stream_signal(epoch, signal, tx.clone());
                     }
-                    AppEvent::ToolExecutionResult { tool_name, call_id, result } => {
-                        app.handle_tool_result(tool_name, call_id, result, tx.clone());
+                    AppEvent::ToolExecutionResult { epoch, tool_name, call_id, result } => {
+                        app.handle_tool_result(epoch, tool_name, call_id, result, tx.clone());
                     }
                     AppEvent::SystemNotification(msg) => {
                         app.add_message("system", msg);

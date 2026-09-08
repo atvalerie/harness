@@ -87,19 +87,27 @@ pub fn responses_request_payload(
                     "image_url": format!("data:{};base64,{}", inline_data.mime_type, inline_data.data),
                 })),
                 Part::FunctionCall { function_call, .. } => {
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": function_call.id.clone().unwrap_or_else(|| format!("call_{}", function_call.name)),
-                        "name": function_call.name,
-                        "arguments": function_call.args.to_string(),
-                    }));
+                    // A Responses function call without its original call_id
+                    // cannot be paired with a later function_call_output.
+                    // Drop malformed legacy history instead of inventing an
+                    // id that the provider never issued.
+                    if let Some(call_id) = &function_call.id {
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": function_call.name,
+                            "arguments": function_call.args.to_string(),
+                        }));
+                    }
                 }
                 Part::FunctionResponse { function_response } => {
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": function_response.id.clone().unwrap_or_default(),
-                        "output": function_response.response.to_string(),
-                    }));
+                    if let Some(call_id) = &function_response.id {
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": openai_tool_output(&function_response.response),
+                        }));
+                    }
                 }
             }
         }
@@ -188,18 +196,24 @@ fn content_messages(content: &Content) -> Vec<Value> {
                 "image_url": { "url": format!("data:{};base64,{}", inline_data.mime_type, inline_data.data) },
                 }));
             }
-            Part::FunctionCall { function_call, .. } => tool_calls.push(json!({
-                "id": function_call.id.clone().unwrap_or_else(|| format!("call_{}", function_call.name)),
-                "type": "function",
-                "function": { "name": function_call.name, "arguments": function_call.args.to_string() }
-            })),
+            Part::FunctionCall { function_call, .. } => {
+                if let Some(id) = &function_call.id {
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": function_call.name, "arguments": function_call.args.to_string() }
+                    }));
+                }
+            }
             Part::FunctionResponse { function_response } => {
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": function_response.id.clone().unwrap_or_default(),
-                    "name": function_response.name,
-                    "content": function_response.response.to_string()
-                }));
+                if let Some(id) = &function_response.id {
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "name": function_response.name,
+                        "content": openai_tool_output(&function_response.response)
+                    }));
+                }
             }
         }
     }
@@ -218,6 +232,19 @@ fn content_messages(content: &Content) -> Vec<Value> {
         messages.insert(0, json!({ "role": role, "tool_calls": tool_calls }));
     }
     messages
+}
+
+/// Holiday stores provider-neutral function responses as an object so Gemini
+/// can receive its normal functionResponse shape. OpenAI tool outputs are
+/// plain text (or structured content), so unwrap our envelope instead of
+/// sending a JSON object encoded inside a string.
+fn openai_tool_output(response: &Value) -> String {
+    response
+        .get("output")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("error").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| response.to_string())
 }
 
 pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSignal>) {
@@ -672,5 +699,29 @@ mod tests {
         assert_eq!(payload["input"][0]["call_id"], "call_123");
         assert_eq!(payload["input"][1]["type"], "function_call_output");
         assert_eq!(payload["input"][1]["call_id"], "call_123");
+        assert_eq!(payload["input"][1]["output"], "ok");
+    }
+
+    #[test]
+    fn does_not_invent_or_emit_empty_openai_tool_call_ids() {
+        let request = GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("model".into()),
+                parts: vec![Part::FunctionCall {
+                    function_call: crate::client::types::FunctionCallPayload {
+                        name: "run_command".into(),
+                        args: json!({"command": "dir"}),
+                        id: None,
+                    },
+                    thought_signature: None,
+                }],
+            }],
+            system_instruction: None,
+            generation_config: None,
+            safety_settings: None,
+            tools: None,
+        };
+        let payload = responses_request_payload("gpt-test", &request, false);
+        assert!(payload["input"].as_array().unwrap().is_empty());
     }
 }

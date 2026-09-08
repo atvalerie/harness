@@ -59,6 +59,7 @@ pub enum DraftAttachment {
 
 #[derive(Debug, Clone)]
 pub struct PendingToolCall {
+    pub epoch: u64,
     pub call_id: Option<String>,
     pub tool_name: String,
     pub args: serde_json::Value,
@@ -100,9 +101,15 @@ pub struct App {
     // HITL Modal State
     pub pending_tool_call: Option<PendingToolCall>,
     pub queued_tool_calls: VecDeque<PendingToolCall>,
-    /// Number of tool executions belonging to the current assistant turn.
+    /// Number of unresolved tool calls belonging to the current assistant
+    /// turn, including calls waiting for HITL approval.
     /// The next model request must wait until the entire batch is complete.
     pub pending_tool_executions: usize,
+    /// The model stream must finish before a tool result can resume the turn.
+    /// Responses providers may emit more function calls after the first one
+    /// has reached the approval UI.
+    tool_turn_stream_finished: bool,
+    tool_turn_failed: bool,
     pub session_allowed_tools: HashSet<String>,
     pub modal_scroll: usize,
 
@@ -279,6 +286,53 @@ mod tests {
         assert!(request.contents.iter().any(|content| {
             content.parts.iter().any(|part| {
                 matches!(part, Part::FunctionCall { function_call, .. } if function_call.id.as_deref() == Some("call-done"))
+            })
+        }));
+    }
+
+    #[test]
+    fn drops_orphaned_codex_tool_calls_and_outputs() {
+        let mut config = AppConfig::default();
+        config.provider = "codex".to_string();
+        config.model = "gpt-test".to_string();
+        let mut app = App::new(config, "test-key".to_string());
+        app.messages = vec![
+            message(
+                "model_tool_call",
+                Part::FunctionCall {
+                    function_call: FunctionCallPayload {
+                        name: "read_file".to_string(),
+                        args: json!({"path": "orphan.rs"}),
+                        id: Some("call-orphan".to_string()),
+                    },
+                    thought_signature: None,
+                },
+            ),
+            message(
+                "function",
+                Part::FunctionResponse {
+                    function_response: FunctionResponsePayload {
+                        name: "read_file".to_string(),
+                        response: json!({"output": "orphan output"}),
+                        id: Some("call-unrelated".to_string()),
+                    },
+                },
+            ),
+            ChatMessage {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                timestamp: String::new(),
+                attachments: Vec::new(),
+            },
+        ];
+
+        let request = app.build_request();
+        assert!(request.contents.iter().all(|content| {
+            content.parts.iter().all(|part| {
+                !matches!(
+                    part,
+                    Part::FunctionCall { .. } | Part::FunctionResponse { .. }
+                )
             })
         }));
     }
@@ -468,6 +522,8 @@ impl App {
             pending_tool_call: None,
             queued_tool_calls: VecDeque::new(),
             pending_tool_executions: 0,
+            tool_turn_stream_finished: true,
+            tool_turn_failed: false,
             session_allowed_tools: HashSet::new(),
             modal_scroll: 0,
             available_models: Vec::new(),
@@ -2217,6 +2273,8 @@ impl App {
         }
 
         self.state = EngineState::Streaming;
+        self.tool_turn_stream_finished = false;
+        self.tool_turn_failed = false;
         self.set_status(format!("Streaming ({})", self.config.model));
         self.current_thought_buffer.clear();
         self.current_response_buffer.clear();
@@ -2318,6 +2376,17 @@ impl App {
                 args,
                 thought_signature,
             } => {
+                // Gemini may omit a tool-call id, but the OpenAI Responses and
+                // Chat Completions protocols require one. Normalize at the
+                // boundary so every provider gets a stable correlation key.
+                let id = Some(id.unwrap_or_else(|| {
+                    format!("holiday-call-{}-{}", self.stream_epoch, self.messages.len())
+                }));
+
+                // Count every emitted call, including calls waiting for HITL
+                // approval. A rejected call still produces a terminal output.
+                self.pending_tool_executions = self.pending_tool_executions.saturating_add(1);
+
                 // If model produced any thought prior to tool call, record it
                 if !self.current_thought_buffer.is_empty() {
                     let thought = std::mem::take(&mut self.current_thought_buffer);
@@ -2356,14 +2425,16 @@ impl App {
                         );
                         self.state = EngineState::ExecutingTool;
                         let _ = tx.send(AppEvent::ToolExecutionResult {
+                            epoch: self.stream_epoch,
                             tool_name: name,
                             call_id: id,
                             result: Err("Mutation blocked while plan mode is enabled.".to_string()),
                         });
                     } else if self.session_allowed_tools.contains(&name) {
-                        self.execute_tool(name, id, args, tx);
+                        self.execute_tool(self.stream_epoch, name, id, args, tx);
                     } else {
                         let pending = PendingToolCall {
+                            epoch: self.stream_epoch,
                             call_id: id,
                             tool_name: name,
                             args,
@@ -2388,6 +2459,12 @@ impl App {
                         "system",
                         format!("Warning: Model attempted to call unknown tool '{}'", name),
                     );
+                    let _ = tx.send(AppEvent::ToolExecutionResult {
+                        epoch: self.stream_epoch,
+                        tool_name: name,
+                        call_id: id,
+                        result: Err("Tool is no longer available.".to_string()),
+                    });
                 }
             }
             StreamSignal::Usage {
@@ -2412,6 +2489,7 @@ impl App {
                 }
             }
             StreamSignal::Finished { finish_reason } => {
+                self.tool_turn_stream_finished = true;
                 self.record_request_usage("ok");
 
                 if !self.current_thought_buffer.is_empty() {
@@ -2443,6 +2521,8 @@ impl App {
                 self.add_message("system", message);
             }
             StreamSignal::Error(err) => {
+                self.tool_turn_stream_finished = true;
+                self.tool_turn_failed = true;
                 self.record_request_usage("error");
 
                 if !self.current_thought_buffer.is_empty() {
@@ -2460,6 +2540,7 @@ impl App {
                 // ghost HITL modal over the normal input box.
                 self.pending_tool_call = None;
                 self.queued_tool_calls.clear();
+                self.pending_tool_executions = 0;
                 self.state = EngineState::Idle;
                 self.set_status("Stream ended with error.");
             }
@@ -2475,7 +2556,13 @@ impl App {
             if whitelist_for_session {
                 self.session_allowed_tools.insert(pending.tool_name.clone());
             }
-            self.execute_tool(pending.tool_name, pending.call_id, pending.args, tx);
+            self.execute_tool(
+                pending.epoch,
+                pending.tool_name,
+                pending.call_id,
+                pending.args,
+                tx,
+            );
         }
     }
 
@@ -2491,6 +2578,7 @@ impl App {
             let app_tx = tx.clone();
             tokio::spawn(async move {
                 let _ = app_tx.send(AppEvent::ToolExecutionResult {
+                    epoch: pending.epoch,
                     tool_name: pending.tool_name,
                     call_id: pending.call_id,
                     result: Err(rejection_result),
@@ -2502,6 +2590,7 @@ impl App {
 
     pub fn execute_tool(
         &mut self,
+        epoch: u64,
         tool_name: String,
         call_id: Option<String>,
         args: serde_json::Value,
@@ -2511,7 +2600,6 @@ impl App {
             self.tool_registry.discover_from_query(&args);
         }
         self.state = EngineState::ExecutingTool;
-        self.pending_tool_executions = self.pending_tool_executions.saturating_add(1);
         self.set_status(format!("Executing tool '{}'...", tool_name));
 
         if let Some(tool) = self.tool_registry.get(&tool_name) {
@@ -2522,16 +2610,17 @@ impl App {
             tokio::spawn(async move {
                 let res = tool.execute(args).await;
                 let _ = app_tx.send(AppEvent::ToolExecutionResult {
+                    epoch,
                     tool_name: t_name,
                     call_id: c_id,
                     result: res,
                 });
             });
         } else {
-            // Keep the turn's accounting balanced even if an MCP tool
-            // disappears between declaration and execution.
-            self.pending_tool_executions = self.pending_tool_executions.saturating_sub(1);
+            // The call was counted when it was emitted. Return a terminal
+            // result so the provider never sees an unpaired function call.
             let _ = tx.send(AppEvent::ToolExecutionResult {
+                epoch,
                 tool_name,
                 call_id,
                 result: Err("Tool is no longer available.".to_string()),
@@ -2541,11 +2630,16 @@ impl App {
 
     pub fn handle_tool_result(
         &mut self,
+        epoch: u64,
         tool_name: String,
         call_id: Option<String>,
         result: Result<String, String>,
         tx: UnboundedSender<AppEvent>,
     ) {
+        if epoch != self.stream_epoch {
+            return;
+        }
+
         let (output_str, is_err) = match result {
             Ok(output) => (output, false),
             Err(e) => (format!("Error: {}", e), true),
@@ -2600,16 +2694,28 @@ impl App {
         // returned. Starting immediately for the first result races the other
         // tool tasks and can abort/restart an in-flight model request.
         self.pending_tool_executions = self.pending_tool_executions.saturating_sub(1);
-        if self.pending_tool_executions > 0 {
-            self.state = EngineState::ExecutingTool;
+        if self.tool_turn_failed {
+            return;
+        }
+        // The outstanding count includes calls waiting in the approval queue,
+        // so advance that queue before testing whether the count reached zero.
+        if self.pending_tool_call.is_none() {
+            if let Some(next) = self.queued_tool_calls.pop_front() {
+                self.pending_tool_call = Some(next);
+                self.state = EngineState::AwaitingHitlApproval;
+                self.set_status("HITL Gate: Approval needed for the next tool");
+                self.modal_scroll = 0;
+                return;
+            }
+        }
+
+        if self.pending_tool_call.is_some() {
+            self.state = EngineState::AwaitingHitlApproval;
             return;
         }
 
-        if let Some(next) = self.queued_tool_calls.pop_front() {
-            self.pending_tool_call = Some(next);
-            self.state = EngineState::AwaitingHitlApproval;
-            self.set_status("HITL Gate: Approval needed for the next tool");
-            self.modal_scroll = 0;
+        if self.pending_tool_executions > 0 || !self.tool_turn_stream_finished {
+            self.state = EngineState::ExecutingTool;
             return;
         }
 
@@ -2636,11 +2742,23 @@ impl App {
                 _ => None,
             })
             .collect();
-        let filter_orphaned_calls = self
-            .config
-            .active_provider_config()
-            .kind
-            .eq_ignore_ascii_case("openai-compatible");
+        let recorded_tool_call_ids: HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "model_tool_call")
+            .filter_map(|message| serde_json::from_str::<Part>(&message.content).ok())
+            .filter_map(|part| match part {
+                Part::FunctionCall { function_call, .. } => function_call.id,
+                _ => None,
+            })
+            .collect();
+        // Both OpenAI-compatible and Codex providers use OpenAI's tool-call
+        // correlation rules. Do not key this recovery behavior only on the
+        // provider label: Codex is also a Responses provider.
+        let provider = self.config.active_provider_config();
+        let filter_orphaned_calls = provider.kind.eq_ignore_ascii_case("openai-compatible")
+            || provider.kind.eq_ignore_ascii_case("codex")
+            || provider.protocol.eq_ignore_ascii_case("responses");
 
         for m in &self.messages {
             if m.role == "thought" || m.role == "tool" {
@@ -2690,6 +2808,16 @@ impl App {
                 }
             } else if m.role == "function" {
                 if let Ok(part) = serde_json::from_str::<Part>(&m.content) {
+                    if filter_orphaned_calls {
+                        if let Part::FunctionResponse { function_response } = &part {
+                            if function_response.id.as_ref().is_none_or(|id| {
+                                !completed_tool_call_ids.contains(id)
+                                    || !recorded_tool_call_ids.contains(id)
+                            }) {
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(last) = contents.last_mut() {
                         if last.role.as_deref() == Some("user")
                             && last

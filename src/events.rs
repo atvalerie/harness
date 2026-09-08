@@ -32,6 +32,7 @@ pub enum AppEvent {
         signal: StreamSignal,
     },
     ToolExecutionResult {
+        epoch: u64,
         tool_name: String,
         call_id: Option<String>,
         result: Result<String, String>,
