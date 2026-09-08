@@ -93,8 +93,7 @@ holiday.exe -p "Summarize this" --format jsonl --tools auto
 ```
 
 Events include `run_started`, `user_message`, `reasoning_delta`, `text_delta`,
-`response_final`, `tool_call`, `usage`, `notice`, `error`, `input_required`,
-`session_control`, and `run_finished`.
+`response_final`, `tool_call`, `usage`, `notice`, `error`, and `run_finished`.
 `text_delta` is intended for live rendering; `response_final` contains the
 complete accumulated response and its `complete` flag is false when generation
 was cancelled or failed. Reasoning events
@@ -135,11 +134,10 @@ model text, tool calls, approvals, and tool results with the originating
 utterance. Diagnostics should remain on stderr. Use `--tools ask` to deny tool
 calls by default, or `--tools auto` only for a deliberately trusted bridge.
 
-The built-in `request_user_input` tool emits `input_required` with the model's
-prompt and pauses the JSONL turn. The `end_voice_session` tool emits a
-`session_control` event with `action: "sleep"`. A frontend may then switch
-between wake-gated and forced-listening states without inferring intent from
-natural-language response text.
+Send `{"version":1,"event":"new_session"}` between interactions to clear
+conversation history and tool context while keeping the Holiday process,
+provider connection, and configuration alive. Holiday responds with a
+`session_reset` event.
 
 Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk. New snapshots retain the tool working directory and discovered `AGENTS.md`/`CLAUDE.md` project instructions, so restoring a session restores the project context as well.
 

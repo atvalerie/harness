@@ -2074,22 +2074,7 @@ impl App {
                 }
             }
             "/new" => {
-                self.messages.clear();
-                self.usage_records.clear();
-                self.chat_scroll = 0;
-                self.prompt_tokens = 0;
-                self.candidates_tokens = 0;
-                self.total_tokens = 0;
-                self.context_tokens = 0;
-                self.context_tokens_estimated = true;
-                self.tool_registry.todo_clear().ok();
-                self.tool_registry.clear_discovered_tools();
-                self.pending_todo_notice = None;
-                self.session_path = session::new_session_path(&self.config.session_name);
-                self.session_messages_at_save = 0;
-                self.set_status("New session started");
-                self.add_message("system", "Started a new session.");
-                let _ = self.flush_session();
+                self.start_new_session();
             }
             "/usage" => {
                 let prompt: u64 = self.usage_records.iter().map(|r| r.prompt_tokens).sum();
@@ -2275,6 +2260,28 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Clears conversation state while preserving provider, model, and client
+    /// configuration. Frontends use this to begin a fresh interaction without
+    /// restarting the Holiday process.
+    pub fn start_new_session(&mut self) {
+        self.messages.clear();
+        self.usage_records.clear();
+        self.chat_scroll = 0;
+        self.prompt_tokens = 0;
+        self.candidates_tokens = 0;
+        self.total_tokens = 0;
+        self.context_tokens = 0;
+        self.context_tokens_estimated = true;
+        self.tool_registry.todo_clear().ok();
+        self.tool_registry.clear_discovered_tools();
+        self.pending_todo_notice = None;
+        self.session_path = session::new_session_path(&self.config.session_name);
+        self.session_messages_at_save = 0;
+        self.set_status("New session started");
+        self.add_message("system", "Started a new session.");
+        let _ = self.flush_session();
     }
 
     pub fn copy_last_response(&mut self) {

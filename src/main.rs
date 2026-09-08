@@ -378,7 +378,6 @@ async fn run_headless_jsonl(
     let mut final_status = "ok";
     let mut generation_finished = false;
     let mut response = String::new();
-    let mut pending_voice_control: Option<(String, Value)> = None;
     app.trigger_generation(event_tx.clone());
 
     loop {
@@ -399,14 +398,6 @@ async fn run_headless_jsonl(
         match event {
             AppEvent::Stream { epoch, signal } => {
                 let tool_call = matches!(&signal, StreamSignal::ToolCall { .. });
-                let voice_control = match &signal {
-                    StreamSignal::ToolCall { name, args, .. }
-                        if name == "request_user_input" || name == "end_voice_session" =>
-                    {
-                        Some((name.clone(), args.clone()))
-                    }
-                    _ => None,
-                };
                 match &signal {
                     StreamSignal::ThoughtDelta(delta) => emit_jsonl(
                         &run_id,
@@ -460,15 +451,7 @@ async fn run_headless_jsonl(
                 }
                 app.handle_stream_signal(epoch, signal, event_tx.clone());
 
-                if let Some((name, args)) = voice_control {
-                    pending_voice_control = Some((name, args));
-                    // These tools only change the frontend's listening state;
-                    // they do not perform a host-side mutation and must not
-                    // stall on the normal shell/filesystem approval gate.
-                    if app.state == EngineState::AwaitingHitlApproval {
-                        app.approve_pending_tool(false, event_tx.clone());
-                    }
-                } else if tool_call && app.state == EngineState::AwaitingHitlApproval {
+                if tool_call && app.state == EngineState::AwaitingHitlApproval {
                     let policy_name = match tool_policy {
                         ToolPolicy::Ask => "ask",
                         ToolPolicy::Auto => "auto",
@@ -500,33 +483,12 @@ async fn run_headless_jsonl(
                 call_id,
                 result,
             } => {
-                let control_succeeded = result.is_ok();
                 let result_data = match &result {
                     Ok(output) => json!({"tool": tool_name, "output": output}),
                     Err(error) => json!({"tool": tool_name, "error": error}),
                 };
                 emit_jsonl(&run_id, &mut sequence, "tool_result", result_data)?;
                 app.handle_tool_result(epoch, tool_name.clone(), call_id, result, event_tx.clone());
-                if let Some((control, args)) = pending_voice_control.take() {
-                    if control_succeeded && control == tool_name {
-                        let (event, data, status) = if control == "request_user_input" {
-                            ("input_required", args, "awaiting_input")
-                        } else {
-                            (
-                                "session_control",
-                                json!({
-                                    "action": "sleep",
-                                    "reason": args.get("reason").and_then(Value::as_str)
-                                }),
-                                "session_closed",
-                            )
-                        };
-                        emit_jsonl(&run_id, &mut sequence, event, data)?;
-                        app.cancel_generation();
-                        final_status = status;
-                        break;
-                    }
-                }
                 if app.state == EngineState::AwaitingHitlApproval {
                     emit_jsonl(
                         &run_id,
@@ -834,6 +796,17 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                     &mut sequence,
                     "pong",
                     json!({"input": input.metadata}),
+                )?;
+            }
+            "new_session" | "reset_context" => {
+                app.start_new_session();
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                emit_jsonl(
+                    &input_run_id,
+                    &mut sequence,
+                    "session_reset",
+                    json!({"status": "ok", "reason": input.metadata}),
                 )?;
             }
             "partial" | "listening" | "level" => {
