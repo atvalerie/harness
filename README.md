@@ -93,7 +93,11 @@ holiday.exe -p "Summarize this" --format jsonl --tools auto
 ```
 
 Events include `run_started`, `user_message`, `reasoning_delta`, `text_delta`,
-`tool_call`, `usage`, `notice`, `error`, and `run_finished`. Reasoning events
+`response_final`, `tool_call`, `usage`, `notice`, `error`, `input_required`,
+`session_control`, and `run_finished`.
+`text_delta` is intended for live rendering; `response_final` contains the
+complete accumulated response and its `complete` flag is false when generation
+was cancelled or failed. Reasoning events
 represent provider-emitted reasoning summaries when available; they are not a
 guarantee of hidden chain-of-thought access.
 Use `--tools auto` to execute declared tools, `--tools deny` to return tool
@@ -107,6 +111,35 @@ holiday.exe --chat --continue
 ```
 
 Enter one prompt per line. The text-only mode accepts the same useful commands as the TUI, including `/help`, `/status`, `/context`, `/compact`, `/resume`, `/retry`, `/fork`, `/clear`, `/new`, `/save`, and `/exit`. The conversation is saved using the same turn-boundary session persistence as the TUI.
+
+For a persistent machine-to-machine session, combine `--chat` with JSONL:
+
+```text
+holiday.exe --chat --format jsonl --tools auto
+```
+
+Send one versioned input event per line on stdin. Speech events are submitted
+as user turns; `partial`, `listening`, and `level` events are ignored as
+non-submitted input, so a voice frontend can report live state without sending
+unfinished transcripts to the model:
+
+```json
+{"version":1,"event":"speech","data":{"text":"open my project","sequence":42,"activation":"manual","input_kind":"command"}}
+{"version":1,"event":"shutdown"}
+```
+
+The stdout stream uses the same versioned event envelope as headless JSONL.
+Each submitted speech event gets its own `run_id`; its input metadata is
+included in `run_started` and `user_message`, allowing a client to correlate
+model text, tool calls, approvals, and tool results with the originating
+utterance. Diagnostics should remain on stderr. Use `--tools ask` to deny tool
+calls by default, or `--tools auto` only for a deliberately trusted bridge.
+
+The built-in `request_user_input` tool emits `input_required` with the model's
+prompt and pauses the JSONL turn. The `end_voice_session` tool emits a
+`session_control` event with `action: "sleep"`. A frontend may then switch
+between wake-gated and forced-listening states without inferring intent from
+natural-language response text.
 
 Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk. New snapshots retain the tool working directory and discovered `AGENTS.md`/`CLAUDE.md` project instructions, so restoring a session restores the project context as well.
 

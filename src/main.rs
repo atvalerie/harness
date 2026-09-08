@@ -26,7 +26,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use serde_json::{json, Value};
 use std::io::{self, stdout, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 struct CliArgs {
@@ -283,7 +285,7 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     app.add_message("user", prompt);
     if cli.output_format == OutputFormat::Jsonl {
-        return run_headless_jsonl(&mut app, cli.tool_policy).await;
+        return run_headless_jsonl(&mut app, cli.tool_policy, None).await;
     }
     let request = app.build_request();
     let result = app
@@ -334,32 +336,49 @@ fn emit_jsonl(run_id: &str, sequence: &mut u64, event: &str, data: Value) -> io:
     io::stdout().flush()
 }
 
+fn new_run_id() -> String {
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        std::process::id(),
+        counter
+    )
+}
+
 async fn run_headless_jsonl(
     app: &mut App,
     tool_policy: ToolPolicy,
+    input_metadata: Option<Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let run_id = format!(
-        "{}-{}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
-        std::process::id()
-    );
+    let run_id = new_run_id();
     let mut sequence = 0;
     emit_jsonl(
         &run_id,
         &mut sequence,
         "run_started",
-        json!({"provider": app.config.provider, "model": app.config.model}),
+        json!({
+            "provider": app.config.provider,
+            "model": app.config.model,
+            "input": input_metadata.clone()
+        }),
     )?;
     emit_jsonl(
         &run_id,
         &mut sequence,
         "user_message",
-        json!({"content": app.messages.last().map(|message| message.content.clone()).unwrap_or_default()}),
+        json!({
+            "content": app.messages.last().map(|message| message.content.clone()).unwrap_or_default(),
+            "input": input_metadata
+        }),
     )?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut final_status = "ok";
     let mut generation_finished = false;
+    let mut response = String::new();
+    let mut pending_voice_control: Option<(String, Value)> = None;
     app.trigger_generation(event_tx.clone());
 
     loop {
@@ -380,6 +399,14 @@ async fn run_headless_jsonl(
         match event {
             AppEvent::Stream { epoch, signal } => {
                 let tool_call = matches!(&signal, StreamSignal::ToolCall { .. });
+                let voice_control = match &signal {
+                    StreamSignal::ToolCall { name, args, .. }
+                        if name == "request_user_input" || name == "end_voice_session" =>
+                    {
+                        Some((name.clone(), args.clone()))
+                    }
+                    _ => None,
+                };
                 match &signal {
                     StreamSignal::ThoughtDelta(delta) => emit_jsonl(
                         &run_id,
@@ -388,6 +415,7 @@ async fn run_headless_jsonl(
                         json!({"delta": delta, "visibility": "provider_summary"}),
                     )?,
                     StreamSignal::TextDelta(delta) => {
+                        response.push_str(delta);
                         emit_jsonl(
                             &run_id,
                             &mut sequence,
@@ -432,7 +460,15 @@ async fn run_headless_jsonl(
                 }
                 app.handle_stream_signal(epoch, signal, event_tx.clone());
 
-                if tool_call && app.state == EngineState::AwaitingHitlApproval {
+                if let Some((name, args)) = voice_control {
+                    pending_voice_control = Some((name, args));
+                    // These tools only change the frontend's listening state;
+                    // they do not perform a host-side mutation and must not
+                    // stall on the normal shell/filesystem approval gate.
+                    if app.state == EngineState::AwaitingHitlApproval {
+                        app.approve_pending_tool(false, event_tx.clone());
+                    }
+                } else if tool_call && app.state == EngineState::AwaitingHitlApproval {
                     let policy_name = match tool_policy {
                         ToolPolicy::Ask => "ask",
                         ToolPolicy::Auto => "auto",
@@ -464,12 +500,33 @@ async fn run_headless_jsonl(
                 call_id,
                 result,
             } => {
+                let control_succeeded = result.is_ok();
                 let result_data = match &result {
                     Ok(output) => json!({"tool": tool_name, "output": output}),
                     Err(error) => json!({"tool": tool_name, "error": error}),
                 };
                 emit_jsonl(&run_id, &mut sequence, "tool_result", result_data)?;
-                app.handle_tool_result(epoch, tool_name, call_id, result, event_tx.clone());
+                app.handle_tool_result(epoch, tool_name.clone(), call_id, result, event_tx.clone());
+                if let Some((control, args)) = pending_voice_control.take() {
+                    if control_succeeded && control == tool_name {
+                        let (event, data, status) = if control == "request_user_input" {
+                            ("input_required", args, "awaiting_input")
+                        } else {
+                            (
+                                "session_control",
+                                json!({
+                                    "action": "sleep",
+                                    "reason": args.get("reason").and_then(Value::as_str)
+                                }),
+                                "session_closed",
+                            )
+                        };
+                        emit_jsonl(&run_id, &mut sequence, event, data)?;
+                        app.cancel_generation();
+                        final_status = status;
+                        break;
+                    }
+                }
                 if app.state == EngineState::AwaitingHitlApproval {
                     emit_jsonl(
                         &run_id,
@@ -516,6 +573,12 @@ async fn run_headless_jsonl(
             break;
         }
     }
+    emit_jsonl(
+        &run_id,
+        &mut sequence,
+        "response_final",
+        json!({"content": response, "complete": final_status == "ok"}),
+    )?;
     emit_jsonl(
         &run_id,
         &mut sequence,
@@ -629,6 +692,185 @@ async fn run_text_generation(
             break;
         }
     }
+}
+
+#[derive(Debug)]
+struct JsonlInput {
+    event: String,
+    text: Option<String>,
+    metadata: Value,
+}
+
+fn parse_jsonl_input(line: &str) -> Result<JsonlInput, String> {
+    let value: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "input must be a JSON object".to_string())?;
+    if let Some(version) = object.get("version") {
+        if version.as_u64() != Some(1) {
+            return Err("unsupported JSONL input version; expected 1".to_string());
+        }
+    }
+    let event = object
+        .get("event")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "input is missing string field 'event'".to_string())?
+        .to_ascii_lowercase();
+    let data = object.get("data").and_then(Value::as_object);
+    let text = data
+        .and_then(|data| data.get("text"))
+        .or_else(|| object.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let metadata = data
+        .map(|data| Value::Object(data.clone()))
+        .unwrap_or_else(|| {
+            let mut metadata = serde_json::Map::new();
+            for (key, value) in object {
+                if key != "version" && key != "event" && key != "text" {
+                    metadata.insert(key.clone(), value.clone());
+                }
+            }
+            Value::Object(metadata)
+        });
+    Ok(JsonlInput {
+        event,
+        text,
+        metadata,
+    })
+}
+
+async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let resume_path = resolve_session_selector(cli.resume.as_deref(), cli.continue_latest)
+        .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
+    let mut config = AppConfig::load();
+    seed_config_from_session(&mut config, resume_path.as_ref());
+    if let Some(provider) = cli.provider.as_deref() {
+        config.select_provider(provider);
+    }
+    if let Some(model) = cli.model.as_deref() {
+        config.model = model.to_string();
+    }
+    if let Some(base_url) = cli.base_url.as_deref() {
+        let value = (!base_url.eq_ignore_ascii_case("default")).then(|| base_url.to_string());
+        if let Some(provider) = config.providers.get_mut(&config.provider) {
+            provider.base_url = value;
+        } else {
+            config.base_url = value;
+        }
+    }
+    refresh_codex_auth_if_available(&config).await;
+    let api_key = resolve_api_key(&config)?;
+    let mut app = App::new(config, api_key);
+    if let Some(path) = resume_path {
+        app.restore_session(&path)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if let Some(provider) = cli.provider.as_deref() {
+            app.config.select_provider(provider);
+        }
+        if let Some(model) = cli.model.as_deref() {
+            app.config.model = model.to_string();
+        }
+        app.refresh_client_from_config();
+    }
+
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    while stdin.read_line(&mut line).await? != 0 {
+        let line_text = std::mem::take(&mut line);
+        if line_text.trim().is_empty() {
+            continue;
+        }
+        let input = match parse_jsonl_input(&line_text) {
+            Ok(input) => input,
+            Err(error) => {
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                emit_jsonl(
+                    &input_run_id,
+                    &mut sequence,
+                    "error",
+                    json!({"message": error, "kind": "invalid_input"}),
+                )?;
+                continue;
+            }
+        };
+
+        match input.event.as_str() {
+            "speech" | "message" | "user_message" => {
+                let Some(text) = input.text.map(|text| text.trim().to_string()) else {
+                    let input_run_id = new_run_id();
+                    let mut sequence = 0;
+                    emit_jsonl(
+                        &input_run_id,
+                        &mut sequence,
+                        "input_ignored",
+                        json!({"reason": "missing_text", "input": input.metadata}),
+                    )?;
+                    continue;
+                };
+                if text.is_empty() {
+                    let input_run_id = new_run_id();
+                    let mut sequence = 0;
+                    emit_jsonl(
+                        &input_run_id,
+                        &mut sequence,
+                        "input_ignored",
+                        json!({"reason": "empty_text", "input": input.metadata}),
+                    )?;
+                    continue;
+                }
+                app.add_message("user", text);
+                let _ = app.flush_session();
+                run_headless_jsonl(&mut app, cli.tool_policy, Some(input.metadata)).await?;
+                let _ = app.flush_session();
+            }
+            "ping" => {
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                emit_jsonl(
+                    &input_run_id,
+                    &mut sequence,
+                    "pong",
+                    json!({"input": input.metadata}),
+                )?;
+            }
+            "partial" | "listening" | "level" => {
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                emit_jsonl(
+                    &input_run_id,
+                    &mut sequence,
+                    "input_ignored",
+                    json!({"reason": "event_not_submitted", "event": input.event, "input": input.metadata}),
+                )?;
+            }
+            "shutdown" | "exit" => {
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                emit_jsonl(
+                    &input_run_id,
+                    &mut sequence,
+                    "shutdown",
+                    json!({"status": "ok"}),
+                )?;
+                break;
+            }
+            event => {
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                emit_jsonl(
+                    &input_run_id,
+                    &mut sequence,
+                    "error",
+                    json!({"message": format!("unsupported input event '{}'; expected speech or shutdown", event), "kind": "unsupported_event"}),
+                )?;
+            }
+        }
+    }
+    let _ = app.flush_session();
+    Ok(())
 }
 
 async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -756,7 +998,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::Error::new(io::ErrorKind::InvalidInput, error)
     })?;
     if cli.help {
-        println!("Usage: holiday.exe [--login browser|device] | -p \"prompt\" [--format text|jsonl] [--tools ask|auto|deny] [--resume NAME|PATH | --continue] | --chat [--resume NAME|PATH | --continue] [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]");
+        println!("Usage: holiday.exe [--login browser|device] | -p \"prompt\" [--format text|jsonl] [--tools ask|auto|deny] [--resume NAME|PATH | --continue] | --chat [--format text|jsonl] [--resume NAME|PATH | --continue] [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]");
         return Ok(());
     }
     if let Some(path) = &cli.config_path {
@@ -769,6 +1011,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_headless(cli).await;
     }
     if cli.chat {
+        if cli.output_format == OutputFormat::Jsonl {
+            return run_jsonl_chat(cli).await;
+        }
         return run_chat(cli).await;
     }
     // 1. Install panic hook to ensure terminal is restored cleanly on panic
@@ -1514,4 +1759,40 @@ fn move_input_vertical(app: &mut App, up: bool) -> bool {
         app.input_cursor = next_start + column.min(next_end - next_start);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_jsonl_input;
+    use serde_json::json;
+
+    #[test]
+    fn parses_versioned_nested_speech_input() {
+        let input = parse_jsonl_input(
+            r#"{"version":1,"event":"speech","data":{"text":" hello ","sequence":42}}"#,
+        )
+        .expect("valid input");
+
+        assert_eq!(input.event, "speech");
+        assert_eq!(input.text.as_deref(), Some(" hello "));
+        assert_eq!(input.metadata, json!({"text":" hello ","sequence":42}));
+    }
+
+    #[test]
+    fn parses_flat_input_and_preserves_metadata() {
+        let input = parse_jsonl_input(
+            r#"{"version":1,"event":"speech","text":"hello","sequence":7,"input_kind":"command"}"#,
+        )
+        .expect("valid input");
+
+        assert_eq!(input.text.as_deref(), Some("hello"));
+        assert_eq!(input.metadata, json!({"sequence":7,"input_kind":"command"}));
+    }
+
+    #[test]
+    fn rejects_unknown_versions_and_non_objects() {
+        assert!(parse_jsonl_input(r#"{"version":2,"event":"ping"}"#).is_err());
+        assert!(parse_jsonl_input(r#"[1,2,3]"#).is_err());
+        assert!(parse_jsonl_input(r#"{"version":1}"#).is_err());
+    }
 }

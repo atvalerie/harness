@@ -314,6 +314,110 @@ impl Tool for SearchToolsTool {
     }
 }
 
+struct RequestUserInputTool;
+
+#[async_trait]
+impl Tool for RequestUserInputTool {
+    fn name(&self) -> &'static str {
+        "request_user_input"
+    }
+
+    fn description(&self) -> &'static str {
+        "Requests a spoken or typed answer from the user. Use this when the task cannot continue without a specific clarification, choice, or confirmation."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The concise question to present to the user"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["answer", "confirmation", "choice"],
+                    "description": "The kind of response needed"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 300000,
+                    "description": "How long the frontend should wait for a response"
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        ToolPreview {
+            title: "Request User Input".to_string(),
+            details: vec![format!(
+                "Prompt: {}",
+                args.get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            )],
+            reason: None,
+            expected_effect: Some("Pauses the current turn until the user responds.".to_string()),
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: false,
+        }
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<String, String> {
+        Ok("The frontend will collect the user's response before the next turn.".to_string())
+    }
+}
+
+struct EndVoiceSessionTool;
+
+#[async_trait]
+impl Tool for EndVoiceSessionTool {
+    fn name(&self) -> &'static str {
+        "end_voice_session"
+    }
+
+    fn description(&self) -> &'static str {
+        "Ends the active voice interaction and returns the frontend to its dormant state. Use this when the user asks to stop or when the interaction is complete."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason for ending the voice session"
+                }
+            }
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        ToolPreview {
+            title: "End Voice Session".to_string(),
+            details: vec![format!(
+                "Reason: {}",
+                args.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("interaction complete")
+            )],
+            reason: None,
+            expected_effect: Some("Returns the voice frontend to dormant mode.".to_string()),
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: false,
+        }
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<String, String> {
+        Ok("The frontend will stop listening after this turn.".to_string())
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -339,6 +443,14 @@ impl ToolRegistry {
 
         reg.register_with_descriptor(
             Arc::new(SearchToolsTool::new(reg.catalog.clone())),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(RequestUserInputTool),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(EndVoiceSessionTool),
             ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
         );
         reg.register_with_descriptor(
