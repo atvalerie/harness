@@ -285,7 +285,7 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     app.add_message("user", prompt);
     if cli.output_format == OutputFormat::Jsonl {
-        return run_headless_jsonl(&mut app, cli.tool_policy, None).await;
+        return run_headless_jsonl(&mut app, cli.tool_policy, None, None).await;
     }
     let request = app.build_request();
     let result = app
@@ -347,10 +347,42 @@ fn new_run_id() -> String {
     )
 }
 
+fn approval_payload(app: &App, approval_id: &str, policy: &str) -> Value {
+    let Some(pending) = app.pending_tool_call.as_ref() else {
+        return json!({
+            "approval_id": approval_id,
+            "policy": policy,
+            "risk": "high",
+            "confirmation": "keybind_or_ui"
+        });
+    };
+    let risk = if pending.preview.is_mutation {
+        "high"
+    } else {
+        "low"
+    };
+    json!({
+        "approval_id": approval_id,
+        "policy": policy,
+        "action": "confirm",
+        "risk": risk,
+        "confirmation": if risk == "high" { "keybind_or_ui" } else { "voice_or_keybind" },
+        "tool": pending.tool_name,
+        "call_id": pending.call_id,
+        "args": pending.args,
+        "title": pending.preview.title,
+        "details": pending.preview.details,
+        "reason": pending.preview.reason,
+        "expected_effect": pending.preview.expected_effect,
+        "command": pending.preview.command
+    })
+}
+
 async fn run_headless_jsonl(
     app: &mut App,
     tool_policy: ToolPolicy,
     input_metadata: Option<Value>,
+    input_rx: Option<&mut mpsc::UnboundedReceiver<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let run_id = new_run_id();
     let mut sequence = 0;
@@ -378,21 +410,133 @@ async fn run_headless_jsonl(
     let mut final_status = "ok";
     let mut generation_finished = false;
     let mut response = String::new();
+    let mut pending_approval_id: Option<String> = None;
+    let mut input_rx = input_rx;
     app.trigger_generation(event_tx.clone());
 
-    loop {
-        let event = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                if app.state == EngineState::Streaming {
-                    app.cancel_generation();
+    enum HeadlessEvent {
+        App(Option<AppEvent>),
+        Input(Option<String>),
+    }
+
+    'run: loop {
+        let event = if pending_approval_id.is_some() {
+            let Some(input_rx) = input_rx.as_deref_mut() else {
+                app.deny_pending_tool(event_tx.clone());
+                final_status = "error";
+                break 'run;
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    if app.state == EngineState::Streaming {
+                        app.cancel_generation();
+                    }
+                    final_status = "cancelled";
+                    break 'run;
                 }
-                final_status = "cancelled";
-                break;
+                event = event_rx.recv() => HeadlessEvent::App(event),
+                line = input_rx.recv() => HeadlessEvent::Input(line),
             }
-            event = event_rx.recv() => event,
+        } else {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    if app.state == EngineState::Streaming {
+                        app.cancel_generation();
+                    }
+                    final_status = "cancelled";
+                    break 'run;
+                }
+                event = event_rx.recv() => HeadlessEvent::App(event),
+            }
+        };
+
+        if let HeadlessEvent::Input(line) = event {
+            let Some(line) = line else {
+                final_status = "cancelled";
+                app.deny_pending_tool(event_tx.clone());
+                break 'run;
+            };
+            let input = match parse_jsonl_input(&line) {
+                Ok(input) => input,
+                Err(error) => {
+                    emit_jsonl(
+                        &run_id,
+                        &mut sequence,
+                        "error",
+                        json!({"message": error, "kind": "invalid_approval_input"}),
+                    )?;
+                    continue;
+                }
+            };
+            if matches!(input.event.as_str(), "shutdown" | "exit") {
+                final_status = "cancelled";
+                app.deny_pending_tool(event_tx.clone());
+                break 'run;
+            }
+            if input.event != "approval_response" {
+                emit_jsonl(
+                    &run_id,
+                    &mut sequence,
+                    "input_ignored",
+                    json!({"reason": "approval_pending", "event": input.event}),
+                )?;
+                continue;
+            }
+
+            let approval_id = input
+                .metadata
+                .get("approval_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if Some(approval_id) != pending_approval_id.as_deref() {
+                emit_jsonl(
+                    &run_id,
+                    &mut sequence,
+                    "approval_rejected",
+                    json!({"reason": "approval_id_mismatch", "approval_id": approval_id}),
+                )?;
+                continue;
+            }
+            let approved = input
+                .metadata
+                .get("approved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let method = input
+                .metadata
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let high_risk = app
+                .pending_tool_call
+                .as_ref()
+                .is_some_and(|pending| pending.preview.is_mutation);
+            if approved && high_risk && method == "voice" {
+                emit_jsonl(
+                    &run_id,
+                    &mut sequence,
+                    "approval_rejected",
+                    json!({
+                        "reason": "keybind_or_ui_required",
+                        "approval_id": approval_id,
+                        "risk": "high"
+                    }),
+                )?;
+                app.deny_pending_tool(event_tx.clone());
+            } else if approved {
+                app.approve_pending_tool(false, event_tx.clone());
+            } else {
+                app.deny_pending_tool(event_tx.clone());
+            }
+            pending_approval_id = None;
+            continue;
+        }
+
+        let HeadlessEvent::App(event) = event else {
+            unreachable!("input handled above");
         };
         let Some(event) = event else {
-            break;
+            break 'run;
         };
 
         match event {
@@ -457,16 +601,23 @@ async fn run_headless_jsonl(
                         ToolPolicy::Auto => "auto",
                         ToolPolicy::Deny => "deny",
                     };
-                    emit_jsonl(
-                        &run_id,
-                        &mut sequence,
-                        "approval_required",
-                        json!({"policy": policy_name, "action": if tool_policy == ToolPolicy::Auto { "execute" } else { "deny" }}),
-                    )?;
                     if tool_policy == ToolPolicy::Auto {
                         app.approve_pending_tool(true, event_tx.clone());
-                    } else {
+                    } else if tool_policy == ToolPolicy::Deny {
                         app.deny_pending_tool(event_tx.clone());
+                    } else {
+                        let approval_id = app
+                            .pending_tool_call
+                            .as_ref()
+                            .and_then(|pending| pending.call_id.clone())
+                            .unwrap_or_else(|| format!("{run_id}:approval:{sequence}"));
+                        emit_jsonl(
+                            &run_id,
+                            &mut sequence,
+                            "approval_required",
+                            approval_payload(app, &approval_id, policy_name),
+                        )?;
+                        pending_approval_id = Some(approval_id);
                     }
                 }
                 if generation_finished
@@ -490,16 +641,23 @@ async fn run_headless_jsonl(
                 emit_jsonl(&run_id, &mut sequence, "tool_result", result_data)?;
                 app.handle_tool_result(epoch, tool_name.clone(), call_id, result, event_tx.clone());
                 if app.state == EngineState::AwaitingHitlApproval {
-                    emit_jsonl(
-                        &run_id,
-                        &mut sequence,
-                        "approval_required",
-                        json!({"policy": if tool_policy == ToolPolicy::Auto { "auto" } else { "deny" }, "action": if tool_policy == ToolPolicy::Auto { "execute" } else { "deny" }}),
-                    )?;
                     if tool_policy == ToolPolicy::Auto {
                         app.approve_pending_tool(true, event_tx.clone());
-                    } else {
+                    } else if tool_policy == ToolPolicy::Deny {
                         app.deny_pending_tool(event_tx.clone());
+                    } else {
+                        let approval_id = app
+                            .pending_tool_call
+                            .as_ref()
+                            .and_then(|pending| pending.call_id.clone())
+                            .unwrap_or_else(|| format!("{run_id}:approval:{sequence}"));
+                        emit_jsonl(
+                            &run_id,
+                            &mut sequence,
+                            "approval_required",
+                            approval_payload(app, &approval_id, "ask"),
+                        )?;
+                        pending_approval_id = Some(approval_id);
                     }
                 }
                 if app.state == EngineState::Streaming {
@@ -737,10 +895,18 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
         app.refresh_client_from_config();
     }
 
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    while stdin.read_line(&mut line).await? != 0 {
-        let line_text = std::mem::take(&mut line);
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut line = String::new();
+        while stdin.read_line(&mut line).await.unwrap_or(0) != 0 {
+            if input_tx.send(std::mem::take(&mut line)).is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(line_text) = input_rx.recv().await {
         if line_text.trim().is_empty() {
             continue;
         }
@@ -828,7 +994,13 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                 }
                 app.add_message("user", text);
                 let _ = app.flush_session();
-                run_headless_jsonl(&mut app, cli.tool_policy, Some(input.metadata)).await?;
+                run_headless_jsonl(
+                    &mut app,
+                    cli.tool_policy,
+                    Some(input.metadata),
+                    Some(&mut input_rx),
+                )
+                .await?;
                 let _ = app.flush_session();
             }
             "ping" => {

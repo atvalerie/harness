@@ -152,6 +152,20 @@ global prompt, tool registry, configuration, or saved conversation. The
 frontend remains responsible for interpreting and enforcing its capability
 identifiers.
 
+With `--tools ask`, a JSONL frontend receives a structured `approval_required`
+event instead of an automatic denial. It includes an `approval_id`, the exact
+tool preview, and a risk level. Complete it with a correlated response:
+
+```json
+{"version":1,"event":"approval_response","data":{"approval_id":"call-42","approved":true,"method":"keybind"}}
+```
+
+Approval IDs are single-use and must match the pending tool request. Mutating
+actions are marked high-risk and cannot be approved with `method: "voice"`;
+they require a deliberate keybind or UI confirmation. A denial or session
+shutdown leaves the action unexecuted; a configurable timeout will be added at
+the Atlas session-policy layer.
+
 Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk. New snapshots retain the tool working directory and discovered `AGENTS.md`/`CLAUDE.md` project instructions, so restoring a session restores the project context as well.
 
 Maintained prompts live in `src/prompts/`: `main.md`, `plan.md`, `subagent.md`, and `compaction.md`. They are embedded at build time; rebuilding after an update applies the current guidance even to existing configurations. The main request combines built-in guidance, user customization, labeled project guidance, and the active mode. Tool schemas remain the authority for arguments and availability, and permission enforcement remains in the runtime.
