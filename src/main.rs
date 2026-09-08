@@ -411,6 +411,7 @@ async fn run_headless_jsonl(
     let mut generation_finished = false;
     let mut response = String::new();
     let mut pending_approval_id: Option<String> = None;
+    let mut pending_capability_id: Option<String> = None;
     let mut input_rx = input_rx;
     app.trigger_generation(event_tx.clone());
 
@@ -420,7 +421,7 @@ async fn run_headless_jsonl(
     }
 
     'run: loop {
-        let event = if pending_approval_id.is_some() {
+        let event = if pending_approval_id.is_some() || pending_capability_id.is_some() {
             let Some(input_rx) = input_rx.as_deref_mut() else {
                 app.deny_pending_tool(event_tx.clone());
                 final_status = "error";
@@ -470,8 +471,59 @@ async fn run_headless_jsonl(
             };
             if matches!(input.event.as_str(), "shutdown" | "exit") {
                 final_status = "cancelled";
-                app.deny_pending_tool(event_tx.clone());
+                if pending_approval_id.is_some() {
+                    app.deny_pending_tool(event_tx.clone());
+                }
                 break 'run;
+            }
+            if pending_capability_id.is_some() {
+                if input.event != "capability_response" {
+                    emit_jsonl(
+                        &run_id,
+                        &mut sequence,
+                        "input_ignored",
+                        json!({"reason": "capability_pending", "event": input.event}),
+                    )?;
+                    continue;
+                }
+                let request_id = input
+                    .metadata
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if Some(request_id) != pending_capability_id.as_deref() {
+                    emit_jsonl(
+                        &run_id,
+                        &mut sequence,
+                        "capability_rejected",
+                        json!({"reason": "request_id_mismatch", "request_id": request_id}),
+                    )?;
+                    continue;
+                }
+                let capability_name = input
+                    .metadata
+                    .get("capability")
+                    .and_then(Value::as_str)
+                    .unwrap_or("session capability")
+                    .to_string();
+                let result = input.metadata.get("result").cloned().unwrap_or_else(
+                    || json!({"status":"error","message":"missing capability result"}),
+                );
+                let request_id = pending_capability_id.take().unwrap_or_default();
+                emit_jsonl(
+                    &run_id,
+                    &mut sequence,
+                    "capability_response",
+                    json!({"request_id": request_id, "capability": capability_name, "result": result}),
+                )?;
+                app.handle_capability_result(
+                    app.stream_epoch,
+                    capability_name,
+                    Some(request_id),
+                    result,
+                    event_tx.clone(),
+                );
+                continue;
             }
             if input.event != "approval_response" {
                 emit_jsonl(
@@ -664,6 +716,22 @@ async fn run_headless_jsonl(
                     generation_finished = false;
                 }
             }
+            AppEvent::CapabilityRequest {
+                capability_name,
+                call_id,
+                args,
+                ..
+            } => {
+                let request_id =
+                    call_id.unwrap_or_else(|| format!("{run_id}:capability:{sequence}"));
+                emit_jsonl(
+                    &run_id,
+                    &mut sequence,
+                    "capability_request",
+                    json!({"request_id": request_id, "capability": capability_name, "args": args}),
+                )?;
+                pending_capability_id = Some(request_id);
+            }
             AppEvent::CompactionFinished(result) => {
                 emit_jsonl(
                     &run_id,
@@ -788,6 +856,9 @@ async fn run_text_generation(
                 if app.state == EngineState::Streaming {
                     saw_finished = false;
                 }
+            }
+            AppEvent::CapabilityRequest { .. } => {
+                eprintln!("capability requests require the JSONL frontend");
             }
             AppEvent::CompactionFinished(result) => {
                 app.handle_compaction_result(result, tx.clone());
@@ -957,6 +1028,15 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                     )?;
                 } else {
                     app.set_session_instruction(system_instruction);
+                    if let Err(error) = app.set_session_capabilities(&capabilities) {
+                        emit_jsonl(
+                            &input_run_id,
+                            &mut sequence,
+                            "error",
+                            json!({"message": error, "kind": "invalid_session_config"}),
+                        )?;
+                        continue;
+                    }
                     emit_jsonl(
                         &input_run_id,
                         &mut sequence,
@@ -1335,6 +1415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     AppEvent::ToolExecutionResult { epoch, tool_name, call_id, result } => {
                         app.handle_tool_result(epoch, tool_name, call_id, result, tx.clone());
                     }
+                    AppEvent::CapabilityRequest { .. } => {}
                     AppEvent::SystemNotification(msg) => {
                         app.add_message("system", msg);
                     }

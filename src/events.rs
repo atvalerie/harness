@@ -37,6 +37,12 @@ pub enum AppEvent {
         call_id: Option<String>,
         result: Result<String, String>,
     },
+    CapabilityRequest {
+        epoch: u64,
+        capability_name: String,
+        call_id: Option<String>,
+        args: serde_json::Value,
+    },
     SystemNotification(String),
     ModelsFetched {
         result: Result<Vec<crate::client::types::ModelInfo>, String>,

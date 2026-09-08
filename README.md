@@ -140,7 +140,7 @@ provider connection, and configuration alive. Holiday responds with a
 `session_reset` event.
 
 Frontends may then send a generic runtime `session_config` event to attach
-temporary instructions and opaque capability identifiers to the new session:
+temporary instructions and session-scoped capability declarations to the new session:
 
 ```json
 {"version":1,"event":"session_config","data":{"session_id":"frontend-42","system_instruction":"Use the frontend's session rules.","capabilities":["frontend.input.v1"]}}
@@ -173,6 +173,14 @@ Maintained prompts live in `src/prompts/`: `main.md`, `plan.md`, `subagent.md`, 
 `/sys` displays the effective main prompt. `/sys <text>` sets user customization, `/sys --clear` clears it, and `/save` persists it. The configuration's `system_instruction` field now holds customization only. Versioned migration removes the exact recognized historical default; customized legacy prompts are preserved verbatim, so users can inspect `/sys` and replace obsolete custom wording when needed. Migration is saved with the next configuration save.
 
 Subagents analyze supplied context without tools or independent repository access. Compaction preserves text attachments and image references (not image payloads), prioritizes active constraints and unfinished work, and retains the original history if the summarizer returns an empty result. Prompt changes should be checked with `cargo test`; these tests cover composition, migration, request integration, and compaction data handling, but do not measure live model behavior.
+Session-scoped capability declarations are callable function schemas, not
+merely labels. When the model calls one, Holiday emits a capability_request
+event and pauses the run until the frontend sends a correlated
+capability_response containing the request_id, capability name, and an
+explicit result such as answered, no_input, cancelled, or error. The frontend
+owns the capability side effect; these declarations never enter the global
+tool registry or prompt.
+
 They also retain per-request token usage, including whether a record was
 provider-reported or estimated. Use `/usage` inside the TUI to inspect totals.
 

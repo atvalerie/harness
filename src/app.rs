@@ -1,5 +1,6 @@
 use crate::client::types::{
-    Content, GenerationConfig, InlineDataPayload, Part, SafetySetting, ThinkingConfig,
+    Content, FunctionDeclaration, FunctionResponsePayload, GenerationConfig, InlineDataPayload,
+    Part, SafetySetting, ThinkingConfig,
 };
 use crate::client::{AiClient, ProviderKind};
 use crate::config::{AppConfig, PermissionMode, TOOL_PERMISSION_GROUPS};
@@ -152,6 +153,8 @@ pub struct App {
     /// Runtime-only instructions supplied by the active frontend session.
     /// These are never written to global configuration or session history.
     pub session_instruction: Option<String>,
+    /// Runtime-only capability declarations supplied by the active frontend.
+    pub session_capabilities: Vec<FunctionDeclaration>,
     pub ui_started_at: std::time::Instant,
 }
 
@@ -653,6 +656,7 @@ impl App {
             project_root,
             project_instructions,
             session_instruction: None,
+            session_capabilities: Vec::new(),
             ui_started_at: std::time::Instant::now(),
         }
     }
@@ -751,6 +755,57 @@ impl App {
     /// intentionally kept outside the persisted configuration and transcript.
     pub fn set_session_instruction(&mut self, instruction: Option<String>) {
         self.session_instruction = instruction.filter(|value| !value.trim().is_empty());
+    }
+
+    /// Installs function declarations for this frontend session only. String
+    /// entries remain accepted for protocol compatibility.
+    pub fn set_session_capabilities(
+        &mut self,
+        capabilities: &serde_json::Value,
+    ) -> Result<(), String> {
+        let Some(entries) = capabilities.as_array() else {
+            return Err("session_config capabilities must be an array".to_string());
+        };
+        let mut parsed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(name) = entry.as_str() {
+                parsed.push(FunctionDeclaration {
+                    name: name.to_string(),
+                    description: "A capability supplied by the active frontend session."
+                        .to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                });
+                continue;
+            }
+            let Some(object) = entry.as_object() else {
+                return Err("each session capability must be a string or object".to_string());
+            };
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| "session capability is missing a name".to_string())?;
+            let description = object
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("A capability supplied by the active frontend session.");
+            parsed.push(FunctionDeclaration {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: object
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+            });
+        }
+        self.session_capabilities = parsed;
+        Ok(())
+    }
+
+    pub fn is_session_capability(&self, name: &str) -> bool {
+        self.session_capabilities
+            .iter()
+            .any(|capability| capability.name == name)
     }
     pub fn selected_model_id(&self) -> Option<String> {
         self.filtered_model_indices()
@@ -2301,6 +2356,7 @@ impl App {
     pub fn start_new_session(&mut self) {
         self.messages.clear();
         self.session_instruction = None;
+        self.session_capabilities.clear();
         self.usage_records.clear();
         self.chat_scroll = 0;
         self.prompt_tokens = 0;
@@ -2562,6 +2618,18 @@ impl App {
                     timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
                     attachments: Vec::new(),
                 });
+
+                if self.is_session_capability(&name) {
+                    self.state = EngineState::ExecutingTool;
+                    self.set_status(format!("Waiting for capability '{}'...", name));
+                    let _ = tx.send(AppEvent::CapabilityRequest {
+                        epoch: self.stream_epoch,
+                        capability_name: name,
+                        call_id: id,
+                        args,
+                    });
+                    return;
+                }
 
                 if let Some(tool) = self.tool_registry.get(&name) {
                     let preview = tool.generate_preview(&args);
@@ -2902,6 +2970,43 @@ impl App {
         self.trigger_generation(tx);
     }
 
+    pub fn handle_capability_result(
+        &mut self,
+        epoch: u64,
+        capability_name: String,
+        call_id: Option<String>,
+        result: serde_json::Value,
+        tx: UnboundedSender<AppEvent>,
+    ) {
+        if epoch != self.stream_epoch || !self.is_session_capability(&capability_name) {
+            return;
+        }
+        let response_part = Part::FunctionResponse {
+            function_response: FunctionResponsePayload {
+                name: capability_name,
+                response: result,
+                id: call_id,
+            },
+        };
+        self.messages.push(ChatMessage {
+            role: "function".to_string(),
+            content: serde_json::to_string(&response_part).unwrap_or_default(),
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            attachments: Vec::new(),
+        });
+        let _ = self.flush_session();
+        self.pending_tool_executions = self.pending_tool_executions.saturating_sub(1);
+        if self.tool_turn_failed
+            || self.pending_tool_executions > 0
+            || !self.tool_turn_stream_finished
+        {
+            self.state = EngineState::ExecutingTool;
+            return;
+        }
+        self.state = EngineState::Idle;
+        self.trigger_generation(tx);
+    }
+
     pub fn build_request(&self) -> crate::client::types::GenerateContentRequest {
         let mut contents: Vec<crate::client::types::Content> = Vec::new();
         // A process/API failure can leave a persisted assistant tool call
@@ -3142,7 +3247,18 @@ impl App {
             },
         ];
 
-        let tools = self.tool_registry.to_gemini_declarations();
+        let mut tools = self.tool_registry.to_gemini_declarations();
+        if !self.session_capabilities.is_empty() {
+            if let Some(declaration) = tools.first_mut() {
+                declaration
+                    .function_declarations
+                    .extend(self.session_capabilities.iter().cloned());
+            } else {
+                tools.push(crate::client::types::GeminiToolDeclaration {
+                    function_declarations: self.session_capabilities.clone(),
+                });
+            }
+        }
 
         crate::client::types::GenerateContentRequest {
             contents,
