@@ -139,6 +139,19 @@ conversation history and tool context while keeping the Holiday process,
 provider connection, and configuration alive. Holiday responds with a
 `session_reset` event.
 
+Frontends may then send a generic runtime `session_config` event to attach
+temporary instructions and opaque capability identifiers to the new session:
+
+```json
+{"version":1,"event":"session_config","data":{"session_id":"frontend-42","system_instruction":"Use the frontend's session rules.","capabilities":["frontend.input.v1"]}}
+```
+
+Holiday acknowledges this with `session_configured`. The instruction is
+appended to requests for the active session only; it is not added to the
+global prompt, tool registry, configuration, or saved conversation. The
+frontend remains responsible for interpreting and enforcing its capability
+identifiers.
+
 Session files are written atomically after each user prompt and completed assistant/tool turn; they are not rewritten for every token or streaming chunk. New snapshots retain the tool working directory and discovered `AGENTS.md`/`CLAUDE.md` project instructions, so restoring a session restores the project context as well.
 
 Maintained prompts live in `src/prompts/`: `main.md`, `plan.md`, `subagent.md`, and `compaction.md`. They are embedded at build time; rebuilding after an update applies the current guidance even to existing configurations. The main request combines built-in guidance, user customization, labeled project guidance, and the active mode. Tool schemas remain the authority for arguments and availability, and permission enforcement remains in the runtime.

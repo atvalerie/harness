@@ -149,6 +149,9 @@ pub struct App {
     pub session_messages_at_save: usize,
     pub project_root: Option<PathBuf>,
     pub project_instructions: String,
+    /// Runtime-only instructions supplied by the active frontend session.
+    /// These are never written to global configuration or session history.
+    pub session_instruction: Option<String>,
     pub ui_started_at: std::time::Instant,
 }
 
@@ -372,6 +375,19 @@ mod tests {
         assert!(app
             .effective_system_instruction()
             .starts_with(crate::prompts::MAIN.trim()));
+    }
+
+    #[test]
+    fn runtime_session_instruction_is_request_scoped() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.set_session_instruction(Some("Speak for this frontend session.".to_string()));
+        assert!(app
+            .effective_system_instruction()
+            .contains("--- BEGIN Session instructions ---\nSpeak for this frontend session."));
+        app.start_new_session();
+        assert!(!app
+            .effective_system_instruction()
+            .contains("Speak for this frontend session."));
     }
 
     #[test]
@@ -636,6 +652,7 @@ impl App {
             session_messages_at_save: 0,
             project_root,
             project_instructions,
+            session_instruction: None,
             ui_started_at: std::time::Instant::now(),
         }
     }
@@ -713,11 +730,27 @@ impl App {
     }
 
     fn effective_system_instruction(&self) -> String {
-        crate::prompts::compose(
+        let mut instruction = crate::prompts::compose(
             &self.config.system_instruction,
             &self.project_instructions,
             self.plan_mode,
-        )
+        );
+        if let Some(session_instruction) = self
+            .session_instruction
+            .as_deref()
+            .filter(|instruction| !instruction.trim().is_empty())
+        {
+            instruction.push_str("\n\n--- BEGIN Session instructions ---\n");
+            instruction.push_str(session_instruction.trim());
+            instruction.push_str("\n--- END Session instructions ---");
+        }
+        instruction
+    }
+
+    /// Sets instructions for the active frontend session only. The value is
+    /// intentionally kept outside the persisted configuration and transcript.
+    pub fn set_session_instruction(&mut self, instruction: Option<String>) {
+        self.session_instruction = instruction.filter(|value| !value.trim().is_empty());
     }
     pub fn selected_model_id(&self) -> Option<String> {
         self.filtered_model_indices()
@@ -2267,6 +2300,7 @@ impl App {
     /// restarting the Holiday process.
     pub fn start_new_session(&mut self) {
         self.messages.clear();
+        self.session_instruction = None;
         self.usage_records.clear();
         self.chat_scroll = 0;
         self.prompt_tokens = 0;

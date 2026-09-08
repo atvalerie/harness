@@ -760,6 +760,49 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
         };
 
         match input.event.as_str() {
+            "session_config" => {
+                let session_id = input
+                    .metadata
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let system_instruction = input
+                    .metadata
+                    .get("system_instruction")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let capabilities = input
+                    .metadata
+                    .get("capabilities")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let input_run_id = new_run_id();
+                let mut sequence = 0;
+                if session_id.is_empty() {
+                    emit_jsonl(
+                        &input_run_id,
+                        &mut sequence,
+                        "error",
+                        json!({
+                            "message": "session_config requires data.session_id",
+                            "kind": "invalid_session_config"
+                        }),
+                    )?;
+                } else {
+                    app.set_session_instruction(system_instruction);
+                    emit_jsonl(
+                        &input_run_id,
+                        &mut sequence,
+                        "session_configured",
+                        json!({
+                            "status": "ok",
+                            "session_id": session_id,
+                            "capabilities": capabilities
+                        }),
+                    )?;
+                }
+            }
             "speech" | "message" | "user_message" => {
                 let Some(text) = input.text.map(|text| text.trim().to_string()) else {
                     let input_run_id = new_run_id();
