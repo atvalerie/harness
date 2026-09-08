@@ -522,7 +522,7 @@ impl App {
     pub fn context_limit(&self) -> Option<u64> {
         self.available_models
             .iter()
-            .find(|model| model.id == self.config.model)
+            .find(|model| same_model_id(&model.id, &self.config.model))
             .and_then(|model| model.input_token_limit)
     }
 
@@ -3062,6 +3062,11 @@ async fn fetch_models(
 
 fn is_free_model_id(id: &str) -> bool {
     id.trim().to_ascii_lowercase().ends_with("-free")
+}
+
+fn same_model_id(left: &str, right: &str) -> bool {
+    let normalize = |id: &str| id.trim().trim_start_matches("models/").to_ascii_lowercase();
+    normalize(left) == normalize(right)
 }
 
 const MAX_TOOL_RESULT_CHARS: usize = 32_000;

@@ -630,11 +630,7 @@ impl AiClient {
                     .to_string();
                 let input_price_per_m = openrouter_price_per_m(entry, "prompt");
                 let output_price_per_m = openrouter_price_per_m(entry, "completion");
-                let input_token_limit = entry
-                    .get("context_length")
-                    .or_else(|| entry.get("context_window"))
-                    .or_else(|| entry.get("max_context_window"))
-                    .and_then(|value| value.as_u64());
+                let input_token_limit = model_context_limit(entry);
                 let reasoning_levels = entry
                     .get("supported_reasoning_levels")
                     .and_then(|value| value.as_array())
@@ -683,6 +679,32 @@ impl AiClient {
         self.adapter
             .uses_responses(self.protocol, model, &self.base_url)
     }
+}
+
+fn model_context_limit(entry: &serde_json::Value) -> Option<u64> {
+    let parse = |value: &serde_json::Value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+            .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+    };
+    [
+        "context_window",
+        "max_context_window",
+        "context_length",
+        "contextWindow",
+        "maxContextWindow",
+        "contextLength",
+    ]
+    .iter()
+    .find_map(|key| entry.get(*key).and_then(parse))
+    .or_else(|| {
+        entry.get("limits").and_then(|limits| {
+            ["context_window", "max_context_window", "context_length"]
+                .iter()
+                .find_map(|key| limits.get(*key).and_then(parse))
+        })
+    })
 }
 
 /// Zen publishes one model catalog for several wire protocols. These model
@@ -745,8 +767,8 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_zen_responses_model_id, is_zen_unsupported_model_id, openrouter_price_per_m,
-        ProviderKind, ProviderProtocol,
+        is_zen_responses_model_id, is_zen_unsupported_model_id, model_context_limit,
+        openrouter_price_per_m, ProviderKind, ProviderProtocol,
     };
     use serde_json::json;
 
@@ -787,6 +809,22 @@ mod tests {
         assert!(is_zen_unsupported_model_id("claude-opus-5"));
         assert!(is_zen_unsupported_model_id("gemini-3.8-flash"));
         assert!(!is_zen_responses_model_id("mimo-v2.5-free"));
+    }
+
+    #[test]
+    fn parses_context_window_metadata_from_codex_catalog_shapes() {
+        assert_eq!(
+            model_context_limit(&json!({"context_window": 272000})),
+            Some(272000)
+        );
+        assert_eq!(
+            model_context_limit(&json!({"max_context_window": "256000"})),
+            Some(256000)
+        );
+        assert_eq!(
+            model_context_limit(&json!({"limits": {"context_window": 128000}})),
+            Some(128000)
+        );
     }
 
     #[test]
