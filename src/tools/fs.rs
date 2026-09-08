@@ -905,7 +905,7 @@ fn apply_exact_edit(
 #[cfg(test)]
 mod edit_tests {
     use super::{apply_exact_edit, resolve_path};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn precise_edit_rejects_ambiguous_match() {
@@ -917,23 +917,29 @@ mod edit_tests {
 
     #[test]
     fn paths_are_anchored_and_lexically_normalized() {
-        let cwd = Path::new(r"C:\projects\harness\target\debug");
+        let cwd = PathBuf::from("projects")
+            .join("harness")
+            .join("target")
+            .join("debug");
         assert_eq!(
-            resolve_path(r"..\..\src\main.rs", cwd),
-            Path::new(r"C:\projects\harness\src\main.rs")
+            resolve_path("../../src/main.rs", &cwd),
+            PathBuf::from("projects")
+                .join("harness")
+                .join("src")
+                .join("main.rs")
         );
         assert_eq!(
-            resolve_path(r".\src\..\Cargo.toml", Path::new(r"C:\projects\harness")),
-            Path::new(r"C:\projects\harness\Cargo.toml")
+            resolve_path("./src/../Cargo.toml", Path::new("projects/harness")),
+            PathBuf::from("projects").join("harness").join("Cargo.toml")
         );
     }
 
     #[test]
     fn unresolved_paths_do_not_search_parent_directories() {
-        let cwd = Path::new(r"C:\projects\harness\target\debug");
-        assert_eq!(
-            resolve_path("missing.txt", cwd),
-            Path::new(r"C:\projects\harness\target\debug\missing.txt")
-        );
+        let cwd = PathBuf::from("projects")
+            .join("harness")
+            .join("target")
+            .join("debug");
+        assert_eq!(resolve_path("missing.txt", &cwd), cwd.join("missing.txt"));
     }
 }

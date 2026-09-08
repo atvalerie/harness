@@ -1,20 +1,20 @@
-name: Release
+name: Nightly
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: nightly
   cancel-in-progress: false
 
 jobs:
   quality:
-    name: Validate release
+    name: Validate nightly build
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -29,7 +29,7 @@ jobs:
         run: cargo test --locked
 
   build:
-    name: Build ${{ matrix.name }}
+    name: Build ${{ matrix.name }} nightly
     needs: quality
     strategy:
       fail-fast: false
@@ -55,66 +55,74 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          tar -C target/release -czf "release-assets/holiday-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" holiday
+          tar -C target/release -czf "release-assets/holiday-nightly-${{ matrix.name }}.tar.gz" holiday
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          Compress-Archive -Path target/release/holiday.exe -DestinationPath "release-assets/holiday-$env:GITHUB_REF_NAME-${{ matrix.name }}.zip"
+          Compress-Archive -Path target/release/holiday.exe -DestinationPath "release-assets/holiday-nightly-${{ matrix.name }}.zip"
       - name: Upload packaged binary
         uses: actions/upload-artifact@v4
         with:
-          name: holiday-${{ matrix.name }}-${{ github.ref_name }}
+          name: holiday-nightly-${{ matrix.name }}-${{ github.run_id }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
   publish:
-    name: Publish GitHub release
+    name: Publish rolling nightly release
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Download packaged binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: holiday-*-${{ github.ref_name }}
+          pattern: holiday-nightly-*-${{ github.run_id }}
           path: release-assets
           merge-multiple: true
-      - name: Create draft release
+      - name: Publish nightly release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" \
+          tag=nightly
+          short_sha="${GITHUB_SHA:0:12}"
+          {
+            echo "Rolling ARM64 nightly build of Holiday from main."
+            echo
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > nightly-notes.md
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" \
+              -f sha="$GITHUB_SHA" \
+              -F force=true
+          else
+            gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --draft \
-              --generate-notes \
-              --title "Holiday $GITHUB_REF_NAME"
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --latest=false \
+              --title "Holiday nightly (${short_sha})" \
+              --notes-file nightly-notes.md
           fi
-      - name: Upload release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
+
           shopt -s nullglob
           assets=(release-assets/*)
           if ((${#assets[@]} == 0)); then
-            echo "No release assets were downloaded" >&2
+            echo "No nightly assets were downloaded" >&2
             exit 1
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+          gh release upload "$tag" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release edit "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Holiday nightly (${short_sha})" \
+            --notes-file nightly-notes.md \
+            --prerelease \
+            --latest=false
