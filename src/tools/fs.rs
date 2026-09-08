@@ -2,32 +2,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
-use super::{working_dir_path, DiffHunk, SharedWorkingDir, Tool, ToolPreview};
-
-fn resolve_path(path_str: &str, cwd: &std::path::Path) -> PathBuf {
-    let initial = PathBuf::from(path_str);
-    if !initial.is_relative() {
-        return initial;
-    }
-
-    let direct = cwd.join(path_str);
-    if direct.exists() {
-        return direct;
-    }
-    let mut curr = cwd.to_path_buf();
-    while let Some(parent) = curr.parent() {
-        let candidate = parent.join(path_str);
-        if candidate.exists() {
-            return candidate;
-        }
-        curr = parent.to_path_buf();
-    }
-    // Keep relative paths anchored to the session's working directory even
-    // when the target does not exist yet (important for write_file).
-    direct
-}
+use super::{resolve_path, working_dir_path, DiffHunk, SharedWorkingDir, Tool, ToolPreview};
 
 pub struct ReadFileTool {
     cwd: SharedWorkingDir,
@@ -77,9 +54,19 @@ impl Tool for ReadFileTool {
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
+        let resolved = if path == "<unknown>" {
+            path.to_string()
+        } else {
+            resolve_path(path, &working_dir_path(&self.cwd))
+                .display()
+                .to_string()
+        };
         ToolPreview {
             title: "Read File".to_string(),
-            details: vec![format!("Path: {}", path)],
+            details: vec![format!("Path: {}", resolved)],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks: Vec::new(),
             is_mutation: false,
         }
@@ -143,6 +130,496 @@ impl Tool for ReadFileTool {
     }
 }
 
+pub struct ListDirectoryTool {
+    cwd: SharedWorkingDir,
+}
+
+impl ListDirectoryTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self {
+        Self { cwd }
+    }
+}
+
+#[async_trait]
+impl Tool for ListDirectoryTool {
+    fn name(&self) -> &'static str {
+        "list_directory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Lists files and directories without invoking a shell. Use depth and max_entries to keep repository exploration bounded."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to list, relative to the current working directory (default: .)"
+                },
+                "depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "Additional directory levels to include (default: 0)"
+                },
+                "max_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "description": "Maximum entries to return (default: 200)"
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include dot-prefixed entries (default: false)"
+                }
+            }
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(".");
+        ToolPreview {
+            title: "List Directory".to_string(),
+            details: vec![format!(
+                "Path: {}",
+                resolve_path(path, &working_dir_path(&self.cwd)).display()
+            )],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: false,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let path_str = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(".");
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
+        if !path.is_dir() {
+            return Err(format!("Directory does not exist: {}", path.display()));
+        }
+        let depth = args
+            .get("depth")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            .min(3) as usize;
+        let max_entries = args
+            .get("max_entries")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(200)
+            .clamp(1, 500) as usize;
+        let include_hidden = args
+            .get("include_hidden")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        let mut entries = Vec::new();
+        collect_directory_entries(
+            &path,
+            &path,
+            depth,
+            max_entries,
+            include_hidden,
+            &mut entries,
+        )
+        .map_err(|error| format!("Failed to list '{}': {}", path.display(), error))?;
+        let mut output = format!(
+            "Directory listing for {} ({} entr{}):\n",
+            path.display(),
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" }
+        );
+        output.push_str(&entries.join("\n"));
+        if entries.len() == max_entries {
+            output.push_str("\n[Directory output limited by max_entries]");
+        }
+        Ok(output)
+    }
+}
+
+fn collect_directory_entries(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    max_entries: usize,
+    include_hidden: bool,
+    output: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name().to_ascii_lowercase());
+    for entry in entries {
+        if output.len() >= max_entries {
+            break;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !include_hidden && name.starts_with('.') {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path().as_path())
+            .display()
+            .to_string();
+        let (kind, suffix) = if file_type.is_dir() {
+            ("dir", "/")
+        } else if file_type.is_symlink() {
+            ("link", "")
+        } else {
+            ("file", "")
+        };
+        output.push(format!("[{}] {}{}", kind, relative, suffix));
+        if file_type.is_dir() && depth > 0 {
+            collect_directory_entries(
+                root,
+                &entry.path(),
+                depth - 1,
+                max_entries,
+                include_hidden,
+                output,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub struct StatPathTool {
+    cwd: SharedWorkingDir,
+}
+
+impl StatPathTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self {
+        Self { cwd }
+    }
+}
+
+#[async_trait]
+impl Tool for StatPathTool {
+    fn name(&self) -> &'static str {
+        "stat_path"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reports bounded metadata for a file, directory, or symlink without invoking a shell."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File or directory path relative to the current working directory"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let resolved = if path == "<unknown>" {
+            path.to_string()
+        } else {
+            resolve_path(path, &working_dir_path(&self.cwd))
+                .display()
+                .to_string()
+        };
+        ToolPreview {
+            title: "Stat Path".to_string(),
+            details: vec![format!("Path: {}", resolved)],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: false,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let path_str = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("Failed to inspect '{}': {}", path.display(), error))?;
+        let kind = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        Ok(format!(
+            "Path: {}\nType: {}\nSize: {} bytes\nReadonly: {}",
+            path.display(),
+            kind,
+            metadata.len(),
+            metadata.permissions().readonly()
+        ))
+    }
+}
+
+pub struct CreateDirectoryTool {
+    cwd: SharedWorkingDir,
+}
+
+impl CreateDirectoryTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self {
+        Self { cwd }
+    }
+}
+
+#[async_trait]
+impl Tool for CreateDirectoryTool {
+    fn name(&self) -> &'static str {
+        "create_directory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Creates a directory and its missing parents after approval."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to create relative to the current working directory"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let resolved = resolve_path(path, &working_dir_path(&self.cwd));
+        ToolPreview {
+            title: "Create Directory".to_string(),
+            details: vec![
+                format!("Target: {}", resolved.display()),
+                "Action: Create directory and missing parents".to_string(),
+            ],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: true,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let path_str = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
+        fs::create_dir_all(&path)
+            .map_err(|error| format!("Failed to create '{}': {}", path.display(), error))?;
+        Ok(format!("Created directory {}", path.display()))
+    }
+}
+
+pub struct MovePathTool {
+    cwd: SharedWorkingDir,
+}
+
+impl MovePathTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self {
+        Self { cwd }
+    }
+}
+
+#[async_trait]
+impl Tool for MovePathTool {
+    fn name(&self) -> &'static str {
+        "move_path"
+    }
+
+    fn description(&self) -> &'static str {
+        "Moves or renames a file or directory after approval. It never overwrites an existing destination."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Existing file or directory to move"},
+                "destination": {"type": "string", "description": "New path; existing destinations are rejected"}
+            },
+            "required": ["source", "destination"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let source = args
+            .get("source")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let destination = args
+            .get("destination")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let cwd = working_dir_path(&self.cwd);
+        ToolPreview {
+            title: "Move Path".to_string(),
+            details: vec![
+                format!("Source: {}", resolve_path(source, &cwd).display()),
+                format!("Destination: {}", resolve_path(destination, &cwd).display()),
+                "Action: Move or rename without overwriting".to_string(),
+            ],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: true,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let source_str = args
+            .get("source")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing required parameter 'source'".to_string())?;
+        let destination_str = args
+            .get("destination")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing required parameter 'destination'".to_string())?;
+        let cwd = working_dir_path(&self.cwd);
+        let source = resolve_path(source_str, &cwd);
+        let destination = resolve_path(destination_str, &cwd);
+        if !source.exists() {
+            return Err(format!("Source does not exist: {}", source.display()));
+        }
+        if destination.exists() {
+            return Err(format!(
+                "Destination already exists: {}",
+                destination.display()
+            ));
+        }
+        fs::rename(&source, &destination).map_err(|error| {
+            format!(
+                "Failed to move '{}' to '{}': {}",
+                source.display(),
+                destination.display(),
+                error
+            )
+        })?;
+        Ok(format!(
+            "Moved {} to {}",
+            source.display(),
+            destination.display()
+        ))
+    }
+}
+
+pub struct DeletePathTool {
+    cwd: SharedWorkingDir,
+}
+
+impl DeletePathTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self {
+        Self { cwd }
+    }
+}
+
+#[async_trait]
+impl Tool for DeletePathTool {
+    fn name(&self) -> &'static str {
+        "delete_path"
+    }
+
+    fn description(&self) -> &'static str {
+        "Deletes a file or an explicitly approved directory. Directory deletion requires recursive=true and cannot be undone."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File or directory to delete"},
+                "recursive": {"type": "boolean", "description": "Required for directory deletion; defaults to false"}
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let recursive = args
+            .get("recursive")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let resolved = resolve_path(path, &working_dir_path(&self.cwd));
+        ToolPreview {
+            title: "Delete Path".to_string(),
+            details: vec![
+                format!("Target: {}", resolved.display()),
+                format!("Recursive: {}", recursive),
+                "Risk: Permanent deletion; there is no undo".to_string(),
+            ],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: true,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let path_str = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
+        let recursive = args
+            .get("recursive")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let path = resolve_path(path_str, &working_dir_path(&self.cwd));
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("Failed to inspect '{}': {}", path.display(), error))?;
+        let cwd = resolve_path(".", &working_dir_path(&self.cwd));
+        if path == cwd {
+            return Err("Refusing to delete the active working directory".to_string());
+        }
+        if metadata.is_dir() {
+            if !recursive {
+                return Err("Directory deletion requires recursive=true".to_string());
+            }
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("Failed to delete '{}': {}", path.display(), error))?;
+        } else {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Failed to delete '{}': {}", path.display(), error))?;
+        }
+        Ok(format!("Deleted {}", path.display()))
+    }
+}
+
 pub struct WriteFileTool {
     cwd: SharedWorkingDir,
 }
@@ -160,7 +637,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Writes or overwrites content to a specified file. Generates unified diff for review before execution."
+        "Creates or overwrites a file with full content. Prefer edit_file for targeted changes to existing files. Generates a diff preview; execution follows the configured permission policy."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -233,6 +710,9 @@ impl Tool for WriteFileTool {
         ToolPreview {
             title: "Write File (Diff Review)".to_string(),
             details: vec![format!("Target: {}", path.display()), summary],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks,
             is_mutation: true,
         }
@@ -285,7 +765,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Applies a precise patch to an existing text file by replacing an exact old_string with new_string. Prefer this over rewriting a whole file. Generates a diff for review."
+        "Applies a precise patch to an existing text file by replacing an exact old_string with new_string. Prefer this over rewriting a whole file. Generates a diff preview; execution follows the configured permission policy."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -348,6 +828,9 @@ impl Tool for EditFileTool {
                 format!("Exact replacements: {}", occurrences),
                 format!("Replace all: {}", replace_all),
             ],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks,
             is_mutation: true,
         }
@@ -421,7 +904,8 @@ fn apply_exact_edit(
 
 #[cfg(test)]
 mod edit_tests {
-    use super::apply_exact_edit;
+    use super::{apply_exact_edit, resolve_path};
+    use std::path::Path;
 
     #[test]
     fn precise_edit_rejects_ambiguous_match() {
@@ -429,5 +913,27 @@ mod edit_tests {
         let (updated, count) = apply_exact_edit("a\na\n", "a", "b", true).unwrap();
         assert_eq!(updated, "b\nb\n");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn paths_are_anchored_and_lexically_normalized() {
+        let cwd = Path::new(r"C:\projects\harness\target\debug");
+        assert_eq!(
+            resolve_path(r"..\..\src\main.rs", cwd),
+            Path::new(r"C:\projects\harness\src\main.rs")
+        );
+        assert_eq!(
+            resolve_path(r".\src\..\Cargo.toml", Path::new(r"C:\projects\harness")),
+            Path::new(r"C:\projects\harness\Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn unresolved_paths_do_not_search_parent_directories() {
+        let cwd = Path::new(r"C:\projects\harness\target\debug");
+        assert_eq!(
+            resolve_path("missing.txt", cwd),
+            Path::new(r"C:\projects\harness\target\debug\missing.txt")
+        );
     }
 }

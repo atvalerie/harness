@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::config::{tool_permission_description, PermissionMode, TOOL_PERMISSION_GROUPS};
 use crate::tools::DiffHunk;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -61,20 +62,43 @@ pub fn render_hitl_modal(app: &App, frame: &mut Frame, area: Rect) {
         header_area,
     );
 
-    let mut body_lines = pending
-        .preview
-        .details
-        .iter()
-        .cloned()
-        .map(Line::from)
-        .collect::<Vec<_>>();
-    if !pending.preview.diff_hunks.is_empty() {
-        body_lines.push(Line::from(Span::styled(
-            "Diff:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+    let section_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut body_lines = Vec::new();
+    if pending.preview.command.is_some() {
+        body_lines.push(Line::from(Span::styled("Why:", section_style)));
+        body_lines.push(Line::from(format!(
+            "  {}",
+            pending
+                .preview
+                .reason
+                .as_deref()
+                .unwrap_or("Not provided by model.")
         )));
+        body_lines.push(Line::from(""));
+        body_lines.push(Line::from(Span::styled("Expected effect:", section_style)));
+        body_lines.push(Line::from(format!(
+            "  {}",
+            pending
+                .preview
+                .expected_effect
+                .as_deref()
+                .unwrap_or("Not provided by model.")
+        )));
+        body_lines.push(Line::from(""));
+    }
+    if let Some(command) = &pending.preview.command {
+        body_lines.push(Line::from(Span::styled("Command:", section_style)));
+        for (index, line) in command.split('\n').enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            body_lines.push(Line::from(format!("{:>3} | {}", index + 1, line)));
+        }
+        body_lines.push(Line::from(""));
+    }
+    body_lines.extend(pending.preview.details.iter().cloned().map(Line::from));
+    if !pending.preview.diff_hunks.is_empty() {
+        body_lines.push(Line::from(Span::styled("Diff:", section_style)));
         body_lines.extend(pending.preview.diff_hunks.iter().map(render_diff_line));
     }
 
@@ -110,6 +134,118 @@ fn render_diff_line(hunk: &DiffHunk) -> Line<'static> {
             Style::default().fg(color).add_modifier(modifier),
         ),
     ])
+}
+
+pub fn render_permissions_modal(app: &App, frame: &mut Frame, area: Rect) {
+    if !app.show_permissions_modal {
+        return;
+    }
+    let popup_area = centered_rect(86, 82, area);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Tool Permissions ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Choose the default handling for each tool risk group.",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Allow executes automatically; Ask shows the approval preview; Deny rejects."),
+        Line::from(""),
+    ];
+    for (index, (key, label)) in TOOL_PERMISSION_GROUPS.iter().enumerate() {
+        let selected = index == app.permissions_selected;
+        let mode = app.config.permission_mode_for(key);
+        let mode_label = match mode {
+            PermissionMode::Allow => "ALLOW",
+            PermissionMode::Ask => "ASK",
+            PermissionMode::Deny => "DENY",
+        };
+        let mode_color = match mode {
+            PermissionMode::Allow => Color::Green,
+            PermissionMode::Ask => Color::Yellow,
+            PermissionMode::Deny => Color::Red,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "> " } else { "  " },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{:<34}", label),
+                Style::default()
+                    .fg(if selected { Color::Cyan } else { Color::White })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                format!("[{}]", mode_label),
+                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if let Some((key, label)) = TOOL_PERMISSION_GROUPS.get(app.permissions_selected) {
+        lines.push(Line::from(Span::styled(
+            format!("{} covers:", label),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            "  {}",
+            tool_permission_description(key)
+        )));
+        let tools = app.tool_registry.tools_for_permission_group(key);
+        if tools.is_empty() {
+            lines.push(Line::from("  No registered tools."));
+        } else {
+            lines.push(Line::from(format!("  Registered tools ({}):", tools.len())));
+            for (name, description) in tools {
+                lines.push(Line::from(format!("    • {} — {}", name, description)));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "These policies are independent from which schemas are visible to the model.",
+    ));
+    lines.push(Line::from("Reopen this screen with /permissions."));
+    let footer_height = 1.min(inner.height);
+    let footer = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(footer_height),
+        width: inner.width,
+        height: footer_height,
+    };
+    let body = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(footer_height),
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll as u16, 0)),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "[Up/Down] choose  [Left/Right/Space] change  [PgUp/PgDn] scroll  [Enter] save  [Esc] close",
+        ),
+        footer,
+    );
 }
 
 pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {

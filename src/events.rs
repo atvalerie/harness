@@ -43,4 +43,5 @@ pub enum AppEvent {
         interactive: bool,
     },
     CompactionFinished(Result<String, String>),
+    ProviderUsageFetched(Result<String, String>),
 }

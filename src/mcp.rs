@@ -3,7 +3,8 @@ use crate::tools::{DiffHunk, Tool, ToolPreview};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -14,6 +15,60 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+
+fn provider_safe_tool_name(raw: &str) -> String {
+    let normalized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let normalized = if normalized.is_empty() {
+        "mcp_tool".to_string()
+    } else {
+        normalized
+    };
+
+    if normalized.len() <= 64 {
+        return normalized;
+    }
+
+    let digest = Sha256::digest(raw.as_bytes());
+    let suffix = format!(
+        "_{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    );
+    let prefix_len = 64 - suffix.len();
+    format!(
+        "{}{}",
+        normalized.chars().take(prefix_len).collect::<String>(),
+        suffix
+    )
+}
+
+fn unique_provider_safe_tool_name(raw: &str, used_names: &mut HashSet<String>) -> String {
+    let base = provider_safe_tool_name(raw);
+    if used_names.insert(base.clone()) {
+        return base;
+    }
+
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut attempt = 0u32;
+    loop {
+        let candidate = provider_safe_tool_name(&format!(
+            "{}__collision_{:02x}{:02x}{:02x}{:02x}_{}",
+            raw, digest[0], digest[1], digest[2], digest[3], attempt
+        ));
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    }
+}
 
 enum Transport {
     Stdio {
@@ -199,6 +254,9 @@ impl Tool for McpTool {
         ToolPreview {
             title: format!("MCP: {}", self.public_name),
             details: vec![format!("Arguments: {}", args)],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks: Vec::<DiffHunk>::new(),
             is_mutation: true,
         }
@@ -240,11 +298,12 @@ impl Tool for McpTool {
 
 pub async fn connect_all(configs: &BTreeMap<String, McpServerConfig>) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut used_names = HashSet::new();
     for (server_name, config) in configs {
         if !config.enabled {
             continue;
         }
-        match connect_server(server_name, config).await {
+        match connect_server(server_name, config, &mut used_names).await {
             Ok(server_tools) => tools.extend(server_tools),
             Err(error) => eprintln!("MCP server '{}': {}", server_name, error),
         }
@@ -255,6 +314,7 @@ pub async fn connect_all(configs: &BTreeMap<String, McpServerConfig>) -> Vec<Arc
 async fn connect_server(
     server_name: &str,
     config: &McpServerConfig,
+    used_names: &mut HashSet<String>,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
     let transport = if config.transport.eq_ignore_ascii_case("http")
         || config.transport.eq_ignore_ascii_case("streamable-http")
@@ -324,8 +384,13 @@ async fn connect_server(
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let public_name =
-            Box::leak(format!("mcp__{}__{}", server_name, original_name).into_boxed_str());
+        let public_name = Box::leak(
+            unique_provider_safe_tool_name(
+                &format!("mcp__{}__{}", server_name, original_name),
+                used_names,
+            )
+            .into_boxed_str(),
+        );
         let description = Box::leak(
             tool.get("description")
                 .and_then(Value::as_str)
@@ -350,7 +415,8 @@ async fn connect_server(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_matching_json;
+    use super::{parse_matching_json, provider_safe_tool_name, unique_provider_safe_tool_name};
+    use std::collections::HashSet;
 
     #[test]
     fn parses_streamable_http_sse_json_rpc_data() {
@@ -362,5 +428,32 @@ mod tests {
         .unwrap();
         assert_eq!(result["ok"], true);
         assert!(parse_matching_json("data: {\"id\":8,\"result\":{}}", 7).is_none());
+    }
+
+    #[test]
+    fn normalizes_mcp_names_for_provider_compatibility() {
+        let name = provider_safe_tool_name("mcp__server.name__tool/read");
+        assert_eq!(name, "mcp__server_name__tool_read");
+        assert!(name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+    }
+
+    #[test]
+    fn bounds_long_mcp_names_without_losing_stable_identity() {
+        let raw = format!("mcp__{}__{}", "server".repeat(40), "tool".repeat(40));
+        let first = provider_safe_tool_name(&raw);
+        let second = provider_safe_tool_name(&raw);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn disambiguates_mcp_names_that_normalize_to_the_same_value() {
+        let mut used = HashSet::new();
+        let first = unique_provider_safe_tool_name("mcp__server.name__tool/read", &mut used);
+        let second = unique_provider_safe_tool_name("mcp__server/name__tool.read", &mut used);
+        assert_ne!(first, second);
+        assert_eq!(used.len(), 2);
     }
 }

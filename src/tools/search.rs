@@ -3,7 +3,7 @@ use serde_json::json;
 use std::process::Stdio;
 use tokio::process::Command;
 
-use super::{working_dir_path, SharedWorkingDir, Tool, ToolPreview};
+use super::{resolve_path, working_dir_path, SharedWorkingDir, Tool, ToolPreview};
 
 pub struct SearchFilesTool {
     cwd: SharedWorkingDir,
@@ -48,9 +48,16 @@ impl Tool for SearchFilesTool {
             .get("path")
             .and_then(|value| value.as_str())
             .unwrap_or(".");
+        let resolved_path = resolve_path(path, &working_dir_path(&self.cwd));
         ToolPreview {
             title: "Search Files (ripgrep)".to_string(),
-            details: vec![format!("Query: {}", query), format!("Path: {}", path)],
+            details: vec![
+                format!("Query: {}", query),
+                format!("Path: {}", resolved_path.display()),
+            ],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks: Vec::new(),
             is_mutation: false,
         }
@@ -97,17 +104,18 @@ impl Tool for SearchFilesTool {
                 command.arg("--glob").arg(glob);
             }
         }
+        let resolved_path = resolve_path(path, &working_dir_path(&self.cwd));
         command
             .arg("--")
             .arg(query)
-            .arg(path)
+            .arg(resolved_path)
             .current_dir(working_dir_path(&self.cwd))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         let output = command.output().await.map_err(|error| {
             format!(
-                "Could not run ripgrep: {}. Install 'rg' or use run_command as a fallback.",
+                "Could not run ripgrep: {}. Use bounded read_file/list_directory inspection, or run_command as a fallback if the active mode and permissions permit it.",
                 error
             )
         })?;

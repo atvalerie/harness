@@ -8,7 +8,8 @@ use crate::client::types::{FunctionDeclaration, GeminiToolDeclaration};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs as std_fs;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -26,6 +27,43 @@ pub fn working_dir_path(cwd: &SharedWorkingDir) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+pub(crate) fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
+    let initial = PathBuf::from(path_str);
+    let candidate = if initial.is_relative() {
+        cwd.join(initial)
+    } else {
+        initial
+    };
+
+    let is_symlink = std_fs::symlink_metadata(&candidate)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        if let Ok(canonical) = candidate.canonicalize() {
+            return canonical;
+        }
+    }
+    lexical_normalize(&candidate)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct DiffHunk {
@@ -40,6 +78,9 @@ pub struct DiffHunk {
 pub struct ToolPreview {
     pub title: String,
     pub details: Vec<String>,
+    pub reason: Option<String>,
+    pub expected_effect: Option<String>,
+    pub command: Option<String>,
     pub diff_hunks: Vec<DiffHunk>,
     pub is_mutation: bool,
 }
@@ -57,6 +98,106 @@ pub trait Tool: Send + Sync {
 struct ToolSummary {
     name: String,
     description: String,
+    category: ToolCategory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCategory {
+    Filesystem,
+    Shell,
+    Web,
+    Agents,
+    Integrations,
+    Other,
+}
+
+impl ToolCategory {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::Shell => "shell",
+            Self::Web => "web",
+            Self::Agents => "agents",
+            Self::Integrations => "integrations",
+            Self::Other => "other",
+        }
+    }
+
+    fn matches_query(self, query: &str) -> bool {
+        match self {
+            Self::Filesystem => matches!(query, "file" | "files" | "filesystem" | "fs"),
+            Self::Shell => matches!(query, "command" | "commands" | "shell" | "terminal"),
+            Self::Web => matches!(query, "web" | "internet" | "browser" | "http"),
+            Self::Agents => matches!(query, "agent" | "agents" | "subagent"),
+            Self::Integrations => matches!(query, "mcp" | "integration" | "integrations"),
+            Self::Other => query == "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolVisibility {
+    Core,
+    Lazy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRisk {
+    ReadOnly,
+    WorkspaceWrite,
+    Destructive,
+    HostExecution,
+    ExternalSideEffect,
+    AgentControl,
+    SessionState,
+}
+
+impl ToolRisk {
+    pub const fn permission_group(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::Destructive => "destructive",
+            Self::HostExecution => "host_execution",
+            Self::ExternalSideEffect => "external_side_effect",
+            Self::AgentControl => "agent_control",
+            Self::SessionState => "session_state",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolDescriptor {
+    pub category: ToolCategory,
+    pub visibility: ToolVisibility,
+    pub risk: ToolRisk,
+}
+
+impl ToolDescriptor {
+    pub const fn core(category: ToolCategory, risk: ToolRisk) -> Self {
+        Self {
+            category,
+            visibility: ToolVisibility::Core,
+            risk,
+        }
+    }
+
+    pub const fn lazy(category: ToolCategory, risk: ToolRisk) -> Self {
+        Self {
+            category,
+            visibility: ToolVisibility::Lazy,
+            risk,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolContextMetrics {
+    pub active_tools: usize,
+    pub registered_tools: usize,
+    pub discovered_tools: usize,
+    pub estimated_schema_chars: usize,
+    pub estimated_schema_tokens: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -84,7 +225,7 @@ impl Tool for SearchToolsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Finds hidden specialized and MCP tools by name or purpose. Returns short descriptions; matching tools become available on the next model turn. Use an empty query to list all hidden tools."
+        "Finds optional tools by name, category, or purpose. Returns short descriptions; matching tools become available on the next model turn. Use a category query such as filesystem, web, agents, or integrations to activate a bundle."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -94,6 +235,12 @@ impl Tool for SearchToolsTool {
                 "query": {
                     "type": "string",
                     "description": "A short purpose or name to search for, such as filesystem, database, or deploy"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 32,
+                    "description": "Maximum optional tools to return and activate (default: 8)"
                 }
             },
             "required": ["query"]
@@ -109,6 +256,9 @@ impl Tool for SearchToolsTool {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
             )],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks: Vec::new(),
             is_mutation: false,
         }
@@ -121,6 +271,11 @@ impl Tool for SearchToolsTool {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
+        let max_results = args
+            .get("max_results")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(8)
+            .clamp(1, 32) as usize;
         let terms = query.split_whitespace().collect::<Vec<_>>();
         let catalog = self
             .catalog
@@ -133,24 +288,36 @@ impl Tool for SearchToolsTool {
                     || terms.iter().any(|term| {
                         tool.name.to_ascii_lowercase().contains(term)
                             || tool.description.to_ascii_lowercase().contains(term)
+                            || tool.category.matches_query(term)
                     })
             })
-            .map(|tool| format!("- {}: {}", tool.name, tool.description))
+            .map(|tool| {
+                format!(
+                    "- [{}] {}: {}",
+                    tool.category.label(),
+                    tool.name,
+                    tool.description
+                )
+            })
             .collect::<Vec<_>>();
         matches.sort();
+        matches.truncate(max_results);
         if matches.is_empty() {
-            return Ok("No hidden tools matched that query.".to_string());
+            return Ok("No optional tools matched that query.".to_string());
         }
-        Ok(format!(
-            "Matching hidden tools (their full schemas are now available on the next turn):\n{}",
-            matches.join("\n")
-        ))
+        let heading = if terms.is_empty() {
+            "Optional tool catalog (use a non-empty purpose or category query to activate matching schemas):"
+        } else {
+            "Matching optional tools (their full schemas are available on the next turn):"
+        };
+        Ok(format!("{}\n{}", heading, matches.join("\n")))
     }
 }
 
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    descriptors: HashMap<String, ToolDescriptor>,
     working_dir: SharedWorkingDir,
     catalog: Arc<Mutex<Vec<ToolSummary>>>,
     discovered: Arc<Mutex<HashSet<String>>>,
@@ -162,6 +329,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             tools: HashMap::new(),
+            descriptors: HashMap::new(),
             working_dir: new_working_dir(),
             catalog: Arc::new(Mutex::new(Vec::new())),
             discovered: Arc::new(Mutex::new(HashSet::new())),
@@ -169,34 +337,79 @@ impl ToolRegistry {
             agent_manager: AgentManager::new(),
         };
 
-        reg.register(Arc::new(SearchToolsTool::new(reg.catalog.clone())));
-        reg.register(Arc::new(grounding::WebSearchTool));
-        reg.register(Arc::new(grounding::WebFetchTool));
-        reg.register(Arc::new(fs::ReadFileTool::new(reg.working_dir.clone())));
-        reg.register(Arc::new(fs::WriteFileTool::new(reg.working_dir.clone())));
-        reg.register(Arc::new(fs::EditFileTool::new(reg.working_dir.clone())));
-        reg.register(Arc::new(TodoTool::new(reg.todos.clone())));
-        reg.register(Arc::new(shell::RunCommandTool::new(
-            reg.working_dir.clone(),
-        )));
-        reg.register(Arc::new(search::SearchFilesTool::new(
-            reg.working_dir.clone(),
-        )));
+        reg.register_with_descriptor(
+            Arc::new(SearchToolsTool::new(reg.catalog.clone())),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(grounding::WebSearchTool),
+            ToolDescriptor::lazy(ToolCategory::Web, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(grounding::WebFetchTool),
+            ToolDescriptor::lazy(ToolCategory::Web, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::ReadFileTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::ListDirectoryTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::StatPathTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::WriteFileTool::new(reg.working_dir.clone())),
+            ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::WorkspaceWrite),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::EditFileTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::WorkspaceWrite),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::CreateDirectoryTool::new(reg.working_dir.clone())),
+            ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::WorkspaceWrite),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::MovePathTool::new(reg.working_dir.clone())),
+            ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::WorkspaceWrite),
+        );
+        reg.register_with_descriptor(
+            Arc::new(fs::DeletePathTool::new(reg.working_dir.clone())),
+            ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::Destructive),
+        );
+        reg.register_with_descriptor(
+            Arc::new(TodoTool::new(reg.todos.clone())),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::SessionState),
+        );
+        reg.register_with_descriptor(
+            Arc::new(shell::RunCommandTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Shell, ToolRisk::HostExecution),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::SearchFilesTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
 
         reg
     }
 
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+    pub fn register_with_descriptor(&mut self, tool: Arc<dyn Tool>, descriptor: ToolDescriptor) {
         let name = tool.name().to_string();
         if let Ok(mut catalog) = self.catalog.lock() {
             catalog.retain(|entry| entry.name != name);
-            if Self::is_hidden_name(&name) {
+            if descriptor.visibility == ToolVisibility::Lazy {
                 catalog.push(ToolSummary {
                     name: name.clone(),
                     description: tool.description().to_string(),
+                    category: descriptor.category,
                 });
             }
         }
+        self.descriptors.insert(name.clone(), descriptor);
         self.tools.insert(name, tool);
     }
 
@@ -214,14 +427,17 @@ impl ToolRegistry {
             AgentToolKind::Inspect,
             AgentToolKind::Kill,
         ] {
-            self.register(Arc::new(AgentTool::new(
-                kind,
-                self.agent_manager.clone(),
-                client.clone(),
-                model.clone(),
-                fallbacks.clone(),
-                max_retries,
-            )));
+            self.register_with_descriptor(
+                Arc::new(AgentTool::new(
+                    kind,
+                    self.agent_manager.clone(),
+                    client.clone(),
+                    model.clone(),
+                    fallbacks.clone(),
+                    max_retries,
+                )),
+                ToolDescriptor::lazy(ToolCategory::Agents, ToolRisk::AgentControl),
+            );
         }
     }
 
@@ -229,12 +445,30 @@ impl ToolRegistry {
         self.agent_manager.clone()
     }
 
-    fn is_hidden_name(name: &str) -> bool {
-        name == "write_file" || name == "edit_file" || name.starts_with("mcp__")
-    }
-
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    pub fn permission_group(&self, name: &str) -> &'static str {
+        self.descriptors
+            .get(name)
+            .map(|descriptor| descriptor.risk.permission_group())
+            .unwrap_or("external_side_effect")
+    }
+
+    pub fn tools_for_permission_group(&self, group: &str) -> Vec<(String, String)> {
+        let mut tools = self
+            .descriptors
+            .iter()
+            .filter(|(_, descriptor)| descriptor.risk.permission_group() == group)
+            .filter_map(|(name, _)| {
+                self.tools
+                    .get(name)
+                    .map(|tool| (name.clone(), tool.description().to_string()))
+            })
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| left.0.cmp(&right.0));
+        tools
     }
 
     pub fn set_working_dir(&self, path: PathBuf) -> Result<(), String> {
@@ -244,6 +478,13 @@ impl ToolRegistry {
                 path.display()
             ));
         }
+        let path = path.canonicalize().map_err(|error| {
+            format!(
+                "Could not resolve working directory '{}': {}",
+                path.display(),
+                error
+            )
+        })?;
         let mut working_dir = self
             .working_dir
             .lock()
@@ -271,7 +512,14 @@ impl ToolRegistry {
         let mut names = self
             .tools
             .keys()
-            .filter(|name| !Self::is_hidden_name(name) || discovered.contains(*name))
+            .filter(|name| {
+                self.descriptors
+                    .get(*name)
+                    .map(|descriptor| {
+                        descriptor.visibility == ToolVisibility::Core || discovered.contains(*name)
+                    })
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect::<Vec<_>>();
         names.sort();
@@ -289,12 +537,46 @@ impl ToolRegistry {
         }]
     }
 
+    pub fn context_metrics(&self) -> ToolContextMetrics {
+        let declarations = self.to_gemini_declarations();
+        let active = declarations
+            .first()
+            .map(|declaration| declaration.function_declarations.as_slice())
+            .unwrap_or(&[]);
+        let estimated_schema_chars = active
+            .iter()
+            .map(|declaration| {
+                declaration.name.len()
+                    + declaration.description.len()
+                    + declaration.parameters.to_string().len()
+            })
+            .sum::<usize>();
+        let discovered_tools = self
+            .discovered
+            .lock()
+            .map(|set| set.len())
+            .unwrap_or_default();
+
+        ToolContextMetrics {
+            active_tools: active.len(),
+            registered_tools: self.tools.len(),
+            discovered_tools,
+            estimated_schema_chars,
+            estimated_schema_tokens: estimated_schema_chars.saturating_add(3) / 4,
+        }
+    }
+
     pub fn discover_from_query(&self, args: &serde_json::Value) {
         let query = args
             .get("query")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
+        let max_results = args
+            .get("max_results")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(8)
+            .clamp(1, 32) as usize;
         let terms = query.split_whitespace().collect::<Vec<_>>();
         let Ok(catalog) = self.catalog.lock() else {
             return;
@@ -302,15 +584,21 @@ impl ToolRegistry {
         let Ok(mut discovered) = self.discovered.lock() else {
             return;
         };
-        for tool in catalog.iter() {
-            if terms.is_empty()
-                || terms.iter().any(|term| {
+        let mut matches = catalog
+            .iter()
+            .filter(|tool| {
+                terms.iter().any(|term| {
                     tool.name.to_ascii_lowercase().contains(term)
                         || tool.description.to_ascii_lowercase().contains(term)
+                        || tool.category.matches_query(term)
                 })
-            {
-                discovered.insert(tool.name.clone());
-            }
+            })
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.truncate(max_results);
+        for name in matches {
+            discovered.insert(name);
         }
     }
 
@@ -429,6 +717,9 @@ impl Tool for TodoTool {
         ToolPreview {
             title: "Update Todo List".to_string(),
             details: vec!["Updates the in-session task list".to_string()],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks: Vec::new(),
             is_mutation: false,
         }
@@ -532,13 +823,92 @@ mod tests {
         let registry = ToolRegistry::new();
         let names = declaration_names(&registry);
         assert!(names.contains(&"search_tools".to_string()));
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"list_directory".to_string()));
+        assert!(names.contains(&"stat_path".to_string()));
+        assert!(names.contains(&"search_files".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
-        assert!(!names.contains(&"edit_file".to_string()));
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
 
         registry.discover_from_query(&serde_json::json!({"query":"patch editing"}));
         let names = declaration_names(&registry);
         assert!(names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
+    }
+
+    #[test]
+    fn category_queries_activate_tool_bundles() {
+        let registry = ToolRegistry::new();
+        registry.discover_from_query(&serde_json::json!({"query":"filesystem"}));
+        let names = declaration_names(&registry);
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
+
+        registry.discover_from_query(&serde_json::json!({"query":"web"}));
+        let names = declaration_names(&registry);
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"web_fetch".to_string()));
+    }
+
+    #[test]
+    fn discovery_limits_the_number_of_activated_tools() {
+        let registry = ToolRegistry::new();
+        registry.discover_from_query(&serde_json::json!({"query":"filesystem", "max_results":1}));
+        let names = declaration_names(&registry);
+        assert!(names.contains(&"create_directory".to_string()));
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+    }
+
+    #[test]
+    fn empty_discovery_query_does_not_activate_every_optional_tool() {
+        let registry = ToolRegistry::new();
+        registry.discover_from_query(&serde_json::json!({"query":""}));
+        let names = declaration_names(&registry);
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn reports_active_tool_schema_context() {
+        let registry = ToolRegistry::new();
+        let initial = registry.context_metrics();
+        assert!(initial.active_tools < initial.registered_tools);
+        assert_eq!(initial.discovered_tools, 0);
+        assert!(initial.estimated_schema_chars > 0);
+        assert!(initial.estimated_schema_tokens > 0);
+
+        registry.discover_from_query(&serde_json::json!({"query":"web"}));
+        let discovered = registry.context_metrics();
+        assert_eq!(discovered.discovered_tools, 2);
+        assert!(discovered.active_tools > initial.active_tools);
+    }
+
+    #[test]
+    fn permission_catalog_matches_registered_tools() {
+        let registry = ToolRegistry::new();
+        let read_only = registry.tools_for_permission_group("read_only");
+        let host_execution = registry.tools_for_permission_group("host_execution");
+        let destructive = registry.tools_for_permission_group("destructive");
+
+        assert!(read_only.iter().any(|(name, _)| name == "read_file"));
+        assert!(read_only.iter().any(|(name, _)| name == "search_files"));
+        assert_eq!(
+            host_execution
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_command"]
+        );
+        assert_eq!(
+            destructive
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["delete_path"]
+        );
     }
 
     #[test]

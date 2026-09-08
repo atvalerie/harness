@@ -45,6 +45,12 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         .map(format_compact_number)
         .unwrap_or_else(|| "?".to_string());
 
+    let provider_limit_parts = app
+        .provider_limits
+        .as_deref()
+        .map(compact_provider_limit_parts)
+        .filter(|parts| !parts.is_empty());
+
     let tps_str = if app.state == EngineState::Streaming || app.current_tps > 0.0 {
         format!(" │ {:.1} tps", app.current_tps)
     } else {
@@ -83,6 +89,45 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(pricing_str, Style::default().fg(Color::DarkGray)),
+        if provider_limit_parts.is_some() {
+            Span::raw(" \u{2502} ")
+        } else {
+            Span::raw("")
+        },
+        if let Some(parts) = provider_limit_parts.as_ref() {
+            Span::styled(
+                parts.first().cloned().unwrap_or_default(),
+                Style::default().fg(Color::LightGreen),
+            )
+        } else {
+            Span::raw("")
+        },
+        if provider_limit_parts
+            .as_ref()
+            .is_some_and(|parts| parts.len() > 1)
+        {
+            Span::raw(" \u{2502} ")
+        } else {
+            Span::raw("")
+        },
+        if let Some(part) = provider_limit_parts.as_ref().and_then(|parts| parts.get(1)) {
+            Span::styled(part.clone(), Style::default().fg(Color::LightGreen))
+        } else {
+            Span::raw("")
+        },
+        if provider_limit_parts
+            .as_ref()
+            .is_some_and(|parts| parts.len() > 2)
+        {
+            Span::raw(" \u{2502} ")
+        } else {
+            Span::raw("")
+        },
+        if let Some(part) = provider_limit_parts.as_ref().and_then(|parts| parts.get(2)) {
+            Span::styled(part.clone(), Style::default().fg(Color::LightGreen))
+        } else {
+            Span::raw("")
+        },
         Span::raw(" │ "),
         Span::styled("think: ", Style::default().fg(Color::DarkGray)),
         Span::styled(thinking_str, Style::default().fg(Color::Magenta)),
@@ -129,5 +174,44 @@ fn format_compact_number(n: u64) -> String {
         format!("{}k", n / 1_000)
     } else {
         n.to_string()
+    }
+}
+
+fn compact_provider_limit_parts(value: &str) -> Vec<String> {
+    let summaries = value
+        .lines()
+        .filter_map(|line| {
+            let percent = line.split_whitespace().find(|word| word.ends_with('%'))?;
+            let reset = line
+                .split_once("resets in ")
+                .map(|(_, duration)| duration.trim().trim_end_matches(','))
+                .unwrap_or("unknown");
+            Some(format!("{} left ({} reset)", percent, reset))
+        })
+        .collect::<Vec<_>>();
+    if !summaries.is_empty() {
+        return summaries;
+    }
+
+    let fallback = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if fallback.is_empty() {
+        Vec::new()
+    } else {
+        vec![fallback]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_provider_limit_parts;
+
+    #[test]
+    fn status_limits_use_a_short_window_summary() {
+        let value = "Codex usage (pro)\nPrimary: 85% left (5h), resets in 2h 10m\nSecondary: 40% left (7d), resets in 3d";
+        let summary = compact_provider_limit_parts(value);
+        assert_eq!(
+            summary,
+            vec!["85% left (2h 10m reset)", "40% left (3d reset)"]
+        );
     }
 }

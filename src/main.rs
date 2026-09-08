@@ -5,6 +5,7 @@ mod codex_auth;
 mod config;
 mod events;
 mod mcp;
+mod prompts;
 mod session;
 mod tools;
 mod ui;
@@ -508,7 +509,8 @@ async fn run_headless_jsonl(
             | AppEvent::Paste(_)
             | AppEvent::Key(_)
             | AppEvent::Mouse(_)
-            | AppEvent::Resize(_, _) => {}
+            | AppEvent::Resize(_, _)
+            | AppEvent::ProviderUsageFetched(_) => {}
         }
         if final_status == "error" {
             break;
@@ -615,7 +617,8 @@ async fn run_text_generation(
             | AppEvent::Paste(_)
             | AppEvent::Key(_)
             | AppEvent::Mouse(_)
-            | AppEvent::Resize(_, _) => {}
+            | AppEvent::Resize(_, _)
+            | AppEvent::ProviderUsageFetched(_) => {}
         }
 
         if saw_finished
@@ -797,7 +800,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(config, api_key);
     let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
     for tool in mcp_tools {
-        app.tool_registry.register(tool);
+        app.tool_registry.register_with_descriptor(
+            tool,
+            tools::ToolDescriptor::lazy(
+                tools::ToolCategory::Integrations,
+                tools::ToolRisk::ExternalSideEffect,
+            ),
+        );
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     app.prefetch_models(tx.clone());
@@ -829,11 +838,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Main TUI Event Loop (60 FPS redraw decoupled from background I/O)
     let mut render_interval = tokio::time::interval(Duration::from_millis(16)); // ~60fps
+    let mut usage_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
         tokio::select! {
             _ = render_interval.tick() => {
                 terminal.draw(|f| ui::render(&app, f))?;
+            }
+            _ = usage_interval.tick() => {
+                // Clone the current client at refresh time so provider switches
+                // do not leave the status bar querying the previous provider.
+                let usage_client = app.client.clone();
+                let usage_tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = usage_tx.send(AppEvent::ProviderUsageFetched(usage_client.usage_summary().await));
+                });
             }
             Some(app_event) = rx.recv() => {
                 let mut current_event = app_event;
@@ -885,6 +904,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     AppEvent::SystemNotification(msg) => {
                         app.add_message("system", msg);
+                    }
+                    AppEvent::ProviderUsageFetched(result) => {
+                        app.provider_limits = result.ok();
                     }
                     AppEvent::ModelsFetched { result, interactive } => {
                         match result {
@@ -968,6 +990,31 @@ fn handle_key_event(
     // blocks; bracketed paste events below handle normal text paste.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
         app.clipboard_paste();
+        return;
+    }
+
+    if app.show_permissions_modal {
+        match key.code {
+            KeyCode::Esc => {
+                app.show_permissions_modal = false;
+                app.set_status("Using current tool permission defaults.");
+            }
+            KeyCode::Up => {
+                app.permissions_selected = app.permissions_selected.saturating_sub(1);
+                app.modal_scroll = 0;
+            }
+            KeyCode::Down => {
+                app.permissions_selected = (app.permissions_selected + 1)
+                    .min(config::TOOL_PERMISSION_GROUPS.len().saturating_sub(1));
+                app.modal_scroll = 0;
+            }
+            KeyCode::Left => app.cycle_permission_mode(true),
+            KeyCode::Right | KeyCode::Char(' ') => app.cycle_permission_mode(false),
+            KeyCode::PageUp => app.modal_scroll = app.modal_scroll.saturating_sub(6),
+            KeyCode::PageDown => app.modal_scroll = app.modal_scroll.saturating_add(6),
+            KeyCode::Enter => app.finish_permission_setup(),
+            _ => {}
+        }
         return;
     }
 

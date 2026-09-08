@@ -198,7 +198,7 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     if !app.current_response_buffer.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Gemini (Streaming)... ",
+            format!("{} (Streaming)... ", app.config.model),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

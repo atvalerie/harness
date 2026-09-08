@@ -199,7 +199,7 @@ async fn agent_loop(
             system_instruction: Some(Content {
                 role: Some("system".to_string()),
                 parts: vec![Part::Text {
-                    text: "You are a focused subagent inside the Holiday developer application. Work only on the assigned task, be concise, state assumptions, and return a useful report for the parent agent. You do not have permission to mutate files or execute host commands.".to_string(),
+                    text: crate::prompts::SUBAGENT.to_string(),
                     thought: None,
                 }],
             }),
@@ -334,7 +334,7 @@ impl crate::tools::Tool for AgentTool {
 
     fn description(&self) -> &'static str {
         match self.kind {
-            AgentToolKind::Spawn => "Starts a focused in-process research or review subagent. It returns immediately with an agent id.",
+            AgentToolKind::Spawn => "Starts a focused analysis subagent with no tools or independent repository/web access. Supply the task, relevant excerpts, evidence, and constraints. Returns immediately with an agent id.",
             AgentToolKind::Status => "Lists in-process subagents and their compact latest result.",
             AgentToolKind::Message => "Sends a follow-up instruction to an existing subagent.",
             AgentToolKind::Inspect => "Reads the bounded latest report from an existing subagent.",
@@ -346,7 +346,7 @@ impl crate::tools::Tool for AgentTool {
         match self.kind {
             AgentToolKind::Spawn => json!({
                 "type":"object",
-                "properties":{"task":{"type":"string","description":"Focused task for the subagent"}},
+                "properties":{"task":{"type":"string","description":"Focused task plus necessary source excerpts, evidence, and constraints; the subagent cannot inspect files or access parent context independently"}},
                 "required":["task"]
             }),
             AgentToolKind::Status => json!({"type":"object","properties":{}}),
@@ -372,6 +372,9 @@ impl crate::tools::Tool for AgentTool {
         crate::tools::ToolPreview {
             title: self.description().to_string(),
             details: vec![args.to_string()],
+            reason: None,
+            expected_effect: None,
+            command: None,
             diff_hunks: Vec::new(),
             is_mutation: false,
         }

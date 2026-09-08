@@ -26,7 +26,7 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Executes a host shell command in the current working directory. Directory changes persist for later tools in this session. On Windows, shell may be auto, powershell, or cmd; auto prefers PowerShell."
+        "Executes a host shell command in the current working directory for builds, tests, git, scripts, or necessary host execution. Use edit_file/write_file for workspace changes instead of shell editing. Directory changes persist for later tools. On Windows, shell may be auto, powershell, or cmd; auto prefers PowerShell."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -35,7 +35,15 @@ impl Tool for RunCommandTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The exact shell command to execute"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Briefly explain why this command is needed"
+                },
+                "expected_effect": {
+                    "type": "string",
+                    "description": "Describe what the command is expected to do"
                 },
                 "shell": {
                     "type": "string",
@@ -70,15 +78,29 @@ impl Tool for RunCommandTool {
             .unwrap_or("<missing command>");
         let shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("auto");
         let cwd = working_dir_path(&self.cwd).display().to_string();
+        let reason = args
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from);
+        let expected_effect = args
+            .get("expected_effect")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from);
 
         ToolPreview {
             title: "Run Shell Command".to_string(),
             details: vec![
-                format!("Command: {}", command),
                 format!("Shell: {}", shell),
                 format!("Working Dir: {}", cwd),
                 "Risk: Executes arbitrary code on host system".to_string(),
             ],
+            reason,
+            expected_effect,
+            command: Some(command.to_string()),
             diff_hunks: Vec::new(),
             is_mutation: true,
         }
@@ -173,6 +195,7 @@ impl Tool for RunCommandTool {
         let (stdout, discovered_cwd) = split_cwd_marker(&raw_stdout);
         if let Some(next_dir) = discovered_cwd {
             if next_dir.is_dir() {
+                let next_dir = next_dir.canonicalize().unwrap_or(next_dir);
                 if let Ok(mut cwd) = self.cwd.lock() {
                     *cwd = next_dir;
                 }
@@ -275,7 +298,9 @@ fn split_cwd_marker(stdout: &str) -> (String, Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bounded_output, split_cwd_marker};
+    use super::{format_bounded_output, split_cwd_marker, RunCommandTool};
+    use crate::tools::{new_working_dir, Tool};
+    use serde_json::json;
 
     #[test]
     fn extracts_persistent_directory_without_leaking_marker() {
@@ -291,5 +316,46 @@ mod tests {
         assert!(bounded.contains("0123"));
         assert!(bounded.contains("89"));
         assert!(bounded.contains("tail preserved"));
+    }
+
+    #[test]
+    fn preview_preserves_multiline_command_and_explanations() {
+        let tool = RunCommandTool::new(new_working_dir());
+        let preview = tool.generate_preview(&json!({
+            "command": "echo one\necho two",
+            "reason": "Check both outputs",
+            "expected_effect": "Prints two lines"
+        }));
+
+        assert_eq!(preview.command.as_deref(), Some("echo one\necho two"));
+        assert_eq!(preview.reason.as_deref(), Some("Check both outputs"));
+        assert_eq!(preview.expected_effect.as_deref(), Some("Prints two lines"));
+        assert!(!preview
+            .details
+            .iter()
+            .any(|detail| detail.starts_with("Command:")));
+    }
+
+    #[test]
+    fn preview_keeps_missing_explanations_compatible() {
+        let tool = RunCommandTool::new(new_working_dir());
+        let preview = tool.generate_preview(&json!({"command": "echo hello"}));
+
+        assert!(preview.reason.is_none());
+        assert!(preview.expected_effect.is_none());
+        assert_eq!(preview.command.as_deref(), Some("echo hello"));
+    }
+
+    #[test]
+    fn preview_trims_explanations_and_ignores_whitespace_only_values() {
+        let tool = RunCommandTool::new(new_working_dir());
+        let preview = tool.generate_preview(&json!({
+            "command": "echo hello",
+            "reason": "  Explain this  ",
+            "expected_effect": "   "
+        }));
+
+        assert_eq!(preview.reason.as_deref(), Some("Explain this"));
+        assert!(preview.expected_effect.is_none());
     }
 }

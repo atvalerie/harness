@@ -13,6 +13,79 @@ const CODEX_REFRESH_USER: &str = "codex_refresh_token";
 const CODEX_ACCOUNT_USER: &str = "codex_account_id";
 const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
+pub const TOOL_PERMISSION_GROUPS: &[(&str, &str)] = &[
+    ("read_only", "Read-only inspection"),
+    ("workspace_write", "Workspace writes and moves"),
+    ("destructive", "Permanent deletion"),
+    ("host_execution", "Shell and host execution"),
+    ("external_side_effect", "MCP and external services"),
+    ("agent_control", "Subagent lifecycle and messaging"),
+    ("session_state", "In-session state"),
+];
+
+pub fn tool_permission_description(group: &str) -> &'static str {
+    match group {
+        "read_only" => {
+            "Inspects files, directories, metadata, repository matches, and web pages without changing the workspace."
+        }
+        "workspace_write" => {
+            "Creates, edits, writes, moves, or renames workspace files and directories."
+        }
+        "destructive" => {
+            "Permanently deletes files or directories. These operations have no built-in undo."
+        }
+        "host_execution" => {
+            "Runs shell commands on the host. Commands may modify files, start processes, or affect systems outside the project."
+        }
+        "external_side_effect" => {
+            "Calls MCP and other integration tools. Effects depend on the connected server or service."
+        }
+        "agent_control" => {
+            "Starts, stops, inspects, and sends messages to subagents."
+        }
+        "session_state" => {
+            "Updates Holiday session state such as todos; it does not directly modify host files."
+        }
+        _ => "Tools in this group require an explicit policy before execution.",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    Ask,
+    Allow,
+    Deny,
+}
+
+impl PermissionMode {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "allow" => Self::Allow,
+            "deny" => Self::Deny,
+            _ => Self::Ask,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn cycle(self, reverse: bool) -> Self {
+        match (self, reverse) {
+            (Self::Ask, false) => Self::Allow,
+            (Self::Allow, false) => Self::Deny,
+            (Self::Deny, false) => Self::Ask,
+            (Self::Ask, true) => Self::Deny,
+            (Self::Deny, true) => Self::Allow,
+            (Self::Allow, true) => Self::Ask,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CodexAuth {
     pub access_token: String,
@@ -91,7 +164,11 @@ pub struct AppConfig {
     pub max_retries: u32,
     pub thinking_budget: i32,
     pub temperature: f32,
+    /// Optional user customization appended to maintained harness instructions.
+    #[serde(default)]
     pub system_instruction: String,
+    #[serde(default)]
+    pub prompt_config_version: u32,
     #[serde(default = "default_provider_configs")]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -110,19 +187,32 @@ pub struct AppConfig {
     pub session_name: String,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    #[serde(default = "default_tool_permissions")]
+    pub tool_permissions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub permissions_configured: bool,
+    #[serde(default = "default_status_bar_position")]
+    pub status_bar_position: String,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            provider: default_provider(),
-            base_url: None,
-            model: DEFAULT_GEMINI_MODEL.to_string(),
-            fallback_models: default_fallback_models(),
-            max_retries: default_max_retries(),
-            thinking_budget: 1024,
-            temperature: 0.7,
-            system_instruction: "You are an expert autonomous developer and coding assistant running in the Gemini TUI Holiday.\n\n\
+// Exact historical default: only known generated text is removed during migration.
+const LEGACY_SYSTEM_INSTRUCTION: &str = "You are an expert autonomous developer and coding assistant running in the Gemini TUI Holiday.\n\n\
+You have direct access to native tools for filesystem inspection, safe command execution, and live web grounding:\n\
+- `web_search(query)`: Query the live internet using DuckDuckGo HTML Lite to look up current documentation, breaking news, libraries, or release notes.\n\
+- `web_fetch(url)`: Fetch and extract clean article text and code from web pages.\n\
+- `search_files(query, path, glob)`: Search the repository with ripgrep and return bounded file/line matches.\n\
+- `read_file(path)`: Inspect an existing text file with bounded line ranges.\n\
+- `list_directory(path, depth, max_entries)`: Inspect a bounded directory tree without shell commands.\n\
+- `stat_path(path)`: Inspect file or directory metadata without shell commands.\n\
+- `write_file(path, content)`: Propose file writes and edits. Holiday automatically generates unified diffs for the user to review in an interactive HITL modal.\n\
+- `run_command(command)`: Run host shell commands. Always preview the exact command before requesting execution.\n\n\
+Operational Guidelines:\n\
+1. Proactively use `web_search` and `web_fetch` whenever you need up-to-date documentation or external facts.\n\
+2. Prioritize reading relevant files before modifying them.\n\
+3. Use `read_file` for source and text inspection, using its optional `start_line` and `max_lines` for bounded chunks. Do not emulate file reads with `run_command`, `type`, `Get-Content`, `findstr`, or line-count probes.\n\
+4. Use `run_command` for actual execution such as builds, tests, git, and scripts. Its working directory persists after `cd` or `Set-Location`; use its optional `shell` field when a specific shell is required.\n\
+5. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.";
+const PREVIOUS_SYSTEM_INSTRUCTION: &str = "You are an expert autonomous developer and coding assistant running in the Gemini TUI Holiday.\n\n\
 You have direct access to native tools for filesystem inspection, safe command execution, and live web grounding:\n\
 - `web_search(query)`: Query the live internet using DuckDuckGo HTML Lite to look up current documentation, breaking news, libraries, or release notes.\n\
 - `web_fetch(url)`: Fetch and extract clean article text and code from web pages.\n\
@@ -135,7 +225,22 @@ Operational Guidelines:\n\
 2. Prioritize reading relevant files before modifying them.\n\
 3. Use `read_file` for source and text inspection, using its optional `start_line` and `max_lines` for bounded chunks. Do not emulate file reads with `run_command`, `type`, `Get-Content`, `findstr`, or line-count probes.\n\
 4. Use `run_command` for actual execution such as builds, tests, git, and scripts. Its working directory persists after `cd` or `Set-Location`; use its optional `shell` field when a specific shell is required.\n\
-5. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.".to_string(),
+5. Explain your thinking concisely. Be accurate, pragmatic, and write clean, production-ready code.";
+const LEGACY_DIRECTORY_GUIDANCE: &str = "\n- Use `list_directory(path, depth, max_entries)` for bounded directory exploration and `stat_path(path)` for metadata; paths are resolved from the project working directory.";
+const PROMPT_CONFIG_VERSION: u32 = 1;
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            base_url: None,
+            model: DEFAULT_GEMINI_MODEL.to_string(),
+            fallback_models: default_fallback_models(),
+            max_retries: default_max_retries(),
+            thinking_budget: 1024,
+            temperature: 0.7,
+            system_instruction: String::new(),
+            prompt_config_version: PROMPT_CONFIG_VERSION,
             providers: default_provider_configs(),
             model_profiles: BTreeMap::new(),
             last_models: BTreeMap::new(),
@@ -144,6 +249,9 @@ Operational Guidelines:\n\
             todo_change_mode: default_todo_change_mode(),
             session_name: "default".to_string(),
             mcp_servers: BTreeMap::new(),
+            tool_permissions: default_tool_permissions(),
+            permissions_configured: false,
+            status_bar_position: default_status_bar_position(),
         }
     }
 }
@@ -183,6 +291,26 @@ fn default_true() -> bool {
 }
 fn default_session_name() -> String {
     "default".to_string()
+}
+
+fn default_status_bar_position() -> String {
+    "top".to_string()
+}
+
+fn default_tool_permissions() -> BTreeMap<String, String> {
+    TOOL_PERMISSION_GROUPS
+        .iter()
+        .map(|(key, _)| {
+            (
+                (*key).to_string(),
+                if *key == "read_only" || *key == "session_state" {
+                    "allow".to_string()
+                } else {
+                    "ask".to_string()
+                },
+            )
+        })
+        .collect()
 }
 
 fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
@@ -251,6 +379,22 @@ fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
 }
 
 impl AppConfig {
+    pub fn status_bar_at_bottom(&self) -> bool {
+        self.status_bar_position.eq_ignore_ascii_case("bottom")
+    }
+
+    pub fn permission_mode_for(&self, group: &str) -> PermissionMode {
+        self.tool_permissions
+            .get(group)
+            .map(|mode| PermissionMode::parse(mode))
+            .unwrap_or(PermissionMode::Ask)
+    }
+
+    pub fn set_permission_mode(&mut self, group: &str, mode: PermissionMode) {
+        self.tool_permissions
+            .insert(group.to_string(), mode.as_str().to_string());
+    }
+
     pub fn active_provider_config(&self) -> ProviderConfig {
         self.providers
             .get(&self.provider)
@@ -332,7 +476,7 @@ impl AppConfig {
                     if let Ok(cfg) = serde_json::from_str::<AppConfig>(&content) {
                         let cfg = Self::migrate_legacy_gemini_defaults(cfg);
                         let cfg = Self::with_builtin_providers(cfg);
-                        return Self::with_tool_guidance(cfg);
+                        return Self::migrate_prompt_config(cfg);
                     }
                 }
             }
@@ -340,21 +484,21 @@ impl AppConfig {
         Self::default()
     }
 
-    fn with_tool_guidance(mut config: Self) -> Self {
-        const MARKER: &str = "Use `read_file` for source and text inspection";
-        if !config.system_instruction.contains(MARKER) {
-            config.system_instruction.push_str(
-                "\n\nTool selection rules:\n\
-- Use `read_file` for source and text inspection. Request `start_line` and `max_lines` when you need a bounded chunk; do not use shell commands to print files or count lines.\n\
-- Use `search_files` for repository-wide pattern searches; use `run_command` for builds, tests, git, and commands that must execute.\n\
-- Use `run_command` for builds, tests, git, and other commands that must execute. Its working directory is persistent across tool calls, so `cd` and `Set-Location` affect subsequent tools.\n\
-- `run_command` accepts an optional `shell` of `auto`, `powershell`, or `cmd` on Windows; leave it as `auto` unless syntax requires a specific shell.",
+    fn migrate_prompt_config(mut config: Self) -> Self {
+        if config.prompt_config_version < PROMPT_CONFIG_VERSION {
+            // Preserve customized legacy text verbatim rather than guessing which
+            // paragraphs belong to the user. Never strip based on a substring.
+            let previous_with_directory_guidance = format!(
+                "{}{}",
+                PREVIOUS_SYSTEM_INSTRUCTION, LEGACY_DIRECTORY_GUIDANCE
             );
-        }
-        if !config.system_instruction.contains("search_files(query") {
-            config.system_instruction.push_str(
-                "\n- Use `search_files(query, path, glob)` for repository-wide searches instead of shell pipelines.",
-            );
+            if config.system_instruction == LEGACY_SYSTEM_INSTRUCTION
+                || config.system_instruction == PREVIOUS_SYSTEM_INSTRUCTION
+                || config.system_instruction == previous_with_directory_guidance
+            {
+                config.system_instruction.clear();
+            }
+            config.prompt_config_version = PROMPT_CONFIG_VERSION;
         }
         config
     }
@@ -590,14 +734,69 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_fallback_models, AppConfig, ProviderConfig};
+    use super::{default_fallback_models, AppConfig, PermissionMode, ProviderConfig};
+    use super::{LEGACY_SYSTEM_INSTRUCTION, PROMPT_CONFIG_VERSION};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn prompt_migration_preserves_customization_and_is_idempotent() {
+        let mut legacy = AppConfig::default();
+        legacy.prompt_config_version = 0;
+        legacy.system_instruction = LEGACY_SYSTEM_INSTRUCTION.to_string();
+        let migrated = AppConfig::migrate_prompt_config(legacy.clone());
+        assert!(migrated.system_instruction.is_empty());
+        assert_eq!(migrated.prompt_config_version, PROMPT_CONFIG_VERSION);
+        let again = AppConfig::migrate_prompt_config(migrated);
+        assert!(again.system_instruction.is_empty());
+
+        for known in [
+            super::PREVIOUS_SYSTEM_INSTRUCTION.to_string(),
+            format!(
+                "{}{}",
+                super::PREVIOUS_SYSTEM_INSTRUCTION,
+                super::LEGACY_DIRECTORY_GUIDANCE
+            ),
+        ] {
+            let mut previous = legacy.clone();
+            previous.system_instruction = known;
+            assert!(AppConfig::migrate_prompt_config(previous)
+                .system_instruction
+                .is_empty());
+        }
+
+        legacy.system_instruction.push_str("\nCustom instruction.");
+        let custom = AppConfig::migrate_prompt_config(legacy.clone());
+        assert_eq!(custom.system_instruction, legacy.system_instruction);
+        let serialized = serde_json::to_string(&custom).unwrap();
+        let restored: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            AppConfig::migrate_prompt_config(restored).system_instruction,
+            legacy.system_instruction
+        );
+
+        let mut old_json = serde_json::to_value(AppConfig::default()).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("prompt_config_version");
+        old_json["system_instruction"] = serde_json::json!(LEGACY_SYSTEM_INSTRUCTION);
+        let old_config: AppConfig = serde_json::from_value(old_json).unwrap();
+        assert!(AppConfig::migrate_prompt_config(old_config)
+            .system_instruction
+            .is_empty());
+    }
 
     #[test]
     fn defaults_target_free_tier_models() {
         let config = AppConfig::default();
         assert_eq!(config.model, "gemini-3.5-flash-lite");
         assert_eq!(config.fallback_models, default_fallback_models());
+        assert_eq!(config.status_bar_position, "top");
+        assert!(!config.status_bar_at_bottom());
+
+        let mut bottom = config;
+        bottom.status_bar_position = "bottom".to_string();
+        assert!(bottom.status_bar_at_bottom());
     }
 
     #[test]
@@ -656,5 +855,37 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert_eq!(config.effective_fallback_models(), vec!["llama3.2:3b"]);
+    }
+
+    #[test]
+    fn permission_defaults_are_conservative() {
+        let config = AppConfig::default();
+        assert!(!config.permissions_configured);
+        assert_eq!(
+            config.permission_mode_for("read_only"),
+            PermissionMode::Allow
+        );
+        assert_eq!(
+            config.permission_mode_for("host_execution"),
+            PermissionMode::Ask
+        );
+        assert_eq!(
+            config.permission_mode_for("destructive"),
+            PermissionMode::Ask
+        );
+        assert_eq!(config.permission_mode_for("unknown"), PermissionMode::Ask);
+    }
+
+    #[test]
+    fn permission_modes_round_trip() {
+        let mut config = AppConfig::default();
+        config.set_permission_mode("host_execution", PermissionMode::Deny);
+        assert_eq!(
+            config.permission_mode_for("host_execution"),
+            PermissionMode::Deny
+        );
+        assert_eq!(PermissionMode::Ask.cycle(false), PermissionMode::Allow);
+        assert_eq!(PermissionMode::Allow.cycle(false), PermissionMode::Deny);
+        assert_eq!(PermissionMode::Deny.cycle(true), PermissionMode::Allow);
     }
 }

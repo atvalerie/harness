@@ -2,7 +2,7 @@ use crate::client::types::{
     Content, GenerationConfig, InlineDataPayload, Part, SafetySetting, ThinkingConfig,
 };
 use crate::client::{AiClient, ProviderKind};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, PermissionMode, TOOL_PERMISSION_GROUPS};
 use crate::events::{AppEvent, StreamSignal};
 use crate::session::{self, SessionSnapshot, UsageRecord};
 use crate::tools::{ToolPreview, ToolRegistry};
@@ -125,6 +125,8 @@ pub struct App {
     pub thinking_target_model: Option<String>,
     pub show_plan_modal: bool,
     pub plan_modal_selected: usize,
+    pub show_permissions_modal: bool,
+    pub permissions_selected: usize,
     pub show_sessions_modal: bool,
     pub available_sessions: Vec<session::SessionInfo>,
     pub sessions_selected: usize,
@@ -134,6 +136,9 @@ pub struct App {
     pub stream_start_time: Option<std::time::Instant>,
     pub candidate_chunks_count: u32,
     pub current_tps: f64,
+
+    // Provider account limits shown in the status bar
+    pub provider_limits: Option<String>,
 
     // Status bar notification
     pub status_message: Option<String>,
@@ -186,7 +191,16 @@ fn discover_project_context(start: &Path) -> (Option<PathBuf>, String) {
     }
     ancestors.reverse();
 
-    let mut root = None;
+    let project_root = ancestors
+        .iter()
+        .rev()
+        .find(|directory| {
+            directory.join("Cargo.toml").is_file()
+                || directory.join(".git").exists()
+                || directory.join("package.json").is_file()
+        })
+        .cloned();
+    let mut root = project_root.clone();
     let mut instructions = Vec::new();
     for directory in ancestors {
         for file_name in ["AGENTS.md", "CLAUDE.md"] {
@@ -335,6 +349,69 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn request_uses_maintained_prompt_and_sys_only_changes_customization() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.project_instructions = "Project convention: use tabs.".to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_slash_command("/sys Respond in Polish.", tx.clone());
+        app.plan_mode = true;
+        let request = app.build_request();
+        let system = request.system_instruction.unwrap();
+        let Part::Text { text, .. } = &system.parts[0] else {
+            panic!("missing system text")
+        };
+        assert!(text.starts_with(crate::prompts::MAIN.trim()));
+        assert!(text.contains("Respond in Polish."));
+        assert!(text.contains("Project convention: use tabs."));
+        assert!(text.ends_with(crate::prompts::PLAN.trim()));
+        app.handle_slash_command("/sys --clear", tx);
+        assert!(app.config.system_instruction.is_empty());
+        assert!(app
+            .effective_system_instruction()
+            .starts_with(crate::prompts::MAIN.trim()));
+    }
+
+    #[test]
+    fn compaction_preserves_attachment_evidence_and_rejects_empty_summary() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.add_message_with_attachments(
+            "user",
+            "Review this",
+            vec![
+                Attachment {
+                    kind: "text".into(),
+                    name: "source.rs".into(),
+                    mime_type: None,
+                    text: Some("fn supplied_code() {}".into()),
+                    data: None,
+                },
+                Attachment {
+                    kind: "image".into(),
+                    name: "screen.png".into(),
+                    mime_type: Some("image/png".into()),
+                    text: None,
+                    data: Some("IMAGE_PAYLOAD_SHOULD_NOT_BE_COPIED".into()),
+                },
+            ],
+        );
+        app.add_message("thought", "PRIVATE_REASONING");
+        let transcript = super::compaction_transcript(&app.messages);
+        assert!(transcript.contains("fn supplied_code() {}"));
+        assert!(transcript.contains("screen.png"));
+        assert!(!transcript.contains("IMAGE_PAYLOAD_SHOULD_NOT_BE_COPIED"));
+        assert!(!transcript.contains("PRIVATE_REASONING"));
+        for line in transcript.lines() {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
+        }
+        let original = app.messages[0].content.clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_compaction_result(Ok("  ".into()), tx);
+        assert_eq!(app.messages[0].content, original);
+        assert_eq!(app.messages[0].attachments.len(), 2);
+        assert!(!app.messages.iter().any(|message| message.role == "summary"));
     }
 
     #[test]
@@ -491,8 +568,12 @@ impl App {
             config.max_retries,
         );
         let session_path = session::new_session_path(&config.session_name);
-        let working_dir = tool_registry.working_dir();
-        let (project_root, project_instructions) = discover_project_context(&working_dir);
+        let show_permissions_modal = !config.permissions_configured;
+        let initial_working_dir = tool_registry.working_dir();
+        let (project_root, project_instructions) = discover_project_context(&initial_working_dir);
+        if let Some(root) = &project_root {
+            let _ = tool_registry.set_working_dir(root.clone());
+        }
 
         Self {
             config,
@@ -537,6 +618,8 @@ impl App {
             thinking_target_model: None,
             show_plan_modal: false,
             plan_modal_selected: 0,
+            show_permissions_modal,
+            permissions_selected: 0,
             show_sessions_modal: false,
             available_sessions: Vec::new(),
             sessions_selected: 0,
@@ -544,6 +627,7 @@ impl App {
             stream_start_time: None,
             candidate_chunks_count: 0,
             current_tps: 0.0,
+            provider_limits: None,
             status_message: Some("Ready".to_string()),
             should_quit: false,
             pending_generation_after_compaction: false,
@@ -629,26 +713,11 @@ impl App {
     }
 
     fn effective_system_instruction(&self) -> String {
-        let mut instruction = self.config.system_instruction.clone();
-        if !self.project_instructions.is_empty() {
-            instruction.push_str(&format!(
-                "\n\nProject instructions loaded from {}:\n{}",
-                self.project_root
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "the current project".to_string()),
-                self.project_instructions
-            ));
-        }
-        instruction.push_str(
-            "\n\nTool discovery: core tools are available directly. Specialized and MCP tools may be hidden to save context; call search_tools with a short purpose query when the core tools are insufficient. Matching tools become available on the next turn.",
-        );
-        if self.plan_mode {
-            instruction.push_str(
-                "\n\nPLAN MODE: inspect and reason about the task, maintain the todo list, and propose changes. Do not mutate files, execute commands, or make external changes. When the plan is ready, format it with a `## Plan` heading followed by numbered steps. The user can approve it with /plan off, which will begin execution; otherwise continue planning when asked.",
-           );
-        }
-        instruction
+        crate::prompts::compose(
+            &self.config.system_instruction,
+            &self.project_instructions,
+            self.plan_mode,
+        )
     }
     pub fn selected_model_id(&self) -> Option<String> {
         self.filtered_model_indices()
@@ -719,6 +788,24 @@ impl App {
             );
             let _ = self.flush_session();
             self.trigger_generation(tx);
+        }
+    }
+
+    pub fn cycle_permission_mode(&mut self, reverse: bool) {
+        let Some((group, _)) = TOOL_PERMISSION_GROUPS.get(self.permissions_selected) else {
+            return;
+        };
+        let current = self.config.permission_mode_for(group);
+        self.config
+            .set_permission_mode(group, current.cycle(reverse));
+    }
+
+    pub fn finish_permission_setup(&mut self) {
+        self.config.permissions_configured = true;
+        self.show_permissions_modal = false;
+        match self.config.save() {
+            Ok(()) => self.set_status("Tool permissions saved."),
+            Err(error) => self.set_status(format!("Could not save tool permissions: {}", error)),
         }
     }
 
@@ -1418,7 +1505,7 @@ impl App {
                     - /provider <name> : Select a configured provider\n\
                     - /baseurl <url|default> : Set the active provider base URL\n\
                     - /config <path|open|dir> : Inspect or open the active config file\n\
-                    - /model <name> : Switch active model (e.g. /model gemini-3.5-flash-lite)\n\
+                    - /model <name> : Switch active model (for example, gpt-4o-mini)\n\
                     - /thinking [off|low|medium|high|xhigh|max] : Open the model-aware thinking picker\n\
                     - /reasoning [on|off|low|medium|high|xhigh|max] : Set reasoning effort for the active model\n\
                     - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
@@ -1432,6 +1519,7 @@ impl App {
                     - /todos : Show the current task list\n\
                     - /todo <add|done|remove|clear|mode> ... : Update tasks or choose next/force updates\n\
                     - /agents : Show in-process subagent status\n\
+                    - /permissions : Configure automatic tool permission policies\n\
                     - /attachments : List draft attachment blocks\n\
                     - /attach <path> : Attach a text file or image\n\
                     - /remove <n> : Remove a draft attachment block\n\
@@ -1442,7 +1530,7 @@ impl App {
                     - /retry : Retry the last user request\n\
                     - /fork : Save the current conversation as a new session\n\
                     - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
-                    - /sys <instruction> : Update system prompt\n\
+                    - /sys [instruction|--clear] : Show effective prompt or update/clear customization\n\
                     - /key <api_key> : Save the active provider API key\n\
                     - /copy : Copy last assistant response to system clipboard (or Ctrl+Y)\n\
                     - /clear or /new : Clear conversation history and start fresh\n\
@@ -1603,6 +1691,7 @@ impl App {
                     if let Some(api_key) = self.config.get_api_key_for_active_provider() {
                         self.client.update_api_key(api_key);
                     }
+                    self.provider_limits = None;
                     self.set_status(format!("Provider set to {}", self.config.provider));
                     self.add_message(
                         "system",
@@ -1905,12 +1994,19 @@ impl App {
                 if arg.is_empty() {
                     self.add_message(
                         "system",
-                        format!("Current system prompt:\n{}", self.config.system_instruction),
+                        format!(
+                            "Effective system prompt:\n{}",
+                            self.effective_system_instruction()
+                        ),
                     );
                 } else {
-                    self.config.system_instruction = arg.to_string();
-                    self.set_status("System instruction updated");
-                    self.add_message("system", "System instruction updated.");
+                    self.config.system_instruction = if arg == "--clear" {
+                        String::new()
+                    } else {
+                        arg.to_string()
+                    };
+                    self.set_status("System customization updated");
+                    self.add_message("system", "System customization updated. Built-in guidance remains active. Use /save to persist.");
                 }
             }
             "/key" => {
@@ -2091,10 +2187,16 @@ impl App {
             "/tools" => {
                 let all_tools = self.tool_registry.names();
                 let discovered = self.tool_registry.discovered_tools();
+                let metrics = self.tool_registry.context_metrics();
                 self.add_message(
                     "system",
                     format!(
-                        "Registered tools ({}):\n- {}\n\nDiscovered hidden tools for this session ({}):\n- {}",
+                        "Tool schema context: {} active / {} registered, ~{} chars (~{} tokens), {} discovered.\n\nRegistered tools ({}):\n- {}\n\nDiscovered optional tools for this session ({}):\n- {}",
+                        metrics.active_tools,
+                        metrics.registered_tools,
+                        metrics.estimated_schema_chars,
+                        metrics.estimated_schema_tokens,
+                        metrics.discovered_tools,
                         all_tools.len(),
                         all_tools.join("\n- "),
                         discovered.len(),
@@ -2105,6 +2207,11 @@ impl App {
                         }
                     ),
                 );
+            }
+            "/permissions" => {
+                self.show_permissions_modal = true;
+                self.permissions_selected = 0;
+                self.modal_scroll = 0;
             }
             "/attachments" => {
                 if self.draft_attachments.is_empty() {
@@ -2376,7 +2483,7 @@ impl App {
                 args,
                 thought_signature,
             } => {
-                // Gemini may omit a tool-call id, but the OpenAI Responses and
+                // The native provider may omit a tool-call id, but the OpenAI Responses and
                 // Chat Completions protocols require one. Normalize at the
                 // boundary so every provider gets a stable correlation key.
                 let id = Some(id.unwrap_or_else(|| {
@@ -2417,6 +2524,8 @@ impl App {
 
                 if let Some(tool) = self.tool_registry.get(&name) {
                     let preview = tool.generate_preview(&args);
+                    let permission_group = self.tool_registry.permission_group(&name);
+                    let permission_mode = self.config.permission_mode_for(permission_group);
 
                     if self.plan_mode && preview.is_mutation {
                         self.add_message(
@@ -2430,7 +2539,20 @@ impl App {
                             call_id: id,
                             result: Err("Mutation blocked while plan mode is enabled.".to_string()),
                         });
-                    } else if self.session_allowed_tools.contains(&name) {
+                    } else if permission_mode == PermissionMode::Deny {
+                        self.reject_tool_call(
+                            self.stream_epoch,
+                            name,
+                            id,
+                            format!(
+                                "Tool denied by the '{}' permission policy.",
+                                permission_group
+                            ),
+                            tx,
+                        );
+                    } else if permission_mode == PermissionMode::Allow
+                        || self.session_allowed_tools.contains(&name)
+                    {
                         self.execute_tool(self.stream_epoch, name, id, args, tx);
                     } else {
                         let pending = PendingToolCall {
@@ -2566,25 +2688,39 @@ impl App {
         }
     }
 
+    fn reject_tool_call(
+        &mut self,
+        epoch: u64,
+        tool_name: String,
+        call_id: Option<String>,
+        reason: String,
+        tx: UnboundedSender<AppEvent>,
+    ) {
+        self.add_message(
+            "system",
+            format!("Denied execution of tool '{}': {}", tool_name, reason),
+        );
+        let app_tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = app_tx.send(AppEvent::ToolExecutionResult {
+                epoch,
+                tool_name,
+                call_id,
+                result: Err(reason),
+            });
+        });
+        self.state = EngineState::ExecutingTool;
+    }
+
     pub fn deny_pending_tool(&mut self, tx: UnboundedSender<AppEvent>) {
         if let Some(pending) = self.pending_tool_call.take() {
-            let rejection_result = "Execution rejected by user.".to_string();
-            self.add_message(
-                "system",
-                format!("Denied execution of tool '{}'", pending.tool_name),
+            self.reject_tool_call(
+                pending.epoch,
+                pending.tool_name,
+                pending.call_id,
+                "Execution rejected by user.".to_string(),
+                tx,
             );
-
-            // Send denial back into tool result pipeline so Gemini can adjust
-            let app_tx = tx.clone();
-            tokio::spawn(async move {
-                let _ = app_tx.send(AppEvent::ToolExecutionResult {
-                    epoch: pending.epoch,
-                    tool_name: pending.tool_name,
-                    call_id: pending.call_id,
-                    result: Err(rejection_result),
-                });
-            });
-            self.state = EngineState::ExecutingTool;
         }
     }
 
@@ -3024,20 +3160,9 @@ impl App {
             ),
         );
 
-        let mut transcript = String::new();
-        for m in &self.messages {
-            if m.role == "thought" {
-                continue;
-            }
-            transcript.push_str(&format!("{}: {}\n\n", m.role, m.content));
-        }
+        let transcript = compaction_transcript(&self.messages);
 
-        let prompt = format!(
-            "Analyze and summarize the following multi-turn coding and development conversation into a concise, high-density structured summary.\n\
-            Preserve all key decisions, file paths modified or discussed, tool outputs, technical facts, and remaining user requests or tasks.\n\n\
-            CONVERSATION TRANSCRIPT:\n{}",
-            transcript
-        );
+        let prompt = format!("Summarize this conversation for continuation.\n\nBEGIN CONVERSATION TRANSCRIPT\n{}\nEND CONVERSATION TRANSCRIPT", transcript);
 
         let request = crate::client::types::GenerateContentRequest {
             contents: vec![Content {
@@ -3050,7 +3175,7 @@ impl App {
             system_instruction: Some(Content {
                 role: Some("system".to_string()),
                 parts: vec![Part::Text {
-                    text: "You are a precise technical summarizer for developer conversations. Retain essential context and code artifacts.".to_string(),
+                    text: crate::prompts::COMPACTION.to_string(),
                     thought: None,
                 }],
             }),
@@ -3083,6 +3208,13 @@ impl App {
         result: Result<String, String>,
         tx: UnboundedSender<AppEvent>,
     ) {
+        let result = result.and_then(|summary| {
+            if summary.trim().is_empty() {
+                Err("The summarizer returned an empty handoff; history was retained.".to_string())
+            } else {
+                Ok(summary)
+            }
+        });
         match result {
             Ok(summary) => {
                 let original_count = self.messages.len();
@@ -3186,6 +3318,42 @@ async fn fetch_models(
             .collect()),
         Err(error) => Err(error),
     }
+}
+
+/// Preserve source roles and attached text, without copying image payloads or
+/// private reasoning into the summarizer's input.
+fn compaction_transcript(messages: &[ChatMessage]) -> String {
+    let mut transcript = String::new();
+    for message in messages {
+        if message.role == "thought" || message.role == "tool" {
+            continue;
+        }
+        if message.role == "system" && !message.content.starts_with("Compact History Summary:") {
+            continue;
+        }
+        let attachments = message.attachments.iter().map(|attachment| {
+            json!({
+                "kind": attachment.kind,
+                "name": attachment.name,
+                "text": attachment.text,
+                "note": if attachment.kind == "image" {
+                    Some("Image payload omitted; preserve any established findings and note if reinspection is needed.")
+                } else { None },
+            })
+        }).collect::<Vec<_>>();
+        // JSON escaping prevents pasted text from masquerading as another
+        // transcript record. The summarizer still treats all records as data.
+        transcript.push_str(
+            &json!({
+                "role": message.role,
+                "content": message.content,
+                "attachments": attachments,
+            })
+            .to_string(),
+        );
+        transcript.push('\n');
+    }
+    transcript
 }
 
 fn is_free_model_id(id: &str) -> bool {
