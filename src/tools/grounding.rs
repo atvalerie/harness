@@ -7,6 +7,8 @@ use tokio::time::{sleep, Duration};
 
 use super::{Tool, ToolPreview};
 
+const WEATHER_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct WebSearchTool;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -27,9 +29,13 @@ fn http_headers() -> HeaderMap {
 }
 
 fn build_http_client() -> Result<Client, String> {
+    build_http_client_with_timeout(HTTP_TIMEOUT)
+}
+
+fn build_http_client_with_timeout(timeout: Duration) -> Result<Client, String> {
     Client::builder()
         .default_headers(http_headers())
-        .timeout(HTTP_TIMEOUT)
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(|error| format!("Failed to build HTTP client: {}", error))
@@ -373,9 +379,191 @@ impl Tool for WebFetchTool {
     }
 }
 
+/// Direct current-weather lookup using Open-Meteo's public geocoding and
+/// forecast endpoints. This is intentionally separate from web search: a
+/// weather request should not spend a model turn discovering a generic tool
+/// or depend on search-engine snippets.
+pub struct WeatherTool;
+
+#[async_trait]
+impl Tool for WeatherTool {
+    fn name(&self) -> &'static str {
+        "weather"
+    }
+
+    fn description(&self) -> &'static str {
+        "Gets the current weather for a city or named location using a direct forecast service. No API key required."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "City or named location, such as Warsaw or Warsaw, Poland"
+                }
+            },
+            "required": ["location"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let location = args
+            .get("location")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<missing location>");
+        ToolPreview {
+            title: "Current Weather".to_string(),
+            details: vec![
+                format!("Location: {}", location),
+                "Source: Open-Meteo direct forecast lookup".to_string(),
+            ],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: false,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let location = args
+            .get("location")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Missing required parameter 'location'".to_string())?;
+
+        let client = build_http_client_with_timeout(WEATHER_TIMEOUT)?;
+        let mut geocode_url = Url::parse("https://geocoding-api.open-meteo.com/v1/search")
+            .map_err(|error| format!("Invalid weather geocoding URL: {}", error))?;
+        geocode_url
+            .query_pairs_mut()
+            .append_pair("name", location)
+            .append_pair("count", "1")
+            .append_pair("language", "en")
+            .append_pair("format", "json");
+
+        let geocode = send_with_retries(&client, &geocode_url, "Weather location lookup").await?;
+        if !geocode.status().is_success() {
+            return Err(format!(
+                "Weather location lookup returned HTTP {}",
+                geocode.status()
+            ));
+        }
+        let geocode_body: serde_json::Value = geocode
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse weather location response: {}", error))?;
+        let result = geocode_body
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|results| results.first())
+            .ok_or_else(|| format!("No weather location matched '{}'.", location))?;
+        let latitude = result
+            .get("latitude")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| "Weather location response had no latitude".to_string())?;
+        let longitude = result
+            .get("longitude")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| "Weather location response had no longitude".to_string())?;
+        let name = result
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(location);
+        let country = result
+            .get("country")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let timezone = result
+            .get("timezone")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("local time");
+
+        let mut forecast_url = Url::parse("https://api.open-meteo.com/v1/forecast")
+            .map_err(|error| format!("Invalid weather forecast URL: {}", error))?;
+        forecast_url
+            .query_pairs_mut()
+            .append_pair("latitude", &latitude.to_string())
+            .append_pair("longitude", &longitude.to_string())
+            .append_pair(
+                "current",
+                "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+            )
+            .append_pair("temperature_unit", "celsius")
+            .append_pair("wind_speed_unit", "kmh")
+            .append_pair("timezone", "auto");
+
+        let forecast = send_with_retries(&client, &forecast_url, "Weather forecast lookup").await?;
+        if !forecast.status().is_success() {
+            return Err(format!(
+                "Weather forecast lookup returned HTTP {}",
+                forecast.status()
+            ));
+        }
+        let forecast_body: serde_json::Value = forecast
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse weather forecast response: {}", error))?;
+        let current = forecast_body
+            .get("current")
+            .ok_or_else(|| "Weather forecast response had no current conditions".to_string())?;
+        let temperature = number_value(current.get("temperature_2m"), "temperature")?;
+        let apparent = number_value(
+            current.get("apparent_temperature"),
+            "feels-like temperature",
+        )?;
+        let humidity = number_value(current.get("relative_humidity_2m"), "humidity")?;
+        let wind = number_value(current.get("wind_speed_10m"), "wind speed")?;
+        let code = current
+            .get("weather_code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        let place = if country.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}, {}", name, country)
+        };
+
+        Ok(format!(
+            "Current weather for {} ({}): {:.1} °C, feels like {:.1} °C, {}, humidity {:.0}%, wind {:.1} km/h.",
+            place,
+            timezone,
+            temperature,
+            apparent,
+            weather_description(code),
+            humidity,
+            wind
+        ))
+    }
+}
+
+fn number_value(value: Option<&serde_json::Value>, field: &str) -> Result<f64, String> {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("Weather response had no {}", field))
+}
+
+fn weather_description(code: i64) -> &'static str {
+    match code {
+        0 => "clear skies",
+        1..=3 => "partly cloudy skies",
+        45 | 48 => "fog",
+        51..=57 => "drizzle",
+        61..=67 | 80..=82 => "rain",
+        71..=77 | 85..=86 => "snow",
+        95..=99 => "thunderstorms",
+        _ => "conditions not reported",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_retryable_status, looks_like_error_page, validate_http_url};
+    use super::{
+        is_retryable_status, looks_like_error_page, validate_http_url, weather_description,
+    };
     use reqwest::StatusCode;
 
     #[test]
@@ -401,6 +589,13 @@ mod tests {
         assert!(!looks_like_error_page(
             "<article><p>Markets opened higher today.</p></article>"
         ));
+    }
+
+    #[test]
+    fn weather_codes_are_summarized_for_voice() {
+        assert_eq!(weather_description(0), "clear skies");
+        assert_eq!(weather_description(61), "rain");
+        assert_eq!(weather_description(95), "thunderstorms");
     }
 }
 

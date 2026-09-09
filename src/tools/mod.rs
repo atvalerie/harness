@@ -350,6 +350,10 @@ impl ToolRegistry {
             ToolDescriptor::lazy(ToolCategory::Web, ToolRisk::ReadOnly),
         );
         reg.register_with_descriptor(
+            Arc::new(grounding::WeatherTool),
+            ToolDescriptor::lazy(ToolCategory::Web, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
             Arc::new(fs::ReadFileTool::new(reg.working_dir.clone())),
             ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
         );
@@ -602,6 +606,31 @@ impl ToolRegistry {
         }
     }
 
+    /// Activates explicitly selected lazy tools for a frontend session.
+    /// This is intentionally separate from the global registry and from the
+    /// natural-language search_tools flow, so trusted frontends can avoid an
+    /// unnecessary discovery round trip without changing normal agent usage.
+    pub fn preload_tools<I, S>(&self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let Ok(mut discovered) = self.discovered.lock() else {
+            return;
+        };
+        for name in names {
+            let name = name.as_ref();
+            if self.tools.contains_key(name)
+                && self
+                    .descriptors
+                    .get(name)
+                    .is_some_and(|descriptor| descriptor.visibility == ToolVisibility::Lazy)
+            {
+                discovered.insert(name.to_string());
+            }
+        }
+    }
+
     pub fn clear_discovered_tools(&self) {
         if let Ok(mut discovered) = self.discovered.lock() {
             discovered.clear();
@@ -830,6 +859,7 @@ mod tests {
         assert!(!names.contains(&"write_file".to_string()));
         assert!(names.contains(&"edit_file".to_string()));
         assert!(!names.contains(&"web_search".to_string()));
+        assert!(!names.contains(&"weather".to_string()));
 
         registry.discover_from_query(&serde_json::json!({"query":"patch editing"}));
         let names = declaration_names(&registry);
@@ -882,8 +912,31 @@ mod tests {
 
         registry.discover_from_query(&serde_json::json!({"query":"web"}));
         let discovered = registry.context_metrics();
-        assert_eq!(discovered.discovered_tools, 2);
+        assert_eq!(discovered.discovered_tools, 3);
         assert!(discovered.active_tools > initial.active_tools);
+    }
+
+    #[test]
+    fn explicit_preload_activates_only_requested_lazy_tools() {
+        let registry = ToolRegistry::new();
+        registry.preload_tools(["web_search"]);
+        let declarations = registry.to_gemini_declarations();
+        let names = declarations[0]
+            .function_declarations
+            .iter()
+            .map(|declaration| declaration.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"web_search"));
+        assert!(!names.contains(&"web_fetch"));
+    }
+
+    #[test]
+    fn explicit_preload_activates_weather_without_discovery() {
+        let registry = ToolRegistry::new();
+        registry.preload_tools(["weather"]);
+        let names = declaration_names(&registry);
+        assert!(names.contains(&"weather".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
     }
 
     #[test]

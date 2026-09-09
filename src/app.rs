@@ -155,6 +155,12 @@ pub struct App {
     pub session_instruction: Option<String>,
     /// Runtime-only capability declarations supplied by the active frontend.
     pub session_capabilities: Vec<FunctionDeclaration>,
+    /// Runtime-only tool profile selected by the active frontend.
+    pub session_tool_profile: Option<String>,
+    /// Runtime-only tools hidden from the active frontend session. This lets
+    /// a specialized client remove generic or expensive capabilities without
+    /// changing Holiday's global registry.
+    pub session_disabled_tools: HashSet<String>,
     pub ui_started_at: std::time::Instant,
 }
 
@@ -657,6 +663,8 @@ impl App {
             project_instructions,
             session_instruction: None,
             session_capabilities: Vec::new(),
+            session_tool_profile: None,
+            session_disabled_tools: HashSet::new(),
             ui_started_at: std::time::Instant::now(),
         }
     }
@@ -757,6 +765,28 @@ impl App {
         self.session_instruction = instruction.filter(|value| !value.trim().is_empty());
     }
 
+    /// Selects a runtime-only tool profile for the active frontend session.
+    /// Profile semantics remain frontend-owned; Holiday only preserves the
+    /// value for diagnostics and future generic policy layers.
+    pub fn set_session_tool_profile(&mut self, profile: Option<String>) {
+        self.session_tool_profile = profile.filter(|value| !value.trim().is_empty());
+    }
+
+    /// Hides selected tools from requests built for the active frontend
+    /// session. The registry remains available to other sessions and to
+    /// Holiday's normal interactive mode.
+    pub fn set_session_disabled_tools<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.session_disabled_tools = names
+            .into_iter()
+            .map(|name| name.as_ref().trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+    }
+
     /// Installs function declarations for this frontend session only. String
     /// entries remain accepted for protocol compatibility.
     pub fn set_session_capabilities(
@@ -800,6 +830,12 @@ impl App {
         }
         self.session_capabilities = parsed;
         Ok(())
+    }
+
+    /// Activates optional tools for this frontend session only. The global
+    /// tool registry and other sessions are unaffected.
+    pub fn preload_session_tools(&self, names: &[String]) {
+        self.tool_registry.preload_tools(names.iter());
     }
 
     pub fn is_session_capability(&self, name: &str) -> bool {
@@ -2357,6 +2393,8 @@ impl App {
         self.messages.clear();
         self.session_instruction = None;
         self.session_capabilities.clear();
+        self.session_tool_profile = None;
+        self.session_disabled_tools.clear();
         self.usage_records.clear();
         self.chat_scroll = 0;
         self.prompt_tokens = 0;
@@ -3248,6 +3286,12 @@ impl App {
         ];
 
         let mut tools = self.tool_registry.to_gemini_declarations();
+        for declaration in &mut tools {
+            declaration
+                .function_declarations
+                .retain(|tool| !self.session_disabled_tools.contains(&tool.name));
+        }
+        tools.retain(|declaration| !declaration.function_declarations.is_empty());
         if !self.session_capabilities.is_empty() {
             if let Some(declaration) = tools.first_mut() {
                 declaration

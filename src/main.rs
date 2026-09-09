@@ -1014,6 +1014,35 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .get("capabilities")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
+                let preload_tools = input
+                    .metadata
+                    .get("preload_tools")
+                    .and_then(Value::as_array)
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let tool_profile = input
+                    .metadata
+                    .get("tool_profile")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let disabled_tools = input
+                    .metadata
+                    .get("disabled_tools")
+                    .and_then(Value::as_array)
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let input_run_id = new_run_id();
                 let mut sequence = 0;
                 if session_id.is_empty() {
@@ -1028,6 +1057,7 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                     )?;
                 } else {
                     app.set_session_instruction(system_instruction);
+                    app.set_session_tool_profile(tool_profile.clone());
                     if let Err(error) = app.set_session_capabilities(&capabilities) {
                         emit_jsonl(
                             &input_run_id,
@@ -1037,6 +1067,8 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                         )?;
                         continue;
                     }
+                    app.preload_session_tools(&preload_tools);
+                    app.set_session_disabled_tools(&disabled_tools);
                     emit_jsonl(
                         &input_run_id,
                         &mut sequence,
@@ -1044,7 +1076,10 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
                         json!({
                             "status": "ok",
                             "session_id": session_id,
-                            "capabilities": capabilities
+                            "capabilities": capabilities,
+                            "preload_tools": preload_tools,
+                            "tool_profile": tool_profile,
+                            "disabled_tools": disabled_tools
                         }),
                     )?;
                 }
