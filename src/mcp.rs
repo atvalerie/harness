@@ -107,6 +107,42 @@ pub fn tool_risk(name: &str) -> ToolRisk {
     }
 }
 
+fn normalize_lightpanda_args(tool_name: &str, mut args: Value) -> Value {
+    if !tool_name.starts_with("mcp__lightpanda__") {
+        return args;
+    }
+    let Some(object) = args.as_object_mut() else {
+        return args;
+    };
+
+    // Some providers materialize optional JSON-schema fields as empty
+    // strings or zeroes. Lightpanda treats those as real arguments, which can
+    // turn an otherwise valid markdown/tree read into InvalidParams.
+    if object
+        .get("selector")
+        .and_then(Value::as_str)
+        .is_some_and(str::is_empty)
+    {
+        object.remove("selector");
+    }
+    if object
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(str::is_empty)
+        && tool_name != "mcp__lightpanda__goto"
+    {
+        object.remove("url");
+    }
+    if object
+        .get("backendNodeId")
+        .and_then(Value::as_i64)
+        .is_some_and(|value| value == 0)
+    {
+        object.remove("backendNodeId");
+    }
+    args
+}
+
 enum Transport {
     Stdio {
         _child: Child,
@@ -299,6 +335,7 @@ impl Tool for McpTool {
         }
     }
     async fn execute(&self, args: Value) -> Result<String, String> {
+        let args = normalize_lightpanda_args(&self.original_name, args);
         let result = timeout(
             Duration::from_secs(120),
             self.connection.request(
@@ -453,9 +490,11 @@ async fn connect_server(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_matching_json, provider_safe_tool_name, tool_risk, unique_provider_safe_tool_name,
+        normalize_lightpanda_args, parse_matching_json, provider_safe_tool_name, tool_risk,
+        unique_provider_safe_tool_name,
     };
     use crate::tools::ToolRisk;
+    use serde_json::json;
     use std::collections::HashSet;
 
     #[test]
@@ -504,5 +543,20 @@ mod tests {
             tool_risk("mcp__lightpanda__fill"),
             ToolRisk::ExternalSideEffect
         );
+    }
+
+    #[test]
+    fn removes_provider_generated_lightpanda_defaults() {
+        let normalized = normalize_lightpanda_args(
+            "mcp__lightpanda__markdown",
+            json!({"url":"", "selector":"", "backendNodeId":0, "maxBytes":2000}),
+        );
+        assert_eq!(normalized, json!({"maxBytes":2000}));
+
+        let goto = normalize_lightpanda_args(
+            "mcp__lightpanda__goto",
+            json!({"url":"", "waitUntil":"load"}),
+        );
+        assert_eq!(goto, json!({"url":"", "waitUntil":"load"}));
     }
 }
