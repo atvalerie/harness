@@ -206,3 +206,33 @@ properly formatted ## Plan with numbered steps and begin execution. TODOs can
 be managed by the model through the todo tool or by the user with /todo.
 Set /todo mode next or /todo mode force to either deliver user TODO changes
 on the next model turn or interrupt the current generation and apply them now.
+
+## Optional Lightpanda browser
+
+Holiday can connect to a local Lightpanda browser through its existing
+streamable HTTP MCP transport. Lightpanda is an independent browser sidecar;
+it is not a Holiday library dependency and it is not Atlas-specific.
+
+The intended Windows deployment is Lightpanda running in Arch Linux under
+WSL2 with telemetry disabled:
+
+    export LIGHTPANDA_DISABLE_TELEMETRY=true
+    lightpanda mcp --host 127.0.0.1 --port 9223
+
+Add the service to the Holiday configuration once the sidecar is running:
+
+    "lightpanda": {
+      "transport": "streamable-http",
+      "url": "http://127.0.0.1:9223/mcp",
+      "enabled": true
+    }
+
+Lightpanda tools remain optional and hidden from ordinary requests until a
+profile or tool-discovery flow activates them. Atlas should preload only a
+curated read-only browser profile for voice sessions. Clicks, form submission,
+authentication, cookies, and other state-changing browser operations must
+remain approval-gated.
+
+Lightpanda controls websites and DOMs, not native Windows applications or
+arbitrary screen pixels. The future Windows computer-automation layer is a
+separate integration.
