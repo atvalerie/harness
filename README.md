@@ -211,7 +211,9 @@ on the next model turn or interrupt the current generation and apply them now.
 
 Holiday can connect to a local Lightpanda browser through its existing
 streamable HTTP MCP transport. Lightpanda is an independent browser sidecar;
-it is not a Holiday library dependency and it is not Atlas-specific.
+it is not a Holiday library dependency and it is not Atlas-specific. The same
+MCP registry is attached in the TUI, one-shot, text-chat, and JSONL frontends,
+so Atlas's JSONL bridge can use the configured browser tools too.
 
 The intended Windows deployment is Lightpanda running in Arch Linux under
 WSL2 with telemetry disabled:

@@ -231,6 +231,17 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     Ok(cli)
 }
 
+async fn attach_mcp_tools(app: &mut App) {
+    let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
+    for tool in mcp_tools {
+        let risk = mcp::tool_risk(tool.name());
+        app.tool_registry.register_with_descriptor(
+            tool,
+            tools::ToolDescriptor::lazy(tools::ToolCategory::Integrations, risk),
+        );
+    }
+}
+
 async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let Some(prompt) = cli.prompt else {
         return Err(
@@ -262,6 +273,7 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
+    attach_mcp_tools(&mut app).await;
     if let Some(path) = resume_path {
         app.restore_session(&path)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -954,6 +966,7 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
     refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
+    attach_mcp_tools(&mut app).await;
     if let Some(path) = resume_path {
         app.restore_session(&path)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1206,6 +1219,7 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
+    attach_mcp_tools(&mut app).await;
     if let Some(path) = resume_path {
         app.restore_session(&path)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1346,16 +1360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Initialize App state and channels
     let mut app = App::new(config, api_key);
-    let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
-    for tool in mcp_tools {
-        app.tool_registry.register_with_descriptor(
-            tool,
-            tools::ToolDescriptor::lazy(
-                tools::ToolCategory::Integrations,
-                tools::ToolRisk::ExternalSideEffect,
-            ),
-        );
-    }
+    attach_mcp_tools(&mut app).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     app.prefetch_models(tx.clone());
 

@@ -1,5 +1,5 @@
 use crate::config::McpServerConfig;
-use crate::tools::{DiffHunk, Tool, ToolPreview};
+use crate::tools::{DiffHunk, Tool, ToolPreview, ToolRisk};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -67,6 +67,43 @@ fn unique_provider_safe_tool_name(raw: &str, used_names: &mut HashSet<String>) -
             return candidate;
         }
         attempt = attempt.saturating_add(1);
+    }
+}
+
+/// Classifies the known Lightpanda mutation tools while keeping unknown MCP
+/// tools conservative. Read-only browser inspection should not require a
+/// host-side approval; page mutations and local artifact writes should.
+pub fn tool_risk(name: &str) -> ToolRisk {
+    match name.rsplit("__").next().unwrap_or(name) {
+        "click" | "fill" | "evaluate" | "press" | "selectOption" | "setChecked" | "save"
+        | "screenshot" | "session_close" => ToolRisk::ExternalSideEffect,
+        "goto"
+        | "search"
+        | "markdown"
+        | "html"
+        | "links"
+        | "tree"
+        | "nodeDetails"
+        | "interactiveElements"
+        | "structuredData"
+        | "detectForms"
+        | "scroll"
+        | "hover"
+        | "waitForSelector"
+        | "waitForScript"
+        | "waitForState"
+        | "getUrl"
+        | "getCookies"
+        | "getEnv"
+        | "consoleLogs"
+        | "session_list"
+        | "session_new"
+        | "extract"
+            if name.starts_with("mcp__") =>
+        {
+            ToolRisk::ReadOnly
+        }
+        _ => ToolRisk::ExternalSideEffect,
     }
 }
 
@@ -415,7 +452,10 @@ async fn connect_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_matching_json, provider_safe_tool_name, unique_provider_safe_tool_name};
+    use super::{
+        parse_matching_json, provider_safe_tool_name, tool_risk, unique_provider_safe_tool_name,
+    };
+    use crate::tools::ToolRisk;
     use std::collections::HashSet;
 
     #[test]
@@ -455,5 +495,14 @@ mod tests {
         let second = unique_provider_safe_tool_name("mcp__server/name__tool.read", &mut used);
         assert_ne!(first, second);
         assert_eq!(used.len(), 2);
+    }
+
+    #[test]
+    fn classifies_lightpanda_reads_and_mutations() {
+        assert_eq!(tool_risk("mcp__lightpanda__markdown"), ToolRisk::ReadOnly);
+        assert_eq!(
+            tool_risk("mcp__lightpanda__fill"),
+            ToolRisk::ExternalSideEffect
+        );
     }
 }
