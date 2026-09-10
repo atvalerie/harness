@@ -316,6 +316,7 @@ impl Tool for SearchToolsTool {
 
 #[derive(Clone)]
 pub struct ToolRegistry {
+    pub tasks: crate::tasks::TaskManager,
     tools: HashMap<String, Arc<dyn Tool>>,
     descriptors: HashMap<String, ToolDescriptor>,
     working_dir: SharedWorkingDir,
@@ -328,6 +329,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
+            tasks: crate::tasks::TaskManager::default(),
             tools: HashMap::new(),
             descriptors: HashMap::new(),
             working_dir: new_working_dir(),
@@ -390,7 +392,10 @@ impl ToolRegistry {
             ToolDescriptor::core(ToolCategory::Other, ToolRisk::SessionState),
         );
         reg.register_with_descriptor(
-            Arc::new(shell::RunCommandTool::new(reg.working_dir.clone())),
+            Arc::new(shell::RunCommandTool::with_tasks(
+                reg.working_dir.clone(),
+                reg.tasks.clone(),
+            )),
             ToolDescriptor::core(ToolCategory::Shell, ToolRisk::HostExecution),
         );
         reg.register_with_descriptor(
@@ -442,6 +447,41 @@ impl ToolRegistry {
                 )),
                 ToolDescriptor::lazy(ToolCategory::Agents, ToolRisk::AgentControl),
             );
+        }
+    }
+
+    pub fn worker_runtime(
+        &self,
+        config: &crate::config::AppConfig,
+        review: crate::review::ReviewStore,
+    ) -> crate::worker::WorkerRuntime {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "read_file"
+                        | "list_directory"
+                        | "stat_path"
+                        | "search_files"
+                        | "write_file"
+                        | "edit_file"
+                )
+            })
+            .filter(|(name, _)| {
+                self.descriptors.get(*name).is_some_and(|d| {
+                    config.permission_mode_for(d.risk.permission_group())
+                        == crate::config::PermissionMode::Allow
+                })
+            })
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect();
+        crate::worker::WorkerRuntime {
+            root: self.working_dir(),
+            tools,
+            review,
+            tasks: self.tasks.clone(),
         }
     }
 

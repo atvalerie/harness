@@ -213,22 +213,12 @@ fn parse_inline_spans(input: &str, base_style: Style) -> Vec<Span<'static>> {
 }
 
 fn find_next_char(chars: &[char], start: usize, target: char) -> Option<usize> {
-    for idx in start..chars.len() {
-        if chars[idx] == target {
-            return Some(idx);
-        }
-    }
-    None
+    (start..chars.len()).find(|&idx| chars[idx] == target)
 }
 
 fn find_next_pair(chars: &[char], start: usize, c1: char, c2: char) -> Option<usize> {
     if chars.len() < 2 {
         return None;
     }
-    for idx in start..chars.len().saturating_sub(1) {
-        if chars[idx] == c1 && chars[idx + 1] == c2 {
-            return Some(idx);
-        }
-    }
-    None
+    (start..chars.len().saturating_sub(1)).find(|&idx| chars[idx] == c1 && chars[idx + 1] == c2)
 }

@@ -1,14 +1,21 @@
 mod agents;
 mod app;
+mod auto_review;
 mod client;
 mod codex_auth;
+mod commands;
 mod config;
 mod events;
+mod interaction;
 mod mcp;
+mod model_metadata;
 mod prompts;
+mod review;
 mod session;
+mod tasks;
 mod tools;
 mod ui;
+mod worker;
 
 use app::{App, EngineState};
 use client::{is_zen_unsupported_model_id, ProviderKind};
@@ -56,6 +63,7 @@ enum OutputFormat {
 enum ToolPolicy {
     Ask,
     Auto,
+    Review,
     Deny,
 }
 
@@ -64,9 +72,10 @@ impl ToolPolicy {
         match value.to_ascii_lowercase().as_str() {
             "ask" => Ok(Self::Ask),
             "auto" => Ok(Self::Auto),
+            "review" => Ok(Self::Review),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
-                "Unknown tool policy '{}'. Use ask, auto, or deny.",
+                "Unknown tool policy '{}'. Use ask, review, auto, or deny.",
                 value
             )),
         }
@@ -209,11 +218,10 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 }
             }
             "--tools" => {
-                cli.tool_policy = ToolPolicy::parse(
-                    &args
-                        .next()
-                        .ok_or_else(|| "--tools requires ask, auto, or deny".to_string())?,
-                )?;
+                cli.tool_policy =
+                    ToolPolicy::parse(&args.next().ok_or_else(|| {
+                        "--tools requires ask, review, auto, or deny".to_string()
+                    })?)?;
             }
             "--login" => {
                 cli.login = Some(
@@ -232,7 +240,10 @@ fn parse_cli_args() -> Result<CliArgs, String> {
 }
 
 async fn attach_mcp_tools(app: &mut App) {
-    let mcp_tools = mcp::connect_all(&app.config.mcp_servers).await;
+    let (mcp_tools, errors) = mcp::connect_all(&app.config.mcp_servers).await;
+    for error in errors {
+        app.add_message("system", format!("MCP connection failed: {error}"));
+    }
     for tool in mcp_tools {
         let risk = mcp::tool_risk(tool.name());
         app.tool_registry.register_with_descriptor(
@@ -273,6 +284,7 @@ async fn run_headless(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
+    app.interaction.headless = true;
     attach_mcp_tools(&mut app).await;
     if let Some(path) = resume_path {
         app.restore_session(&path)
@@ -365,7 +377,7 @@ fn approval_payload(app: &App, approval_id: &str, policy: &str) -> Value {
             "approval_id": approval_id,
             "policy": policy,
             "risk": "high",
-            "confirmation": "keybind_or_ui"
+            "confirmation": "text_or_keybind_or_ui"
         });
     };
     let risk = if pending.preview.is_mutation {
@@ -378,7 +390,7 @@ fn approval_payload(app: &App, approval_id: &str, policy: &str) -> Value {
         "policy": policy,
         "action": "confirm",
         "risk": risk,
-        "confirmation": if risk == "high" { "keybind_or_ui" } else { "voice_or_keybind" },
+        "confirmation": if risk == "high" || app.pending_requires_review() { "text_or_keybind_or_ui" } else { "voice_or_keybind" },
         "tool": pending.tool_name,
         "call_id": pending.call_id,
         "args": pending.args,
@@ -396,6 +408,9 @@ async fn run_headless_jsonl(
     input_metadata: Option<Value>,
     input_rx: Option<&mut mpsc::UnboundedReceiver<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if tool_policy == ToolPolicy::Review {
+        app.auto_mode = true;
+    }
     let run_id = new_run_id();
     let mut sequence = 0;
     emit_jsonl(
@@ -425,6 +440,7 @@ async fn run_headless_jsonl(
     let mut pending_approval_id: Option<String> = None;
     let mut pending_capability_id: Option<String> = None;
     let mut input_rx = input_rx;
+    app.ensure_models_loaded().await;
     app.trigger_generation(event_tx.clone());
 
     enum HeadlessEvent {
@@ -441,9 +457,7 @@ async fn run_headless_jsonl(
             };
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    if app.state == EngineState::Streaming {
-                        app.cancel_generation();
-                    }
+                    app.cancel_generation();
                     final_status = "cancelled";
                     break 'run;
                 }
@@ -453,9 +467,7 @@ async fn run_headless_jsonl(
         } else {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    if app.state == EngineState::Streaming {
-                        app.cancel_generation();
-                    }
+                    app.cancel_generation();
                     final_status = "cancelled";
                     break 'run;
                 }
@@ -575,7 +587,10 @@ async fn run_headless_jsonl(
                 .pending_tool_call
                 .as_ref()
                 .is_some_and(|pending| pending.preview.is_mutation);
-            if approved && high_risk && method == "voice" {
+            if approved
+                && ((app.pending_requires_review() && !matches!(method, "text" | "keybind" | "ui"))
+                    || (high_risk && method == "voice"))
+            {
                 emit_jsonl(
                     &run_id,
                     &mut sequence,
@@ -605,8 +620,17 @@ async fn run_headless_jsonl(
 
         match event {
             AppEvent::Stream { epoch, signal } => {
-                let tool_call = matches!(&signal, StreamSignal::ToolCall { .. });
+                let tool_call = matches!(
+                    &signal,
+                    StreamSignal::ToolCall { .. } | StreamSignal::ToolReviewed { .. }
+                );
                 match &signal {
+                    StreamSignal::ModelSelected { model, protocol } => emit_jsonl(
+                        &run_id,
+                        &mut sequence,
+                        "model_selected",
+                        json!({"model":model,"protocol":protocol}),
+                    )?,
                     StreamSignal::ThoughtDelta(delta) => emit_jsonl(
                         &run_id,
                         &mut sequence,
@@ -646,6 +670,17 @@ async fn run_headless_jsonl(
                     StreamSignal::Finished { .. } => {
                         generation_finished = true;
                     }
+                    StreamSignal::ToolReviewed { pending, result } => {
+                        emit_jsonl(
+                            &run_id,
+                            &mut sequence,
+                            "auto_review",
+                            json!({
+                                "tool": pending.tool_name, "call_id": pending.call_id,
+                                "result": result, "auto_approved": result.as_ref().is_ok_and(|d| d.may_approve())
+                            }),
+                        )?;
+                    }
                     StreamSignal::Notice(message) => emit_jsonl(
                         &run_id,
                         &mut sequence,
@@ -663,9 +698,10 @@ async fn run_headless_jsonl(
                     let policy_name = match tool_policy {
                         ToolPolicy::Ask => "ask",
                         ToolPolicy::Auto => "auto",
+                        ToolPolicy::Review => "review",
                         ToolPolicy::Deny => "deny",
                     };
-                    if tool_policy == ToolPolicy::Auto {
+                    if tool_policy == ToolPolicy::Auto && !app.pending_requires_review() {
                         app.approve_pending_tool(true, event_tx.clone());
                     } else if tool_policy == ToolPolicy::Deny {
                         app.deny_pending_tool(event_tx.clone());
@@ -705,7 +741,7 @@ async fn run_headless_jsonl(
                 emit_jsonl(&run_id, &mut sequence, "tool_result", result_data)?;
                 app.handle_tool_result(epoch, tool_name.clone(), call_id, result, event_tx.clone());
                 if app.state == EngineState::AwaitingHitlApproval {
-                    if tool_policy == ToolPolicy::Auto {
+                    if tool_policy == ToolPolicy::Auto && !app.pending_requires_review() {
                         app.approve_pending_tool(true, event_tx.clone());
                     } else if tool_policy == ToolPolicy::Deny {
                         app.deny_pending_tool(event_tx.clone());
@@ -744,17 +780,22 @@ async fn run_headless_jsonl(
                 )?;
                 pending_capability_id = Some(request_id);
             }
-            AppEvent::CompactionFinished(result) => {
+            AppEvent::CompactionFinished(epoch, result) => {
                 emit_jsonl(
                     &run_id,
                     &mut sequence,
                     "compaction",
                     json!({"status": if result.is_ok() { "ok" } else { "error" }}),
                 )?;
-                app.handle_compaction_result(result, event_tx.clone());
-                if app.state == EngineState::Streaming {
-                    generation_finished = false;
+                if epoch != app.stream_epoch {
+                    continue;
                 }
+                app.handle_compaction_result(epoch, result, event_tx.clone());
+                if app.state == EngineState::Idle {
+                    final_status = "error";
+                    break;
+                }
+                generation_finished = false;
             }
             AppEvent::SystemNotification(message) => emit_jsonl(
                 &run_id,
@@ -793,6 +834,7 @@ async fn run_text_generation(
     tx: &mpsc::UnboundedSender<AppEvent>,
     rx: &mut mpsc::UnboundedReceiver<AppEvent>,
 ) {
+    app.ensure_models_loaded().await;
     app.trigger_generation(tx.clone());
     let mut saw_finished = false;
 
@@ -811,13 +853,16 @@ async fn run_text_generation(
         };
         match event {
             AppEvent::Stream { epoch, signal } => {
-                let approval_needed = matches!(&signal, StreamSignal::ToolCall { .. });
+                let approval_needed = matches!(
+                    &signal,
+                    StreamSignal::ToolCall { .. } | StreamSignal::ToolReviewed { .. }
+                );
                 match &signal {
                     StreamSignal::TextDelta(delta) => {
                         print!("{}", delta);
                         let _ = io::stdout().flush();
                     }
-                    StreamSignal::ThoughtDelta(_) => {}
+                    StreamSignal::ModelSelected { .. } | StreamSignal::ThoughtDelta(_) => {}
                     StreamSignal::ToolCall { name, args, .. } => {
                         println!("\n[tool request: {} {}]", name, args);
                     }
@@ -825,6 +870,9 @@ async fn run_text_generation(
                     StreamSignal::Finished { .. } => {
                         saw_finished = true;
                         println!();
+                    }
+                    StreamSignal::ToolReviewed { result, .. } => {
+                        eprintln!("auto-review: {:?}", result);
                     }
                     StreamSignal::Notice(message) => {
                         eprintln!("notice: {}", message);
@@ -872,11 +920,9 @@ async fn run_text_generation(
             AppEvent::CapabilityRequest { .. } => {
                 eprintln!("capability requests require the JSONL frontend");
             }
-            AppEvent::CompactionFinished(result) => {
-                app.handle_compaction_result(result, tx.clone());
-                if app.state == EngineState::Streaming {
-                    saw_finished = false;
-                }
+            AppEvent::CompactionFinished(epoch, result) => {
+                app.handle_compaction_result(epoch, result, tx.clone());
+                saw_finished = app.state == EngineState::Idle;
             }
             AppEvent::SystemNotification(message) => eprintln!("{}", message),
             AppEvent::ModelsFetched { .. }
@@ -966,6 +1012,7 @@ async fn run_jsonl_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> 
     refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
+    app.interaction.headless = true;
     attach_mcp_tools(&mut app).await;
     if let Some(path) = resume_path {
         app.restore_session(&path)
@@ -1219,6 +1266,7 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     refresh_codex_auth_if_available(&config).await;
     let api_key = resolve_api_key(&config)?;
     let mut app = App::new(config, api_key);
+    app.interaction.headless = true;
     attach_mcp_tools(&mut app).await;
     if let Some(path) = resume_path {
         app.restore_session(&path)
@@ -1253,13 +1301,15 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             app.handle_slash_command(prompt, command_tx.clone());
             while let Ok(event) = command_rx.try_recv() {
                 match event {
-                    AppEvent::CompactionFinished(result) => {
-                        app.handle_compaction_result(result, command_tx.clone());
+                    AppEvent::CompactionFinished(epoch, result) => {
+                        app.handle_compaction_result(epoch, result, command_tx.clone());
                     }
                     AppEvent::ModelsFetched {
-                        result: Ok(models), ..
-                    } => {
-                        app.available_models = models;
+                        result: Ok(models),
+                        epoch,
+                        ..
+                    } if epoch == app.models_epoch => {
+                        app.install_models(epoch, models);
                     }
                     AppEvent::ModelsFetched {
                         result: Err(error), ..
@@ -1270,8 +1320,8 @@ async fn run_chat(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if app.state == EngineState::Compacting {
-                if let Some(AppEvent::CompactionFinished(result)) = command_rx.recv().await {
-                    app.handle_compaction_result(result, command_tx.clone());
+                if let Some(AppEvent::CompactionFinished(epoch, result)) = command_rx.recv().await {
+                    app.handle_compaction_result(epoch, result, command_tx.clone());
                 }
             }
             if app.state == EngineState::Streaming {
@@ -1315,7 +1365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::Error::new(io::ErrorKind::InvalidInput, error)
     })?;
     if cli.help {
-        println!("Usage: holiday.exe [--login browser|device] | -p \"prompt\" [--format text|jsonl] [--tools ask|auto|deny] [--resume NAME|PATH | --continue] | --chat [--format text|jsonl] [--resume NAME|PATH | --continue] [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]");
+        println!("Usage: holiday.exe [--login browser|device] | -p \"prompt\" [--format text|jsonl] [--tools ask|review|auto|deny] [--resume NAME|PATH | --continue] | --chat [--format text|jsonl] [--resume NAME|PATH | --continue] [--config PATH] [--provider NAME] [--model MODEL] [--base-url URL]");
         return Ok(());
     }
     if let Some(path) = &cli.config_path {
@@ -1366,37 +1416,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. Spawn input event listener thread
     let event_tx = tx.clone();
-    tokio::spawn(async move {
-        loop {
-            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
-                        let _ = event_tx.send(AppEvent::Key(key));
-                    }
-                    Ok(Event::Paste(data)) => {
-                        let _ = event_tx.send(AppEvent::Paste(data));
-                    }
-                    Ok(Event::Mouse(mouse)) => {
-                        let _ = event_tx.send(AppEvent::Mouse(mouse));
-                    }
-                    Ok(Event::Resize(w, h)) => {
-                        let _ = event_tx.send(AppEvent::Resize(w, h));
-                    }
-                    _ => {}
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    std::thread::spawn(move || loop {
+        if event_tx.is_closed() {
+            break;
         }
+        if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    let _ = event_tx.send(AppEvent::Key(key));
+                }
+                Ok(Event::Paste(data)) => {
+                    let _ = event_tx.send(AppEvent::Paste(data));
+                }
+                Ok(Event::Mouse(mouse)) => {
+                    let _ = event_tx.send(AppEvent::Mouse(mouse));
+                }
+                Ok(Event::Resize(w, h)) => {
+                    let _ = event_tx.send(AppEvent::Resize(w, h));
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
     });
 
-    // 7. Main TUI Event Loop (60 FPS redraw decoupled from background I/O)
-    let mut render_interval = tokio::time::interval(Duration::from_millis(16)); // ~60fps
+    // 7. Dirty-state rendering with a bounded animation tick.
+    let mut render_interval = tokio::time::interval(Duration::from_millis(80)); // animations at most 12.5fps
     let mut usage_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
         tokio::select! {
             _ = render_interval.tick() => {
-                terminal.draw(|f| ui::render(&app, f))?;
+                if app.interaction.external_editor_requested { edit_external_draft(&mut app); }
+                if app.interaction.dirty || app.state != EngineState::Idle || app.tool_registry.tasks.running() {
+                    terminal.draw(|f| ui::render(&app, f))?;
+                    app.interaction.dirty=false;
+                }
+                app.send_queued_prompt(tx.clone());
             }
             _ = usage_interval.tick() => {
                 // Clone the current client at refresh time so provider switches
@@ -1408,6 +1464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             Some(app_event) = rx.recv() => {
+                app.interaction.dirty=true;
                 let mut current_event = app_event;
                 loop {
                     match current_event {
@@ -1417,18 +1474,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         AppEvent::Paste(data) => {
-                            if app.state == EngineState::Idle {
-                                app.append_paste(data);
-                            }
+                            app.append_paste(data);
                         }
                         AppEvent::Mouse(mouse) => {
                             match mouse.kind {
                                 crossterm::event::MouseEventKind::ScrollUp => {
                                     if app.state == EngineState::AwaitingHitlApproval {
                                         app.modal_scroll = app.modal_scroll.saturating_sub(5);
-                                    } else if app.show_models_modal {
+                                    } else if app.interaction.is_overlay(crate::interaction::Overlay::Models) {
                                         app.models_scroll = app.models_scroll.saturating_sub(5);
-                                    } else if app.show_sessions_modal {
+                                    } else if app.interaction.is_overlay(crate::interaction::Overlay::Sessions) {
                                         app.sessions_selected = app.sessions_selected.saturating_sub(1);
                                     } else {
                                         app.chat_scroll = app.chat_scroll.saturating_add(5);
@@ -1437,9 +1492,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 crossterm::event::MouseEventKind::ScrollDown => {
                                     if app.state == EngineState::AwaitingHitlApproval {
                                         app.modal_scroll = app.modal_scroll.saturating_add(5);
-                                    } else if app.show_models_modal {
+                                    } else if app.interaction.is_overlay(crate::interaction::Overlay::Models) {
                                         app.models_scroll = app.models_scroll.saturating_add(5);
-                                    } else if app.show_sessions_modal {
+                                    } else if app.interaction.is_overlay(crate::interaction::Overlay::Sessions) {
                                         if !app.available_sessions.is_empty() { app.sessions_selected = (app.sessions_selected + 1).min(app.available_sessions.len() - 1); }
                                     } else {
                                         app.chat_scroll = app.chat_scroll.saturating_sub(5);
@@ -1462,10 +1517,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     AppEvent::ProviderUsageFetched(result) => {
                         app.provider_limits = result.ok();
                     }
-                    AppEvent::ModelsFetched { result, interactive } => {
+                    AppEvent::ModelsFetched { epoch, result, interactive } if epoch == app.models_epoch => {
                         match result {
                             Ok(models) => {
-                                app.available_models = models;
+                                app.install_models(epoch, models);
                                 if app.config.provider.eq_ignore_ascii_case("opencode-zen")
                                     && app.config.get_api_key_for_active_provider().is_none()
                                 {
@@ -1488,7 +1543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.models_selected = app.available_models.iter().position(|model| model.id == app.config.model).unwrap_or(0);
                                 app.models_filter.clear();
                                 app.models_searching = false;
-                                app.show_models_modal = interactive;
+                                app.interaction.set_overlay(crate::interaction::Overlay::Models, interactive);
                                 app.models_scroll = 0;
                                 app.set_status(if interactive {
                                     "Fetched live models list."
@@ -1505,8 +1560,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    AppEvent::CompactionFinished(res) => {
-                        app.handle_compaction_result(res, tx.clone());
+                    AppEvent::ModelsFetched { .. } => {}
+                    AppEvent::CompactionFinished(epoch, res) => {
+                        app.handle_compaction_result(epoch, res, tx.clone());
                     }
                 }
 
@@ -1523,7 +1579,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 8. Clean terminal restoration
+    // 8. Stop managed work before dropping process supervisors and restore the terminal.
+    app.cancel_generation();
+    app.tool_registry.tasks.shutdown().await;
     let _ = app.flush_session();
     reset_terminal();
     Ok(())
@@ -1534,6 +1592,138 @@ fn handle_key_event(
     key: crossterm::event::KeyEvent,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
+    use crate::interaction::Overlay;
+    app.interaction.dirty = true;
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('k') => {
+                app.open_palette();
+                return;
+            }
+            KeyCode::Char('z') => {
+                app.undo_draft(false);
+                return;
+            }
+            KeyCode::Char('y') if app.interaction.top().is_none() => {
+                app.undo_draft(true);
+                return;
+            }
+            KeyCode::Char('r') => {
+                app.handle_workspace_command(commands::CommandId::History, "", tx);
+                return;
+            }
+            KeyCode::Char('o') if app.interaction.top().is_none() => {
+                let index = app.interaction.focus_message.or_else(|| {
+                    app.messages
+                        .iter()
+                        .rposition(|m| m.role == "tool" || m.role == "thought" || m.role == "model")
+                });
+                if let Some(index) = index {
+                    app.handle_workspace_command(
+                        commands::CommandId::Inspect,
+                        &(index + 1).to_string(),
+                        tx,
+                    );
+                }
+                return;
+            }
+            KeyCode::Char('g') => {
+                app.cancel_generation();
+                return;
+            }
+            KeyCode::Left => {
+                app.move_word(false);
+                return;
+            }
+            KeyCode::Right => {
+                app.move_word(true);
+                return;
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        app.interaction.top(),
+        Some(Overlay::Palette | Overlay::History | Overlay::Tasks | Overlay::Review)
+    ) {
+        let overlay = app.interaction.top().unwrap();
+        match key.code {
+            KeyCode::Esc => app.interaction.back(),
+            KeyCode::Up => app.interaction.selected = app.interaction.selected.saturating_sub(1),
+            KeyCode::Down => app.interaction.selected = app.interaction.selected.saturating_add(1),
+            KeyCode::Backspace => {
+                app.interaction.query.pop();
+                app.interaction.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                app.interaction.query.push(c);
+                app.interaction.selected = 0;
+            }
+            KeyCode::Enter => {
+                if overlay == Overlay::Palette {
+                    let choices = commands::matching(&app.interaction.query);
+                    if let Some(spec) = choices.get(
+                        app.interaction
+                            .selected
+                            .min(choices.len().saturating_sub(1)),
+                    ) {
+                        app.input_buffer = format!("{} ", spec.name);
+                        app.input_cursor = app.input_buffer.chars().count();
+                        app.interaction.back();
+                    }
+                } else if overlay == Overlay::History {
+                    let choices = app
+                        .input_history
+                        .iter()
+                        .rev()
+                        .filter(|s| s.contains(&app.interaction.query))
+                        .collect::<Vec<_>>();
+                    if let Some(text) = choices.get(
+                        app.interaction
+                            .selected
+                            .min(choices.len().saturating_sub(1)),
+                    ) {
+                        app.input_buffer = (*text).clone();
+                        app.input_cursor = app.input_buffer.chars().count();
+                        app.interaction.back();
+                    }
+                } else if overlay == Overlay::Tasks {
+                    if let Some(id) = app.interaction.query.strip_prefix("cancel ") {
+                        app.set_status(
+                            app.tool_registry
+                                .tasks
+                                .cancel(id.trim())
+                                .unwrap_or_else(|e| e),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Backspace {
+        app.interaction
+            .remember_edit(&app.input_buffer, app.input_cursor);
+        let end = input_byte_index(&app.input_buffer, app.input_cursor);
+        app.move_word(false);
+        let start = input_byte_index(&app.input_buffer, app.input_cursor);
+        app.input_buffer.replace_range(start..end, "");
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Up | KeyCode::Down)
+    {
+        app.handle_workspace_command(
+            commands::CommandId::Jump,
+            if key.code == KeyCode::Up {
+                "prev"
+            } else {
+                "next"
+            },
+            tx,
+        );
+        return;
+    }
     // Ctrl+C clears the composer once, then exits only when pressed again.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.handle_ctrl_c();
@@ -1547,10 +1737,14 @@ fn handle_key_event(
         return;
     }
 
-    if app.show_permissions_modal {
+    if app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Permissions)
+    {
         match key.code {
             KeyCode::Esc => {
-                app.show_permissions_modal = false;
+                app.interaction
+                    .set_overlay(crate::interaction::Overlay::Permissions, false);
                 app.set_status("Using current tool permission defaults.");
             }
             KeyCode::Up => {
@@ -1572,10 +1766,14 @@ fn handle_key_event(
         return;
     }
 
-    if app.show_plan_modal {
+    if app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Plan)
+    {
         match key.code {
             KeyCode::Esc => {
-                app.show_plan_modal = false;
+                app.interaction
+                    .set_overlay(crate::interaction::Overlay::Plan, false);
                 app.set_status("Plan left for review");
             }
             KeyCode::Up | KeyCode::Char('1') => app.plan_modal_selected = 0,
@@ -1589,9 +1787,14 @@ fn handle_key_event(
     }
 
     // 1. When Session Browser is active
-    if app.show_sessions_modal {
+    if app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Sessions)
+    {
         match key.code {
-            KeyCode::Esc => app.show_sessions_modal = false,
+            KeyCode::Esc => app
+                .interaction
+                .set_overlay(crate::interaction::Overlay::Sessions, false),
             KeyCode::Up => app.sessions_selected = app.sessions_selected.saturating_sub(1),
             KeyCode::Down => {
                 if !app.available_sessions.is_empty() {
@@ -1609,7 +1812,10 @@ fn handle_key_event(
 
     // Thinking picker sits above the model browser and edits the selected
     // provider/model profile without changing the active model itself.
-    if app.show_thinking_modal {
+    if app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Thinking)
+    {
         let target_model = app
             .thinking_target_model
             .clone()
@@ -1617,7 +1823,8 @@ fn handle_key_event(
         let max_choice = app.thinking_choices(&target_model).len().saturating_sub(1);
         match key.code {
             KeyCode::Esc => {
-                app.show_thinking_modal = false;
+                app.interaction
+                    .set_overlay(crate::interaction::Overlay::Thinking, false);
                 app.thinking_target_model = None;
             }
             KeyCode::Up => app.thinking_selected = app.thinking_selected.saturating_sub(1),
@@ -1633,7 +1840,10 @@ fn handle_key_event(
     }
 
     // 2. When Live Models Modal is active
-    if app.show_models_modal {
+    if app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Models)
+    {
         if app.models_searching {
             match key.code {
                 KeyCode::Esc => {
@@ -1660,7 +1870,8 @@ fn handle_key_event(
         }
         match key.code {
             KeyCode::Esc => {
-                app.show_models_modal = false;
+                app.interaction
+                    .set_overlay(crate::interaction::Overlay::Models, false);
             }
             KeyCode::Char('/') => {
                 app.models_searching = true;
@@ -1731,11 +1942,13 @@ fn handle_key_event(
     }
 
     // 4. When streaming: Esc cancels generation on the fly
-    if app.state == EngineState::Streaming {
-        if key.code == KeyCode::Esc {
-            app.cancel_generation();
-            return;
-        }
+    if matches!(
+        app.state,
+        EngineState::Streaming | EngineState::Compacting | EngineState::ExecutingTool
+    ) && key.code == KeyCode::Esc
+    {
+        app.cancel_generation();
+        return;
     }
 
     // Modifiers-based chat scroll
@@ -1819,7 +2032,7 @@ fn handle_key_event(
                 return;
             }
             KeyCode::Char('y') => {
-                app.copy_last_response();
+                app.copy_selection("", tx);
                 return;
             }
             // Command history navigation via standard Ctrl+P / Ctrl+N
@@ -1858,6 +2071,42 @@ fn handle_key_event(
         }
     }
 
+    let suggestions = app.slash_suggestions();
+    if !suggestions.is_empty() && key.modifiers.is_empty() {
+        let selected = app
+            .interaction
+            .suggestion_selected
+            .min(suggestions.len() - 1);
+        match key.code {
+            KeyCode::Up => {
+                app.interaction.suggestion_selected = selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                app.interaction.suggestion_selected = (selected + 1).min(suggestions.len() - 1);
+                return;
+            }
+            KeyCode::Tab => {
+                app.input_buffer = format!("{} ", suggestions[selected].name);
+                app.input_cursor = app.input_buffer.chars().count();
+                app.interaction.suggestion_selected = 0;
+                return;
+            }
+            KeyCode::Esc => {
+                app.interaction.suggestions_dismissed = true;
+                return;
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        key.code,
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+    ) {
+        app.interaction.suggestion_selected = 0;
+        app.interaction.suggestions_dismissed = false;
+    }
+
     // 4. Normal Prompt and Viewport navigation
     match key.code {
         KeyCode::Enter
@@ -1882,77 +2131,61 @@ fn handle_key_event(
             }
         }
         KeyCode::Tab => {
-            if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
-                let commands = [
-                    "/help",
-                    "/models",
-                    "/model",
-                    "/compact",
-                    "/thinking",
-                    "/reasoning",
-                    "/autocompact",
-                    "/context",
-                    "/status",
-                    "/pwd",
-                    "/tools",
-                    "/plan",
-                    "/todos",
-                    "/todo",
-                    "/agents",
-                    "/attachments",
-                    "/attach",
-                    "/remove",
-                    "/edit",
-                    "/session",
-                    "/sessions",
-                    "/resume",
-                    "/retry",
-                    "/fork",
-                    "/temp",
-                    "/sys",
-                    "/key",
-                    "/provider",
-                    "/baseurl",
-                    "/copy",
-                    "/clear",
-                    "/new",
-                    "/save",
-                    "/quit",
-                    "/exit",
-                ];
-                let prefix = app.input_buffer.to_lowercase();
-                if let Some(matched) = commands.iter().find(|cmd| cmd.starts_with(&prefix)) {
-                    app.input_buffer = format!("{} ", matched);
-                    app.input_cursor = app.input_buffer.chars().count();
-                }
+            let choices = app.completion_candidates();
+            if choices.len() == 1 {
+                app.input_buffer = choices[0].clone();
+                app.input_cursor = app.input_buffer.chars().count();
+            } else if app.input_buffer.starts_with('/') && !app.input_buffer.contains(' ') {
+                app.open_palette();
+            } else if !choices.is_empty() {
+                app.set_status(
+                    choices
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                );
             }
         }
         KeyCode::Char(c) => {
             app.insert_input_text(&c.to_string());
         }
         KeyCode::Backspace => {
+            app.interaction
+                .remember_edit(&app.input_buffer, app.input_cursor);
             if app.input_cursor > 0 {
                 let end = input_byte_index(&app.input_buffer, app.input_cursor);
-                let start = input_byte_index(&app.input_buffer, app.input_cursor - 1);
+                let start = input_byte_index(
+                    &app.input_buffer,
+                    crate::interaction::previous_grapheme(&app.input_buffer, app.input_cursor),
+                );
                 app.input_buffer.replace_range(start..end, "");
-                app.input_cursor -= 1;
+                app.input_cursor = app.input_buffer[..start].chars().count();
             }
         }
         KeyCode::Delete => {
+            app.interaction
+                .remember_edit(&app.input_buffer, app.input_cursor);
             if app.input_cursor < app.input_buffer.chars().count() {
                 let start = input_byte_index(&app.input_buffer, app.input_cursor);
-                let end = input_byte_index(&app.input_buffer, app.input_cursor + 1);
+                let end = input_byte_index(
+                    &app.input_buffer,
+                    crate::interaction::next_grapheme(&app.input_buffer, app.input_cursor),
+                );
                 app.input_buffer.replace_range(start..end, "");
             }
         }
         KeyCode::Left => {
             if app.input_cursor > 0 {
-                app.input_cursor -= 1;
+                app.input_cursor =
+                    crate::interaction::previous_grapheme(&app.input_buffer, app.input_cursor);
             }
         }
         KeyCode::Right => {
             if app.input_cursor < app.input_buffer.chars().count() {
-                app.input_cursor += 1;
+                app.input_cursor =
+                    crate::interaction::next_grapheme(&app.input_buffer, app.input_cursor);
             }
         }
         KeyCode::Home => {
@@ -2070,6 +2303,66 @@ fn move_input_vertical(app: &mut App, up: bool) -> bool {
     true
 }
 
+fn edit_external_draft(app: &mut App) {
+    app.interaction.external_editor_requested = false;
+    app.interaction
+        .input_paused
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "notepad.exe".into()
+            } else {
+                "vi".into()
+            }
+        });
+    let path = std::env::temp_dir().join(format!(
+        "holiday-draft-{}-{}.txt",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    let result = (|| -> Result<String, String> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&path)
+            .and_then(|mut f| f.write_all(app.input_buffer.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        // Treat EDITOR as an executable path, never interpolate it into a shell.
+        let result=std::process::Command::new(&editor).arg(&path).status().map_err(|e|format!("Could not run editor '{editor}': {e}. EDITOR must name an executable, without shell arguments."));
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+        let _ = crossterm::terminal::enable_raw_mode();
+        if !result?.success() {
+            return Err("Editor exited unsuccessfully; draft retained".into());
+        }
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(&path);
+    match result {
+        Ok(text) => {
+            app.interaction
+                .remember_edit(&app.input_buffer, app.input_cursor);
+            app.input_buffer = text;
+            app.input_cursor = app.input_buffer.chars().count();
+        }
+        Err(e) => app.set_status(e),
+    }
+    app.interaction
+        .input_paused
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    app.interaction.dirty = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_jsonl_input;
@@ -2103,5 +2396,27 @@ mod tests {
         assert!(parse_jsonl_input(r#"{"version":2,"event":"ping"}"#).is_err());
         assert!(parse_jsonl_input(r#"[1,2,3]"#).is_err());
         assert!(parse_jsonl_input(r#"{"version":1}"#).is_err());
+    }
+
+    #[test]
+    fn slash_suggestion_navigation_and_insertion() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::app::App::new(crate::config::AppConfig::default(), "".into());
+        app.interaction.back();
+        app.input_buffer = "/".into();
+        let expected = app.slash_suggestions()[1].name.to_string();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        super::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            tx.clone(),
+        );
+        super::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            tx,
+        );
+        assert_eq!(app.input_buffer, format!("{expected} "));
+        assert!(app.interaction.top().is_none());
     }
 }

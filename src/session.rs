@@ -10,6 +10,8 @@ use std::time::SystemTime;
 pub struct SessionSnapshot {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    #[serde(default)]
+    pub checkpoints: Vec<crate::review::Checkpoint>,
     pub provider: String,
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -70,9 +72,91 @@ pub fn new_session_path(prefix: &str) -> Option<PathBuf> {
 }
 
 pub fn load(path: &Path) -> Option<SessionSnapshot> {
+    // A partial final journal record is ignored; earlier records remain usable.
+    let journal = journal_path(path);
+    if let Ok(file) = std::fs::File::open(journal) {
+        use std::io::BufRead;
+        let mut latest: Option<SessionSnapshot> = None;
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<JournalRecord>(&line) {
+                if event.version == 1 {
+                    if event.base_messages == 0
+                        && event.base_usage == 0
+                        && event.base_checkpoints == 0
+                    {
+                        latest = Some(event.snapshot);
+                    } else if let Some(previous) = latest.take() {
+                        if event.base_messages <= previous.messages.len()
+                            && event.base_usage <= previous.usage.len()
+                            && event.base_checkpoints <= previous.checkpoints.len()
+                        {
+                            let mut next = event.snapshot;
+                            let mut messages = previous
+                                .messages
+                                .into_iter()
+                                .take(event.base_messages)
+                                .collect::<Vec<_>>();
+                            messages.append(&mut next.messages);
+                            next.messages = messages;
+                            let mut usage = previous
+                                .usage
+                                .into_iter()
+                                .take(event.base_usage)
+                                .collect::<Vec<_>>();
+                            usage.append(&mut next.usage);
+                            next.usage = usage;
+                            let mut checkpoints = previous
+                                .checkpoints
+                                .into_iter()
+                                .take(event.base_checkpoints)
+                                .collect::<Vec<_>>();
+                            checkpoints.append(&mut next.checkpoints);
+                            next.checkpoints = checkpoints;
+                            latest = Some(next);
+                        } else {
+                            latest = Some(previous);
+                        }
+                    }
+                }
+            }
+        }
+        if latest.is_some() {
+            return latest;
+        }
+    }
     fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str(&content).ok())
+}
+#[derive(Serialize, Deserialize)]
+struct JournalRecord {
+    version: u32,
+    timestamp: String,
+    kind: String,
+    snapshot: SessionSnapshot,
+    #[serde(default)]
+    base_messages: usize,
+    #[serde(default)]
+    base_usage: usize,
+    #[serde(default)]
+    base_checkpoints: usize,
+}
+fn journal_path(path: &Path) -> PathBuf {
+    path.with_extension("events.jsonl")
+}
+
+fn saved_states(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (SessionSnapshot, u64)>> {
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (SessionSnapshot, u64)>>,
+    > = std::sync::OnceLock::new();
+    STATES.get_or_init(Default::default)
+}
+fn prefix<T: Serialize>(a: &[T], b: &[T]) -> usize {
+    a.iter()
+        .zip(b)
+        .take_while(|(a, b)| serde_json::to_vec(a).ok() == serde_json::to_vec(b).ok())
+        .count()
 }
 
 pub fn save(path: &Path, snapshot: &SessionSnapshot) -> Result<(), String> {
@@ -80,6 +164,63 @@ pub fn save(path: &Path, snapshot: &SessionSnapshot) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "Session path has no parent".to_string())?;
     fs::create_dir_all(parent).map_err(|e| format!("Failed to create session directory: {}", e))?;
+    // Write-ahead checkpoint first. Never remove the old snapshot to replace it.
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut journal = options
+        .open(journal_path(path))
+        .map_err(|e| format!("Cannot open session journal: {e}"))?;
+    let mut saved = saved_states()
+        .lock()
+        .map_err(|_| "Session state cache unavailable")?;
+    let previous = saved.get(path);
+    let revision = previous.map(|(_, r)| r + 1).unwrap_or(0);
+    let mut delta = snapshot.clone();
+    let (mut base_messages, mut base_usage, mut base_checkpoints) = (0, 0, 0);
+    if let Some((previous, _)) = previous.filter(|_| revision % 32 != 0) {
+        base_messages = prefix(&previous.messages, &snapshot.messages);
+        base_usage = prefix(&previous.usage, &snapshot.usage);
+        base_checkpoints = prefix(&previous.checkpoints, &snapshot.checkpoints);
+        delta.messages.drain(..base_messages);
+        delta.usage.drain(..base_usage);
+        delta.checkpoints.drain(..base_checkpoints);
+    }
+    let mut record = serde_json::to_vec(&JournalRecord {
+        version: 1,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        kind: if revision % 32 == 0 {
+            "checkpoint"
+        } else {
+            "append"
+        }
+        .into(),
+        snapshot: delta,
+        base_messages,
+        base_usage,
+        base_checkpoints,
+    })
+    .map_err(|e| e.to_string())?;
+    // A leading newline isolates a previously torn final record from this commit.
+    record.insert(0, b'\n');
+    record.push(b'\n');
+    journal
+        .write_all(&record)
+        .and_then(|_| journal.sync_data())
+        .map_err(|e| format!("Cannot commit session journal: {e}"))?;
+    if saved.len() > 16 {
+        saved.clear();
+    }
+    saved.insert(path.to_path_buf(), (snapshot.clone(), revision));
+    drop(saved);
+    if revision % 32 != 0 && path.exists() {
+        return Ok(());
+    }
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| format!("Failed to serialize session: {}", e))?;
     let file_name = path
@@ -87,20 +228,49 @@ pub fn save(path: &Path, snapshot: &SessionSnapshot) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .unwrap_or("session.json");
     let temp = path.with_file_name(format!(".{}.{}.tmp", file_name, std::process::id()));
-    fs::write(&temp, json).map_err(|e| format!("Failed to write session: {}", e))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(json.as_bytes())
+                .and_then(|_| file.sync_data())
+        })
+        .map_err(|e| format!("Failed to write snapshot: {e}"))?;
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
         Err(_error) if cfg!(windows) && path.exists() => {
-            // Windows does not replace an existing destination with rename.
-            // The destination is exact and the new snapshot is already fully
-            // written, so replace it as a fallback.
-            fs::remove_file(path)
-                .map_err(|remove_error| format!("Failed to replace session: {}", remove_error))?;
-            fs::rename(&temp, path)
-                .map_err(|rename_error| format!("Failed to commit session: {}", rename_error))
+            // Recovery uses the durably appended journal. Keep the previous snapshot
+            // intact rather than introducing a delete/rename data-loss window.
+            let _ = fs::remove_file(&temp);
+            Ok(())
         }
         Err(error) => Err(format!("Failed to commit session: {}", error)),
     }
+}
+
+pub fn delete(path: &Path) -> Result<(), String> {
+    // Exact sidecar paths only; never recursive deletion.
+    for file in [
+        journal_path(path),
+        path.with_extension("changes.jsonl"),
+        path.to_path_buf(),
+    ] {
+        match fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    if let Ok(mut saved) = saved_states().lock() {
+        saved.remove(path);
+    }
+    Ok(())
 }
 
 pub fn list() -> Vec<SessionInfo> {
@@ -127,8 +297,8 @@ pub fn list() -> Vec<SessionInfo> {
             }
             let snapshot = load(&path)?;
             let name = path.file_stem()?.to_string_lossy().to_string();
-            let modified = entry
-                .metadata()
+            let modified = fs::metadata(journal_path(&path))
+                .or_else(|_| entry.metadata())
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             Some(SessionInfo {
@@ -141,13 +311,60 @@ pub fn list() -> Vec<SessionInfo> {
             })
         })
         .collect::<Vec<_>>();
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
     sessions
 }
 
 #[cfg(test)]
 mod tests {
     use super::SessionSnapshot;
+
+    #[test]
+    fn journal_replays_deltas_and_survives_torn_record() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "holiday-journal-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.json");
+        let mut snapshot: super::SessionSnapshot = serde_json::from_value(
+            serde_json::json!({"provider":"test","model":"test","messages":[]}),
+        )
+        .unwrap();
+        super::save(&path, &snapshot).unwrap();
+        snapshot.messages.push(crate::app::ChatMessage {
+            role: "user".into(),
+            content: "first".into(),
+            timestamp: "now".into(),
+            attachments: Vec::new(),
+        });
+        super::save(&path, &snapshot).unwrap();
+        snapshot.messages.push(crate::app::ChatMessage {
+            role: "model".into(),
+            content: "second".into(),
+            timestamp: "now".into(),
+            attachments: Vec::new(),
+        });
+        super::save(&path, &snapshot).unwrap();
+        let journal = super::journal_path(&path);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(b"{broken")
+            .unwrap();
+        assert_eq!(super::load(&path).unwrap().messages.len(), 2);
+        snapshot.messages.truncate(1);
+        super::save(&path, &snapshot).unwrap();
+        assert_eq!(super::load(&path).unwrap().messages.len(), 1);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(super::load(&path).unwrap().messages[0].content, "first");
+        super::delete(&path).unwrap();
+        assert!(super::load(&path).is_none());
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn loads_legacy_snapshot_with_usage_defaults() {

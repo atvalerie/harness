@@ -8,6 +8,13 @@ use ratatui::{
     Frame,
 };
 
+#[derive(Default)]
+pub struct TranscriptCache {
+    entries: Vec<(u64, Vec<Line<'static>>)>,
+    last_scroll: usize,
+    anchor: Option<usize>,
+}
+
 pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -27,7 +34,7 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                 Style::default().fg(Color::Cyan),
             ),
         ]));
-        if app.config.get_api_key_for_active_provider().is_some() {
+        if app.interaction.credentials_available {
             lines.push(Line::from(vec![Span::styled(
                 "Ready. Type /help for commands or enter a prompt.",
                 Style::default().fg(Color::DarkGray),
@@ -52,11 +59,53 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    for msg in &app.messages {
+    let mut cache = app.interaction.cache.borrow_mut();
+    for (index, msg) in app.messages.iter().enumerate() {
+        if app
+            .interaction
+            .focus_message
+            .is_some_and(|first| index < first)
+        {
+            continue;
+        }
+        use std::hash::{Hash, Hasher};
+        if !app.interaction.transcript_query.is_empty()
+            && !msg
+                .content
+                .to_lowercase()
+                .contains(&app.interaction.transcript_query.to_lowercase())
+        {
+            continue;
+        }
+        let expanded = app.interaction.expanded.contains(&index);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        msg.content.hash(&mut hasher);
+        msg.role.hash(&mut hasher);
+        msg.timestamp.hash(&mut hasher);
+        serde_json::to_string(&msg.attachments)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        if expanded && msg.role == "tool" {
+            app.messages
+                .get(index + 1)
+                .map(|m| &m.content)
+                .hash(&mut hasher);
+        }
+        expanded.hash(&mut hasher);
+        area.width.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((old, rendered)) = cache.entries.get(index) {
+            if *old == key {
+                lines.extend(rendered.iter().cloned());
+                continue;
+            }
+        }
+        let mut item_lines: Vec<Line<'static>> = Vec::new();
+
         match msg.role.as_str() {
             "user" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                item_lines.push(Line::from(""));
+                item_lines.push(Line::from(vec![
                     Span::styled(
                         "❯ user",
                         Style::default()
@@ -64,12 +113,12 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("  {}", msg.timestamp),
+                        format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
+                    item_lines.push(Line::from(vec![Span::styled(
                         format!("  {}", l),
                         Style::default().fg(Color::White),
                     )]));
@@ -97,15 +146,15 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                         attachment.name,
                         details
                     );
-                    lines.push(Line::from(vec![Span::styled(
+                    item_lines.push(Line::from(vec![Span::styled(
                         label,
                         Style::default().fg(Color::Yellow),
                     )]));
                 }
             }
             "model" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                item_lines.push(Line::from(""));
+                item_lines.push(Line::from(vec![
                     Span::styled(
                         "◆ assistant",
                         Style::default()
@@ -113,36 +162,36 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("  {}", msg.timestamp),
+                        format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
                 // Markdown rendering for assistant messages
                 let md_lines = parse_markdown(&msg.content, "  ");
-                lines.extend(md_lines);
+                item_lines.extend(md_lines);
             }
             "thought" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                item_lines.push(Line::from(""));
+                item_lines.push(Line::from(vec![
                     Span::styled("· thought", Style::default().fg(Color::Magenta)),
                     Span::styled(
-                        format!("  {}", msg.timestamp),
+                        format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
-                for l in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  │ {}", l),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
+                if !expanded {
+                    item_lines.push(Line::from(format!(
+                        "  {} ...",
+                        msg.content.chars().take(100).collect::<String>()
+                    )));
                 }
             }
             "tool" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                item_lines.push(Line::from(""));
+                item_lines.push(Line::from(vec![
                     Span::styled("⚡ tool", Style::default().fg(Color::Yellow)),
                     Span::styled(
-                        format!("  {}", msg.timestamp),
+                        format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
@@ -152,22 +201,25 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                 if compact.chars().count() > max_chars {
                     visible.push('…');
                 }
-                lines.push(Line::from(vec![Span::styled(
+                item_lines.push(Line::from(vec![Span::styled(
                     format!("  {}", visible),
                     Style::default().fg(Color::Yellow),
                 )]));
             }
             "system" => {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+                if msg.content.starts_with("Error:") {
+                    item_lines.push(Line::from("  Recovery: /retry | /fork | /review"));
+                }
+                item_lines.push(Line::from(""));
+                item_lines.push(Line::from(vec![
                     Span::styled("— system", Style::default().fg(Color::Blue)),
                     Span::styled(
-                        format!("  {}", msg.timestamp),
+                        format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
                 for l in msg.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
+                    item_lines.push(Line::from(vec![Span::styled(
                         format!("  {}", l),
                         Style::default().fg(Color::DarkGray),
                     )]));
@@ -175,6 +227,65 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
             }
             _ => {}
         }
+        if expanded && msg.role == "tool" {
+            if let Some(output) = app.messages.get(index + 1).filter(|m| m.role == "function") {
+                if let Ok(crate::client::types::Part::FunctionResponse { function_response }) =
+                    serde_json::from_str(&output.content)
+                {
+                    if let Some(id) = &function_response.id {
+                        for call in app.messages[..index].iter().rev() {
+                            if let Ok(crate::client::types::Part::FunctionCall {
+                                function_call,
+                                ..
+                            }) = serde_json::from_str(&call.content)
+                            {
+                                if function_call.id.as_ref() == Some(id) {
+                                    item_lines.push(Line::from("  Arguments:"));
+                                    item_lines.extend(
+                                        serde_json::to_string_pretty(&function_call.args)
+                                            .unwrap_or_default()
+                                            .lines()
+                                            .map(|s| Line::from(format!("  {s}"))),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    item_lines.push(Line::from("  Result:"));
+                    let result = function_response
+                        .response
+                        .get("output")
+                        .or_else(|| function_response.response.get("error"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            serde_json::to_string_pretty(&function_response.response)
+                                .unwrap_or_default()
+                        });
+                    item_lines.extend(result.lines().map(|s| Line::from(format!("  {s}"))));
+                } else {
+                    item_lines.extend(output.content.lines().map(|s| Line::from(format!("  {s}"))));
+                }
+            }
+        }
+        if expanded
+            && matches!(
+                msg.role.as_str(),
+                "tool" | "function" | "thought" | "model_tool_call"
+            )
+        {
+            item_lines.extend(
+                msg.content
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+        }
+        while cache.entries.len() <= index {
+            cache.entries.push((0, Vec::new()));
+        }
+        cache.entries[index] = (key, item_lines.clone());
+        lines.extend(item_lines);
     }
 
     // Render active streaming thought buffer
@@ -229,7 +340,7 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     lines.push(Line::from(""));
 
     // Pre-wrap lines to exact inner width so line count matches visual layout 1:1
-    let inner_width = area.width.saturating_sub(2).max(10) as usize;
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
     let mut visual_lines: Vec<Line<'static>> = Vec::new();
     for line in lines {
         visual_lines.extend(wrap_line(line, inner_width));
@@ -247,7 +358,21 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     // app.chat_scroll represents how many lines UP from the bottom we have scrolled.
     // 0 = bottom (most recent).
     let effective_scroll = app.chat_scroll.min(max_scroll);
-    let scroll_y = max_scroll.saturating_sub(effective_scroll);
+    let scroll_y = if app.chat_scroll == 0 {
+        cache.anchor = None;
+        max_scroll
+    } else if cache.last_scroll == app.chat_scroll {
+        cache
+            .anchor
+            .unwrap_or(max_scroll.saturating_sub(effective_scroll))
+            .min(max_scroll)
+    } else {
+        max_scroll.saturating_sub(effective_scroll)
+    };
+    if app.chat_scroll > 0 {
+        cache.anchor = Some(scroll_y);
+    }
+    cache.last_scroll = app.chat_scroll;
 
     let scroll_indicator = if max_scroll > 0 {
         if effective_scroll == 0 {
@@ -265,90 +390,86 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
         format!(" Conversation{} ", scroll_indicator)
     };
 
-    let paragraph = Paragraph::new(visual_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(title, Style::default().fg(Color::DarkGray)))
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .scroll((scroll_y as u16, 0));
+    let paragraph = Paragraph::new(
+        visual_lines
+            .into_iter()
+            .skip(scroll_y)
+            .take(viewport_height)
+            .collect::<Vec<_>>(),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().fg(Color::DarkGray)))
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
 
     frame.render_widget(paragraph, area);
 }
 
 fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
-    if line.width() <= max_width || max_width == 0 {
-        return vec![line];
-    }
-
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let max_width = max_width.max(1);
     let mut result = Vec::new();
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut current_line_width = 0;
-
+    let mut spans = Vec::new();
+    let mut width = 0;
     for span in line.spans {
-        let style = span.style;
-        let text = span.content;
-
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
-        let len = chars.len();
-
-        let mut i = 0;
-        while i < len {
-            let is_space = chars[i].1.is_whitespace();
-            let start_byte = chars[i].0;
-            while i < len && chars[i].1.is_whitespace() == is_space {
-                i += 1;
+        for glyph in span.content.graphemes(true) {
+            let cells = UnicodeWidthStr::width(glyph);
+            if width + cells > max_width && !spans.is_empty() {
+                result.push(Line::from(std::mem::take(&mut spans)));
+                width = 0;
             }
-            let end_byte = if i < len { chars[i].0 } else { text.len() };
-            let token = &text[start_byte..end_byte];
-            let token_width = token.chars().count();
+            if cells > max_width {
+                continue;
+            }
+            spans.push(Span::styled(glyph.to_owned(), span.style));
+            width += cells;
+        }
+    }
+    if !spans.is_empty() || result.is_empty() {
+        result.push(Line::from(spans));
+    }
+    result
+}
 
-            if current_line_width + token_width <= max_width {
-                current_spans.push(Span::styled(token.to_string(), style));
-                current_line_width += token_width;
-            } else if is_space {
-                if !current_spans.is_empty() {
-                    result.push(Line::from(std::mem::take(&mut current_spans)));
-                    current_line_width = 0;
-                }
-            } else {
-                if !current_spans.is_empty() {
-                    result.push(Line::from(std::mem::take(&mut current_spans)));
-                    current_line_width = 0;
-                }
-
-                if token_width > max_width {
-                    let mut chunk = String::new();
-                    let mut chunk_w = 0;
-                    for c in token.chars() {
-                        if chunk_w + 1 > max_width {
-                            result.push(Line::from(vec![Span::styled(chunk, style)]));
-                            chunk = String::new();
-                            chunk_w = 0;
-                        }
-                        chunk.push(c);
-                        chunk_w += 1;
-                    }
-                    if !chunk.is_empty() {
-                        current_spans.push(Span::styled(chunk, style));
-                        current_line_width = chunk_w;
-                    }
-                } else {
-                    current_spans.push(Span::styled(token.to_string(), style));
-                    current_line_width = token_width;
-                }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wrapping_respects_terminal_cells() {
+        for width in 1..12 {
+            for line in wrap_line(Line::from("abc 漢字 👩‍💻 é longtext"), width) {
+                assert!(line.width() <= width);
             }
         }
     }
-
-    if !current_spans.is_empty() {
-        result.push(Line::from(current_spans));
-    }
-
-    if result.is_empty() {
-        vec![Line::from("")]
-    } else {
-        result
+    #[test]
+    fn expanded_tool_shows_arguments_and_readable_result_next_to_numbered_timestamp() {
+        let mut app = App::new(crate::config::AppConfig::default(), "".into());
+        app.add_message(
+            "model_tool_call",
+            r#"{"functionCall":{"name":"read_file","args":{"path":"fixture.rs"},"id":"call-1"}}"#,
+        );
+        app.add_message("tool", "read_file completed");
+        app.add_message("function", r#"{"functionResponse":{"name":"read_file","response":{"output":"line one\nline two"},"id":"call-1"}}"#);
+        app.interaction.expanded.insert(1);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_chat(&app, f, f.area())).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("#2"));
+        assert!(!text.contains("/inspect"));
+        assert!(text.contains("Arguments:"));
+        assert!(text.contains("fixture.rs"));
+        assert!(text.contains("line one"));
+        assert!(text.contains("line two"));
     }
 }

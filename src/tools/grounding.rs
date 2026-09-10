@@ -559,54 +559,13 @@ fn weather_description(code: i64) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        is_retryable_status, looks_like_error_page, validate_http_url, weather_description,
-    };
-    use reqwest::StatusCode;
-
-    #[test]
-    fn only_http_urls_are_accepted() {
-        assert!(validate_http_url("https://example.com/path").is_ok());
-        assert!(validate_http_url("file:///tmp/example").is_err());
-        assert!(validate_http_url("not a url").is_err());
-    }
-
-    #[test]
-    fn transient_statuses_are_retryable() {
-        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
-        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
-    }
-
-    #[test]
-    fn challenge_pages_are_not_presented_as_content() {
-        assert!(looks_like_error_page(
-            "<title>Oops, something went wrong</title>"
-        ));
-        assert!(looks_like_error_page("Cloudflare Ray ID: abc"));
-        assert!(!looks_like_error_page(
-            "<article><p>Markets opened higher today.</p></article>"
-        ));
-    }
-
-    #[test]
-    fn weather_codes_are_summarized_for_voice() {
-        assert_eq!(weather_description(0), "clear skies");
-        assert_eq!(weather_description(61), "rain");
-        assert_eq!(weather_description(95), "thunderstorms");
-    }
-}
-
 fn extract_ddg_url(raw: &str) -> String {
     if let Some(pos) = raw.find("uddg=") {
         let rest = &raw[pos + 5..];
         let end = rest.find('&').unwrap_or(rest.len());
         let encoded = &rest[..end];
         url_decode(encoded)
-    } else if raw.starts_with("//duckduckgo.com/l/?uddg=") {
-        let rest = &raw[25..];
+    } else if let Some(rest) = raw.strip_prefix("//duckduckgo.com/l/?uddg=") {
         let end = rest.find('&').unwrap_or(rest.len());
         url_decode(&rest[..end])
     } else if raw.starts_with("http://") || raw.starts_with("https://") {
@@ -652,4 +611,44 @@ fn url_decode(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&result).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_retryable_status, looks_like_error_page, validate_http_url, weather_description,
+    };
+    use reqwest::StatusCode;
+
+    #[test]
+    fn only_http_urls_are_accepted() {
+        assert!(validate_http_url("https://example.com/path").is_ok());
+        assert!(validate_http_url("file:///tmp/example").is_err());
+        assert!(validate_http_url("not a url").is_err());
+    }
+
+    #[test]
+    fn transient_statuses_are_retryable() {
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn challenge_pages_are_not_presented_as_content() {
+        assert!(looks_like_error_page(
+            "<title>Oops, something went wrong</title>"
+        ));
+        assert!(looks_like_error_page("Cloudflare Ray ID: abc"));
+        assert!(!looks_like_error_page(
+            "<article><p>Markets opened higher today.</p></article>"
+        ));
+    }
+
+    #[test]
+    fn weather_codes_are_summarized_for_voice() {
+        assert_eq!(weather_description(0), "clear skies");
+        assert_eq!(weather_description(61), "rain");
+        assert_eq!(weather_description(95), "thunderstorms");
+    }
 }

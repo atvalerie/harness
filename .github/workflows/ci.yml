@@ -12,16 +12,22 @@ permissions:
 jobs:
   quality:
     name: Rust quality
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked
       - name: Build release binary

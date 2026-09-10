@@ -3,19 +3,26 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
 
 use super::{working_dir_path, SharedWorkingDir, Tool, ToolPreview};
 
 const CWD_MARKER: &str = "__HOLIDAY_CWD__";
 
 pub struct RunCommandTool {
+    tasks: crate::tasks::TaskManager,
     cwd: SharedWorkingDir,
 }
 
 impl RunCommandTool {
+    pub fn with_tasks(cwd: SharedWorkingDir, tasks: crate::tasks::TaskManager) -> Self {
+        Self { cwd, tasks }
+    }
+    #[cfg(test)]
     pub fn new(cwd: SharedWorkingDir) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            tasks: crate::tasks::TaskManager::default(),
+        }
     }
 }
 
@@ -67,7 +74,7 @@ impl Tool for RunCommandTool {
                     "description": "Start and detach the command instead of waiting for completion"
                 }
             },
-            "required": ["command"]
+            "required": ["command", "reason", "expected_effect"]
         })
     }
 
@@ -114,6 +121,10 @@ impl Tool for RunCommandTool {
 
         let starting_dir = working_dir_path(&self.cwd);
         let requested_shell = args.get("shell").and_then(|v| v.as_str()).unwrap_or("auto");
+        #[cfg(not(windows))]
+        if !matches!(requested_shell, "auto" | "sh") {
+            return Err("This platform supports auto/sh for managed shell commands".into());
+        }
         let timeout_seconds = args
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
@@ -138,11 +149,11 @@ impl Tool for RunCommandTool {
                 Command::new("powershell.exe")
             };
             if selected_shell == "cmd" {
-                let wrapped = format!("{} & echo. & echo {}!CD!", command_str, CWD_MARKER);
+                let wrapped = format!("{} & set holiday_exit=!ERRORLEVEL! & echo. & echo {}!CD! & exit /b !holiday_exit!", command_str, CWD_MARKER);
                 c.args(["/V:ON", "/C", &wrapped]);
             } else {
                 let wrapped = format!(
-                    "{}; Write-Output (\"{}\" + (Get-Location).Path)",
+                    "{}; $holidaySuccess=$?; $holidayExit=$LASTEXITCODE; if ($null -eq $holidayExit) {{ $holidayExit=0 }}; if (-not $holidaySuccess -and $holidayExit -eq 0) {{ $holidayExit=1 }}; Write-Output (\"{}\" + (Get-Location).Path); exit $holidayExit",
                     command_str, CWD_MARKER
                 );
                 c.args([
@@ -161,37 +172,32 @@ impl Tool for RunCommandTool {
         #[cfg(not(target_os = "windows"))]
         let mut cmd = {
             let mut c = Command::new("sh");
-            let wrapped = format!("{}; printf '\\n{}%s\\n' \"$PWD\"", command_str, CWD_MARKER);
+            let wrapped = format!(
+                "{}; holiday_exit=$?; printf '\\n{}%s\\n' \"$PWD\"; exit \"$holiday_exit\"",
+                command_str, CWD_MARKER
+            );
             c.args(["-c", &wrapped]);
             c
         };
 
         cmd.current_dir(&starting_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if background {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-            let child = cmd.spawn().map_err(|e| {
-                format!(
-                    "Failed to start background command '{}': {}",
-                    command_str, e
-                )
-            })?;
-            return Ok(format!(
-                "Started background command (pid={}): {}",
-                child.id().unwrap_or(0),
-                command_str
-            ));
-        }
-
-        cmd.kill_on_drop(true);
-        let output = timeout(Duration::from_secs(timeout_seconds), cmd.output())
-            .await
-            .map_err(|_| format!("Command timed out after {} seconds", timeout_seconds))?
-            .map_err(|e| format!("Failed to spawn command '{}': {}", command_str, e))?;
-
-        let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let output = self
+            .tasks
+            .process(
+                cmd,
+                command_str,
+                timeout_seconds,
+                background,
+                args.get("_holiday_epoch")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            )
+            .await?;
+        let raw_stdout = output.stdout;
         let (stdout, discovered_cwd) = split_cwd_marker(&raw_stdout);
         if let Some(next_dir) = discovered_cwd {
             if next_dir.is_dir() {
@@ -201,8 +207,8 @@ impl Tool for RunCommandTool {
                 }
             }
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let code = output.status.code().unwrap_or(-1);
+        let stderr = output.stderr;
+        let code = output.code;
 
         let mut out = format!("Exit Code: {}\n", code);
         if !stdout.is_empty() {

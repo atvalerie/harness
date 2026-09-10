@@ -9,7 +9,8 @@ use ratatui::{
 
 pub fn input_height(app: &App, width: u16) -> u16 {
     let content_width = width.saturating_sub(4).max(1) as usize;
-    let text_rows = input_text_rows(&app.input_buffer, content_width);
+    let text_rows = input_text_rows(&app.input_buffer, content_width)
+        .max(cursor_position(&app.input_buffer, app.input_cursor, content_width).0 + 1);
     let attachment_rows = usize::from(!app.draft_attachments.is_empty());
     (text_rows + attachment_rows + 2).clamp(3, 10) as u16
 }
@@ -18,6 +19,10 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     let content_width = area.width.saturating_sub(4).max(1) as usize;
     let cursor = app.input_cursor.min(app.input_buffer.chars().count());
     let mut lines = input_text_lines(&app.input_buffer, content_width);
+    let needed = cursor_position(&app.input_buffer, cursor, content_width).0 + 1;
+    while lines.len() < needed {
+        lines.push(Line::from("  "));
+    }
 
     if !app.draft_attachments.is_empty() {
         let mut chips = vec![Span::styled(
@@ -44,11 +49,18 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     let viewport_height = area.height.saturating_sub(2) as usize;
     let scroll = cursor_row.saturating_sub(viewport_height.saturating_sub(1));
     let status = app.status_message.as_deref().unwrap_or("");
-    let status = status.chars().take(80).collect::<String>();
+    let mut status_width = 0;
+    let status = status
+        .chars()
+        .take_while(|ch| {
+            status_width += unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0);
+            status_width <= area.width.saturating_sub(14) as usize
+        })
+        .collect::<String>();
     let hint = if app.draft_attachments.is_empty() {
-        " Ctrl+Enter/Ctrl+J: newline "
+        " /: commands | Ctrl+R: history | Ctrl+O: expand tool "
     } else {
-        " Ctrl+Enter/Ctrl+J: newline | Ctrl+X: remove last attachment "
+        " Ctrl+K: commands | Ctrl+X: remove attachment | Ctrl+Enter: newline "
     };
     let paragraph = Paragraph::new(lines)
         .block(
@@ -85,80 +97,74 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn input_text_rows(input: &str, content_width: usize) -> usize {
-    let width = content_width.max(1);
-    input
-        .split('\n')
-        .map(|line| ((line.chars().count() + width - 1) / width).max(1))
-        .sum()
-}
-
-fn input_text_lines(input: &str, content_width: usize) -> Vec<Line<'static>> {
-    let width = content_width.max(1);
-    let mut lines = Vec::new();
-    for (logical_index, logical_line) in input.split('\n').enumerate() {
-        let prefix = if logical_index == 0 { "> " } else { "  " };
-        let prefix_style = if logical_index == 0 {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let chars = logical_line.chars().collect::<Vec<_>>();
-        if chars.is_empty() {
-            lines.push(Line::from(Span::styled(prefix, prefix_style)));
-            continue;
+fn wrapped_rows(input: &str, width: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for logical in input.split('\n') {
+        let mut row = String::new();
+        let mut cells = 0;
+        for glyph in logical.graphemes(true) {
+            let n = UnicodeWidthStr::width(glyph);
+            if cells + n > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                cells = 0;
+            }
+            row.push_str(glyph);
+            cells += n;
         }
-        for (chunk_index, chunk) in chars.chunks(width).enumerate() {
-            let continuation = if chunk_index == 0 { prefix } else { "  " };
-            let continuation_style = if chunk_index == 0 {
-                prefix_style
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(continuation, continuation_style),
+        rows.push(row);
+    }
+    rows
+}
+fn input_text_rows(input: &str, width: usize) -> usize {
+    wrapped_rows(input, width).len()
+}
+fn input_text_lines(input: &str, width: usize) -> Vec<Line<'static>> {
+    wrapped_rows(input, width)
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            Line::from(vec![
                 Span::styled(
-                    chunk.iter().collect::<String>(),
-                    Style::default().fg(Color::White),
+                    if i == 0 { "> " } else { "  " },
+                    Style::default().fg(Color::Cyan),
                 ),
-            ]));
-        }
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "> ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
-    lines
+                Span::raw(row),
+            ])
+        })
+        .collect()
 }
-
 fn cursor_position(input: &str, cursor: usize, width: usize) -> (usize, usize) {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
     let width = width.max(1);
     let mut row = 0;
     let mut col = 0;
     let mut seen = 0;
-    for character in input.chars() {
+    for glyph in input.graphemes(true) {
         if seen >= cursor {
             break;
         }
-        seen += 1;
-        if character == '\n' {
+        seen += glyph.chars().count();
+        if glyph == "\n" {
             row += 1;
             col = 0;
         } else {
-            col += 1;
-            if col >= width {
-                row += col / width;
-                col %= width;
+            let n = UnicodeWidthStr::width(glyph);
+            if col + n > width {
+                row += 1;
+                col = 0;
             }
+            col += n;
         }
     }
-    (row, col)
+    if col == width {
+        (row + 1, 0)
+    } else {
+        (row, col)
+    }
 }
 
 #[cfg(test)]

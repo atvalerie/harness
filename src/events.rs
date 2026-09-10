@@ -1,5 +1,13 @@
 #[derive(Debug, Clone)]
 pub enum StreamSignal {
+    ToolReviewed {
+        pending: crate::app::PendingToolCall,
+        result: Result<crate::auto_review::Decision, String>,
+    },
+    ModelSelected {
+        model: String,
+        protocol: String,
+    },
     ThoughtDelta(String),
     TextDelta(String),
     ToolCall {
@@ -45,9 +53,10 @@ pub enum AppEvent {
     },
     SystemNotification(String),
     ModelsFetched {
+        epoch: u64,
         result: Result<Vec<crate::client::types::ModelInfo>, String>,
         interactive: bool,
     },
-    CompactionFinished(Result<String, String>),
+    CompactionFinished(u64, Result<String, String>),
     ProviderUsageFetched(Result<String, String>),
 }

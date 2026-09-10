@@ -14,6 +14,7 @@ pub struct AgentManager {
     next_id: Arc<AtomicU64>,
     agents: Arc<Mutex<BTreeMap<String, AgentRecord>>>,
     slots: Arc<Semaphore>,
+    runtime: Arc<Mutex<Option<crate::worker::WorkerRuntime>>>,
 }
 
 struct AgentRecord {
@@ -21,11 +22,12 @@ struct AgentRecord {
     status: String,
     output: String,
     tx: UnboundedSender<AgentCommand>,
+    stop: tokio::sync::watch::Sender<bool>,
+    write_paths: Vec<std::path::PathBuf>,
 }
 
 enum AgentCommand {
     Message(String),
-    Stop,
 }
 
 impl AgentManager {
@@ -34,6 +36,13 @@ impl AgentManager {
             next_id: Arc::new(AtomicU64::new(1)),
             agents: Arc::new(Mutex::new(BTreeMap::new())),
             slots: Arc::new(Semaphore::new(8)),
+            runtime: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn configure(&self, runtime: crate::worker::WorkerRuntime) {
+        if let Ok(mut current) = self.runtime.lock() {
+            *current = Some(runtime);
         }
     }
 
@@ -44,42 +53,89 @@ impl AgentManager {
         fallbacks: Vec<String>,
         max_retries: u32,
         task: String,
+        paths: Vec<String>,
     ) -> Result<String, String> {
         let task = task.trim().to_string();
         if task.is_empty() {
             return Err("Agent task cannot be empty".to_string());
         }
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "Worker runtime unavailable")?
+            .clone();
+        let write_paths = if let Some(runtime) = &runtime {
+            crate::worker::scopes(&runtime.root, &paths)?
+        } else {
+            Vec::new()
+        };
+        let mut reservations = self.agents.lock().map_err(|_| "Agent store unavailable")?;
+        if reservations.values().any(|agent| {
+            !matches!(agent.status.as_str(), "stopped" | "failed")
+                && agent
+                    .write_paths
+                    .iter()
+                    .any(|path| write_paths.contains(path))
+        }) {
+            return Err("Another active worker owns one of these write files".into());
+        }
+        if reservations
+            .values()
+            .filter(|a| !matches!(a.status.as_str(), "failed" | "stopped"))
+            .count()
+            >= 32
+        {
+            return Err("Worker queue is full (32 active/queued workers)".into());
+        }
+        let (stop, mut stopping) = tokio::sync::watch::channel(false);
         let id = format!("agent-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::unbounded_channel();
-        self.agents
-            .lock()
-            .map_err(|_| "Agent manager lock is poisoned".to_string())?
-            .insert(
-                id.clone(),
-                AgentRecord {
-                    task: task.clone(),
-                    status: "queued".to_string(),
-                    output: String::new(),
-                    tx,
-                },
-            );
+        reservations.insert(
+            id.clone(),
+            AgentRecord {
+                task: task.clone(),
+                status: "queued".to_string(),
+                output: String::new(),
+                tx,
+                stop,
+                write_paths: write_paths.clone(),
+            },
+        );
 
+        drop(reservations);
         let agents = self.agents.clone();
         let slots = self.slots.clone();
         let worker_id = id.clone();
         tokio::spawn(async move {
-            agent_loop(
-                agents,
-                worker_id,
-                client,
-                model,
-                fallbacks,
-                max_retries,
-                task,
-                rx,
-                slots,
-            )
-            .await;
+            let tasks = runtime.as_ref().map(|r| r.tasks.clone());
+            let task_record = tasks
+                .as_ref()
+                .map(|tasks| tasks.start(&format!("worker {worker_id}"), 0));
+            let (task_id, mut cancellation) = task_record
+                .map(|(id, rx)| (Some(id), Some(rx)))
+                .unwrap_or((None, None));
+            tokio::select! {
+                _=agent_loop(AgentJob{agents:agents.clone(),id:worker_id.clone(),client,model,fallbacks,max_retries,task,commands:rx,slots,runtime,write_paths})=>{},
+                _=stopping.changed()=>{set_agent_status(&agents,&worker_id,"stopped",None);},
+                _=async {if let Some(rx)=&mut cancellation{let _=rx.changed().await;}else{std::future::pending::<()>().await;}}=>{set_agent_status(&agents,&worker_id,"stopped",None);},
+            }
+            if let (Some(tasks), Some(id)) = (tasks, task_id) {
+                let status = agents
+                    .lock()
+                    .ok()
+                    .and_then(|all| all.get(&worker_id).map(|a| a.status.clone()))
+                    .unwrap_or_else(|| "failed".into());
+                tasks.finish(
+                    &id,
+                    if status == "stopped" {
+                        "cancelled"
+                    } else if status == "failed" {
+                        "failed"
+                    } else {
+                        "completed"
+                    },
+                );
+            }
         });
         Ok(format!(
             "Spawned {}. Use agent_status or agent_inspect to check it.",
@@ -111,10 +167,10 @@ impl AgentManager {
             .get(id)
             .ok_or_else(|| format!("Unknown agent '{}'", id))?;
         agent
-            .tx
-            .send(AgentCommand::Stop)
-            .map_err(|_| format!("Agent '{}' is no longer running", id))?;
-        Ok(format!("Stop requested for {}.", id))
+            .stop
+            .send(true)
+            .map_err(|_| format!("Agent '{id}' is no longer running"))?;
+        Ok(format!("Stop requested for {id}."))
     }
 
     pub fn status(&self) -> String {
@@ -164,7 +220,7 @@ impl AgentManager {
     }
 }
 
-async fn agent_loop(
+struct AgentJob {
     agents: Arc<Mutex<BTreeMap<String, AgentRecord>>>,
     id: String,
     client: AiClient,
@@ -172,9 +228,26 @@ async fn agent_loop(
     fallbacks: Vec<String>,
     max_retries: u32,
     task: String,
-    mut commands: UnboundedReceiver<AgentCommand>,
+    commands: UnboundedReceiver<AgentCommand>,
     slots: Arc<Semaphore>,
-) {
+    runtime: Option<crate::worker::WorkerRuntime>,
+    write_paths: Vec<std::path::PathBuf>,
+}
+
+async fn agent_loop(job: AgentJob) {
+    let AgentJob {
+        agents,
+        id,
+        client,
+        model,
+        fallbacks,
+        max_retries,
+        task,
+        mut commands,
+        slots,
+        runtime,
+        write_paths,
+    } = job;
     let mut conversation = vec![Content {
         role: Some("user".to_string()),
         parts: vec![Part::Text {
@@ -214,23 +287,38 @@ async fn agent_loop(
             tools: None,
         };
 
-        match client
-            .generate_content_with_fallback(&model, &fallbacks, max_retries, &request)
+        let result = if let Some(runtime) = &runtime {
+            crate::worker::run(
+                runtime,
+                &client,
+                &model,
+                &fallbacks,
+                max_retries,
+                &mut conversation,
+                &write_paths,
+            )
             .await
-        {
+        } else {
+            client
+                .generate_content_with_fallback(&model, &fallbacks, max_retries, &request)
+                .await
+        };
+        match result {
             Ok(output) => {
                 let bounded = output
                     .chars()
                     .take(MAX_AGENT_OUTPUT_CHARS)
                     .collect::<String>();
                 set_agent_status(&agents, &id, "idle", Some(bounded.clone()));
-                conversation.push(Content {
-                    role: Some("model".to_string()),
-                    parts: vec![Part::Text {
-                        text: bounded,
-                        thought: None,
-                    }],
-                });
+                if runtime.is_none() {
+                    conversation.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part::Text {
+                            text: bounded,
+                            thought: None,
+                        }],
+                    });
+                }
             }
             Err(error) => {
                 set_agent_status(&agents, &id, "failed", Some(format!("Error: {}", error)));
@@ -250,7 +338,7 @@ async fn agent_loop(
                 });
             }
             Some(AgentCommand::Message(_)) => {}
-            Some(AgentCommand::Stop) | None => {
+            None => {
                 set_agent_status(&agents, &id, "stopped", None);
                 return;
             }
@@ -346,7 +434,7 @@ impl crate::tools::Tool for AgentTool {
         match self.kind {
             AgentToolKind::Spawn => json!({
                 "type":"object",
-                "properties":{"task":{"type":"string","description":"Focused task plus necessary source excerpts, evidence, and constraints; the subagent cannot inspect files or access parent context independently"}},
+                "properties":{"task":{"type":"string","description":"Focused task and necessary context. Worker inherits only explicitly allowed filesystem tools."},"write_paths":{"type":"array","items":{"type":"string"},"description":"Exact workspace-relative files this worker may edit, only if parent workspace_write permission is allow. Omit for read-only work."}},
                 "required":["task"]
             }),
             AgentToolKind::Status => json!({"type":"object","properties":{}}),
@@ -391,6 +479,15 @@ impl crate::tools::Tool for AgentTool {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                args.get("write_paths")
+                    .and_then(|v| v.as_array())
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             ),
             AgentToolKind::Status => Ok(self.manager.status()),
             AgentToolKind::Message => self.manager.message(

@@ -80,7 +80,13 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 .bg(state_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
+        Span::styled(
+            if app.auto_mode { " AUTO REVIEW " } else { " " },
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(activity, Style::default().fg(Color::LightCyan)),
         Span::styled(
             &app.config.model,

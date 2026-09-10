@@ -69,6 +69,8 @@ pub struct PendingToolCall {
 
 pub struct App {
     pub config: AppConfig,
+    pub interaction: crate::interaction::Interaction,
+    pub review: crate::review::ReviewStore,
     pub client: AiClient,
     pub tool_registry: ToolRegistry,
     pub state: EngineState,
@@ -80,6 +82,8 @@ pub struct App {
     pub input_history_idx: Option<usize>,
     pub draft_attachments: Vec<DraftAttachment>,
     pub plan_mode: bool,
+    /// Runtime-only override; never persisted into permission settings.
+    pub auto_mode: bool,
 
     // Active token metrics
     pub prompt_tokens: u64,
@@ -116,19 +120,15 @@ pub struct App {
 
     // Models list cached
     pub available_models: Vec<crate::client::types::ModelInfo>,
-    pub show_models_modal: bool,
+    pub models_epoch: u64,
     pub models_scroll: usize,
     pub models_selected: usize,
     pub models_filter: String,
     pub models_searching: bool,
-    pub show_thinking_modal: bool,
     pub thinking_selected: usize,
     pub thinking_target_model: Option<String>,
-    pub show_plan_modal: bool,
     pub plan_modal_selected: usize,
-    pub show_permissions_modal: bool,
     pub permissions_selected: usize,
-    pub show_sessions_modal: bool,
     pub available_sessions: Vec<session::SessionInfo>,
     pub sessions_selected: usize,
 
@@ -239,349 +239,6 @@ fn discover_project_context(start: &Path) -> (Option<PathBuf>, String) {
     (root, instructions.join("\n\n"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{truncate_tool_output, App, Attachment, ChatMessage, MAX_TOOL_RESULT_CHARS};
-    use crate::client::types::{FunctionCallPayload, FunctionResponsePayload, Part};
-    use crate::config::AppConfig;
-    use serde_json::json;
-
-    fn message(role: &str, part: Part) -> ChatMessage {
-        ChatMessage {
-            role: role.to_string(),
-            content: serde_json::to_string(&part).unwrap(),
-            timestamp: String::new(),
-            attachments: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn drops_orphaned_openai_tool_calls_but_keeps_completed_calls() {
-        let mut config = AppConfig::default();
-        config.providers.get_mut("gemini").unwrap().kind = "openai-compatible".to_string();
-        let mut app = App::new(config, "test-key".to_string());
-        app.messages = vec![
-            message(
-                "model_tool_call",
-                Part::FunctionCall {
-                    function_call: FunctionCallPayload {
-                        name: "read_file".to_string(),
-                        args: json!({"path": "orphan.rs"}),
-                        id: Some("call-orphan".to_string()),
-                    },
-                    thought_signature: None,
-                },
-            ),
-            ChatMessage {
-                role: "user".to_string(),
-                content: "continue".to_string(),
-                timestamp: String::new(),
-                attachments: Vec::new(),
-            },
-        ];
-        let request = app.build_request();
-        assert!(request.contents.iter().all(|content| {
-            content
-                .parts
-                .iter()
-                .all(|part| !matches!(part, Part::FunctionCall { .. }))
-        }));
-
-        app.messages.push(message(
-            "model_tool_call",
-            Part::FunctionCall {
-                function_call: FunctionCallPayload {
-                    name: "read_file".to_string(),
-                    args: json!({"path": "done.rs"}),
-                    id: Some("call-done".to_string()),
-                },
-                thought_signature: None,
-            },
-        ));
-        app.messages.push(message(
-            "function",
-            Part::FunctionResponse {
-                function_response: FunctionResponsePayload {
-                    name: "read_file".to_string(),
-                    response: json!({"output": "ok"}),
-                    id: Some("call-done".to_string()),
-                },
-            },
-        ));
-        let request = app.build_request();
-        assert!(request.contents.iter().any(|content| {
-            content.parts.iter().any(|part| {
-                matches!(part, Part::FunctionCall { function_call, .. } if function_call.id.as_deref() == Some("call-done"))
-            })
-        }));
-    }
-
-    #[test]
-    fn drops_orphaned_codex_tool_calls_and_outputs() {
-        let mut config = AppConfig::default();
-        config.provider = "codex".to_string();
-        config.model = "gpt-test".to_string();
-        let mut app = App::new(config, "test-key".to_string());
-        app.messages = vec![
-            message(
-                "model_tool_call",
-                Part::FunctionCall {
-                    function_call: FunctionCallPayload {
-                        name: "read_file".to_string(),
-                        args: json!({"path": "orphan.rs"}),
-                        id: Some("call-orphan".to_string()),
-                    },
-                    thought_signature: None,
-                },
-            ),
-            message(
-                "function",
-                Part::FunctionResponse {
-                    function_response: FunctionResponsePayload {
-                        name: "read_file".to_string(),
-                        response: json!({"output": "orphan output"}),
-                        id: Some("call-unrelated".to_string()),
-                    },
-                },
-            ),
-            ChatMessage {
-                role: "user".to_string(),
-                content: "continue".to_string(),
-                timestamp: String::new(),
-                attachments: Vec::new(),
-            },
-        ];
-
-        let request = app.build_request();
-        assert!(request.contents.iter().all(|content| {
-            content.parts.iter().all(|part| {
-                !matches!(
-                    part,
-                    Part::FunctionCall { .. } | Part::FunctionResponse { .. }
-                )
-            })
-        }));
-    }
-
-    #[test]
-    fn request_uses_maintained_prompt_and_sys_only_changes_customization() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.project_instructions = "Project convention: use tabs.".to_string();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.handle_slash_command("/sys Respond in Polish.", tx.clone());
-        app.plan_mode = true;
-        let request = app.build_request();
-        let system = request.system_instruction.unwrap();
-        let Part::Text { text, .. } = &system.parts[0] else {
-            panic!("missing system text")
-        };
-        assert!(text.starts_with(crate::prompts::MAIN.trim()));
-        assert!(text.contains("Respond in Polish."));
-        assert!(text.contains("Project convention: use tabs."));
-        assert!(text.ends_with(crate::prompts::PLAN.trim()));
-        app.handle_slash_command("/sys --clear", tx);
-        assert!(app.config.system_instruction.is_empty());
-        assert!(app
-            .effective_system_instruction()
-            .starts_with(crate::prompts::MAIN.trim()));
-    }
-
-    #[test]
-    fn runtime_session_instruction_is_request_scoped() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.set_session_instruction(Some("Speak for this frontend session.".to_string()));
-        assert!(app
-            .effective_system_instruction()
-            .contains("--- BEGIN Session instructions ---\nSpeak for this frontend session."));
-        app.start_new_session();
-        assert!(!app
-            .effective_system_instruction()
-            .contains("Speak for this frontend session."));
-    }
-
-    #[test]
-    fn compaction_preserves_attachment_evidence_and_rejects_empty_summary() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.add_message_with_attachments(
-            "user",
-            "Review this",
-            vec![
-                Attachment {
-                    kind: "text".into(),
-                    name: "source.rs".into(),
-                    mime_type: None,
-                    text: Some("fn supplied_code() {}".into()),
-                    data: None,
-                },
-                Attachment {
-                    kind: "image".into(),
-                    name: "screen.png".into(),
-                    mime_type: Some("image/png".into()),
-                    text: None,
-                    data: Some("IMAGE_PAYLOAD_SHOULD_NOT_BE_COPIED".into()),
-                },
-            ],
-        );
-        app.add_message("thought", "PRIVATE_REASONING");
-        let transcript = super::compaction_transcript(&app.messages);
-        assert!(transcript.contains("fn supplied_code() {}"));
-        assert!(transcript.contains("screen.png"));
-        assert!(!transcript.contains("IMAGE_PAYLOAD_SHOULD_NOT_BE_COPIED"));
-        assert!(!transcript.contains("PRIVATE_REASONING"));
-        for line in transcript.lines() {
-            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
-        }
-        let original = app.messages[0].content.clone();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.handle_compaction_result(Ok("  ".into()), tx);
-        assert_eq!(app.messages[0].content, original);
-        assert_eq!(app.messages[0].attachments.len(), 2);
-        assert!(!app.messages.iter().any(|message| message.role == "summary"));
-    }
-
-    #[test]
-    fn context_metric_is_not_last_request_total() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.add_message("user", "A short prompt");
-        app.total_tokens = 900_000;
-        assert!(app.context_tokens < 900_000);
-        assert!(app.context_tokens_estimated);
-    }
-
-    #[test]
-    fn compact_summary_is_replayed_as_model_input() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.messages.push(ChatMessage {
-            role: "summary".to_string(),
-            content: "Compact History Summary:\nThe user is fixing session restore.".to_string(),
-            timestamp: String::new(),
-            attachments: Vec::new(),
-        });
-        app.messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: "UI-only notice".to_string(),
-            timestamp: String::new(),
-            attachments: Vec::new(),
-        });
-        let request = app.build_request();
-        assert!(request.contents.iter().any(|content| {
-            content.parts.iter().any(
-                |part| matches!(part, Part::Text { text, .. } if text.contains("session restore")),
-            )
-        }));
-        assert!(request.contents.iter().all(|content| {
-            content
-                .parts
-                .iter()
-                .all(|part| !matches!(part, Part::Text { text, .. } if text == "UI-only notice"))
-        }));
-    }
-
-    #[test]
-    fn tool_output_truncation_is_unicode_safe() {
-        let output = "界".repeat(MAX_TOOL_RESULT_CHARS + 256);
-        let truncated = truncate_tool_output(&output);
-        assert!(truncated.contains("tool output truncated"));
-        assert!(truncated.starts_with("界"));
-        assert!(truncated.ends_with("界"));
-    }
-
-    #[test]
-    fn structured_plan_requires_a_heading_and_step() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.add_message(
-            "model",
-            "## Plan\n1. Inspect the project\n2. Propose the fix",
-        );
-        assert!(app.latest_model_has_plan());
-        app.messages.push(ChatMessage {
-            role: "model".to_string(),
-            content: "I have some ideas, but no executable outline yet.".to_string(),
-            timestamp: String::new(),
-            attachments: Vec::new(),
-        });
-        assert!(!app.latest_model_has_plan());
-    }
-
-    #[test]
-    fn attachments_are_sent_after_prompt_with_text_last() {
-        let mut config = AppConfig::default();
-        config.providers.get_mut("gemini").unwrap().kind = "gemini".to_string();
-        let mut app = App::new(config, "test-key".to_string());
-        app.add_message_with_attachments(
-            "user",
-            "question",
-            vec![
-                Attachment {
-                    kind: "image".to_string(),
-                    name: "screen.png".to_string(),
-                    mime_type: Some("image/png".to_string()),
-                    text: None,
-                    data: Some("base64-image".to_string()),
-                },
-                Attachment {
-                    kind: "text".to_string(),
-                    name: "paste-1.txt".to_string(),
-                    mime_type: Some("text/plain".to_string()),
-                    text: Some("actual pasted content".to_string()),
-                    data: None,
-                },
-            ],
-        );
-
-        let request = app.build_request();
-        let user = request
-            .contents
-            .iter()
-            .find(|content| content.role.as_deref() == Some("user"))
-            .unwrap();
-        assert!(matches!(&user.parts[0], Part::InlineData { .. }));
-        assert!(
-            matches!(&user.parts[1], Part::Text { text, .. } if text.contains("actual pasted content"))
-        );
-        assert!(matches!(&user.parts[2], Part::Text { text, .. } if text == "question"));
-    }
-
-    #[test]
-    fn attachment_commands_operate_on_draft_instead_of_clearing_it() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.draft_attachments.push(super::DraftAttachment::Text {
-            name: "paste-1.txt".to_string(),
-            text: "editable paste".to_string(),
-        });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-
-        app.input_buffer = "/attachments".to_string();
-        app.input_cursor = app.input_buffer.chars().count();
-        app.handle_enter(tx.clone());
-        assert_eq!(app.draft_attachments.len(), 1);
-
-        app.input_buffer = "/edit 1".to_string();
-        app.input_cursor = app.input_buffer.chars().count();
-        app.handle_enter(tx);
-        assert!(app.draft_attachments.is_empty());
-        assert_eq!(app.input_buffer, "editable paste");
-    }
-
-    #[test]
-    fn ctrl_c_clears_draft_before_quitting() {
-        let mut app = App::new(AppConfig::default(), "test-key".to_string());
-        app.input_buffer = "unsent text".to_string();
-        app.input_cursor = app.input_buffer.chars().count();
-
-        app.handle_ctrl_c();
-        assert!(app.input_buffer.is_empty());
-        assert!(!app.should_quit);
-        assert!(app
-            .status_message
-            .as_deref()
-            .is_some_and(|message| message.contains("Press Ctrl+C again")));
-
-        app.handle_ctrl_c();
-        assert!(app.should_quit);
-    }
-}
-
 impl App {
     pub fn new(config: AppConfig, api_key: String) -> Self {
         let client = AiClient::from_config(api_key.clone(), &config);
@@ -593,7 +250,17 @@ impl App {
             config.max_retries,
         );
         let session_path = session::new_session_path(&config.session_name);
-        let show_permissions_modal = !config.permissions_configured;
+        let review = crate::review::ReviewStore::default();
+        if let Some(path) = &session_path {
+            let _ = review.bind(path, false);
+        }
+        let mut interaction = crate::interaction::Interaction::default();
+        interaction.credentials_available = !api_key.is_empty();
+        interaction.dirty = true;
+        interaction.set_overlay(
+            crate::interaction::Overlay::Permissions,
+            !config.permissions_configured,
+        );
         let initial_working_dir = tool_registry.working_dir();
         let (project_root, project_instructions) = discover_project_context(&initial_working_dir);
         if let Some(root) = &project_root {
@@ -632,20 +299,18 @@ impl App {
             tool_turn_failed: false,
             session_allowed_tools: HashSet::new(),
             modal_scroll: 0,
+            interaction,
+            review,
             available_models: Vec::new(),
-            show_models_modal: false,
+            models_epoch: 0,
             models_scroll: 0,
             models_selected: 0,
             models_filter: String::new(),
             models_searching: false,
-            show_thinking_modal: false,
             thinking_selected: 0,
             thinking_target_model: None,
-            show_plan_modal: false,
             plan_modal_selected: 0,
-            show_permissions_modal,
             permissions_selected: 0,
-            show_sessions_modal: false,
             available_sessions: Vec::new(),
             sessions_selected: 0,
             stream_epoch: 0,
@@ -655,6 +320,7 @@ impl App {
             provider_limits: None,
             status_message: Some("Ready".to_string()),
             should_quit: false,
+            auto_mode: false,
             pending_generation_after_compaction: false,
             pending_todo_notice: None,
             session_path,
@@ -689,10 +355,21 @@ impl App {
     }
 
     pub fn context_limit(&self) -> Option<u64> {
-        self.available_models
-            .iter()
-            .find(|model| same_model_id(&model.id, &self.config.model))
-            .and_then(|model| model.input_token_limit)
+        self.config
+            .active_model_profile()
+            .context_window
+            .filter(|limit| *limit > 0)
+            .or(self
+                .config
+                .active_model_profile()
+                .input_token_limit
+                .filter(|limit| *limit > 0))
+            .or_else(|| {
+                self.available_models
+                    .iter()
+                    .find(|model| same_model_id(&model.id, &self.config.model))
+                    .and_then(|model| model.context_window.or(model.input_token_limit))
+            })
     }
 
     pub fn refresh_client_from_config(&mut self) {
@@ -709,27 +386,115 @@ impl App {
                 .map(|auth| auth.account_id)
                 .unwrap_or_default(),
         );
-        if let Some(api_key) = self.config.get_api_key_for_active_provider() {
-            self.client.update_api_key(api_key);
-        }
+        self.client.update_api_key(
+            self.config
+                .get_api_key_for_active_provider()
+                .unwrap_or_default(),
+        );
+        self.interaction.credentials_available =
+            self.config.get_api_key_for_active_provider().is_some();
+        self.models_epoch += 1;
+        self.available_models.clear();
+        self.provider_limits = None;
     }
 
     /// Refresh the active provider's model catalog without blocking the UI.
     /// The catalog is also the source of truth for model context limits.
-    pub fn prefetch_models(&self, tx: UnboundedSender<AppEvent>) {
+    pub fn prefetch_models(&mut self, tx: UnboundedSender<AppEvent>) {
         self.spawn_models_fetch(tx, false);
     }
 
-    fn spawn_models_fetch(&self, tx: UnboundedSender<AppEvent>, interactive: bool) {
+    /// Headless frontends resolve the same metadata before constructing a request.
+    /// A failed catalog fetch leaves configured overrides usable.
+    pub async fn ensure_models_loaded(&mut self) {
+        if !self.available_models.is_empty() {
+            return;
+        }
+        let free_only = self.config.provider.eq_ignore_ascii_case("opencode-zen")
+            && self.config.get_api_key_for_active_provider().is_none();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_models(
+                self.client.clone(),
+                self.config.configured_models(),
+                self.config.model.clone(),
+                free_only,
+            ),
+        )
+        .await;
+        if let Ok(Ok(mut models)) = result {
+            crate::model_metadata::enrich(&self.config, &mut models).await;
+            self.available_models = models;
+        }
+    }
+
+    pub fn install_models(
+        &mut self,
+        epoch: u64,
+        models: Vec<crate::client::types::ModelInfo>,
+    ) -> bool {
+        if epoch != self.models_epoch {
+            return false;
+        }
+        self.available_models = models;
+        true
+    }
+
+    pub fn output_budget(&self) -> u32 {
+        let requested = self
+            .config
+            .active_model_profile()
+            .max_output_tokens
+            .unwrap_or(8192)
+            .max(1);
+        let limit = self
+            .available_models
+            .iter()
+            .find(|model| same_model_id(&model.id, &self.config.model))
+            .and_then(|model| model.output_token_limit)
+            .filter(|limit| *limit > 0);
+        limit
+            .map(|limit| (requested as u64).min(limit) as u32)
+            .unwrap_or(requested)
+    }
+
+    fn context_would_overflow(&self, context_estimate: u64) -> bool {
+        let output_budget = self.output_budget() as u64;
+        let profile = self.config.active_model_profile();
+        let metadata = self
+            .available_models
+            .iter()
+            .find(|model| same_model_id(&model.id, &self.config.model));
+        let window = profile
+            .context_window
+            .filter(|limit| *limit > 0)
+            .or_else(|| metadata.and_then(|model| model.context_window));
+        let input_limit = profile
+            .input_token_limit
+            .filter(|limit| *limit > 0)
+            .or_else(|| metadata.and_then(|model| model.input_token_limit));
+        window.is_some_and(|limit| context_estimate.saturating_add(output_budget) >= limit)
+            || input_limit.is_some_and(|limit| context_estimate >= limit)
+    }
+
+    fn spawn_models_fetch(&mut self, tx: UnboundedSender<AppEvent>, interactive: bool) {
+        self.models_epoch += 1;
+        let epoch = self.models_epoch;
         let client = self.client.clone();
         let configured_models = self.config.configured_models();
         let bootstrap_model = self.config.model.clone();
         let free_only = self.config.provider.eq_ignore_ascii_case("opencode-zen")
             && self.config.get_api_key_for_active_provider().is_none();
 
+        let config = self.config.clone();
         tokio::spawn(async move {
-            let result = fetch_models(client, configured_models, bootstrap_model, free_only).await;
+            let mut result =
+                fetch_models(client, configured_models, bootstrap_model, free_only).await;
+            if let Ok(models) = &mut result {
+                crate::model_metadata::enrich(&config, models).await;
+            }
             let _ = tx.send(AppEvent::ModelsFetched {
+                epoch,
                 result,
                 interactive,
             });
@@ -885,16 +650,21 @@ impl App {
             return;
         };
         if self.restore_session(&info.path).is_ok() {
-            self.show_sessions_modal = false;
+            self.interaction
+                .set_overlay(crate::interaction::Overlay::Sessions, false);
             self.add_message("system", format!("Resumed session '{}'.", info.name));
         }
     }
 
     pub fn choose_plan_decision(&mut self, execute: bool, tx: UnboundedSender<AppEvent>) {
-        if !self.show_plan_modal {
+        if !self
+            .interaction
+            .is_overlay(crate::interaction::Overlay::Plan)
+        {
             return;
         }
-        self.show_plan_modal = false;
+        self.interaction
+            .set_overlay(crate::interaction::Overlay::Plan, false);
         if execute {
             self.plan_mode = false;
             self.add_message("system", "Plan approved. Starting execution.");
@@ -926,7 +696,8 @@ impl App {
 
     pub fn finish_permission_setup(&mut self) {
         self.config.permissions_configured = true;
-        self.show_permissions_modal = false;
+        self.interaction
+            .set_overlay(crate::interaction::Overlay::Permissions, false);
         match self.config.save() {
             Ok(()) => self.set_status("Tool permissions saved."),
             Err(error) => self.set_status(format!("Could not save tool permissions: {}", error)),
@@ -934,8 +705,21 @@ impl App {
     }
 
     pub fn restore_session(&mut self, path: &Path) -> Result<(), String> {
+        let old = self
+            .session_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.interaction.drafts.insert(
+            old,
+            (self.input_buffer.clone(), self.draft_attachments.clone()),
+        );
         let snapshot = session::load(path)
             .ok_or_else(|| format!("Could not read session snapshot: {}", path.display()))?;
+        self.interaction.reset_transcript();
+        self.review = crate::review::ReviewStore::default();
+        self.review.restore(snapshot.checkpoints);
+        self.review.bind(path, true)?;
         self.messages = snapshot.messages;
         self.usage_records = snapshot.usage;
         let restored_working_dir = snapshot
@@ -968,12 +752,21 @@ impl App {
         self.current_thought_buffer.clear();
         self.current_response_buffer.clear();
         self.pending_todo_notice = None;
-        self.show_plan_modal = false;
+        self.interaction
+            .set_overlay(crate::interaction::Overlay::Plan, false);
         self.plan_modal_selected = 0;
         self.request_started_at = None;
         self.request_usage_received = false;
         self.active_stream_task = None;
         self.session_path = Some(path.to_path_buf());
+        let (text, blocks) = self
+            .interaction
+            .drafts
+            .remove(&path.display().to_string())
+            .unwrap_or_default();
+        self.input_buffer = text;
+        self.input_cursor = self.input_buffer.chars().count();
+        self.draft_attachments = blocks;
         self.chat_scroll = 0;
         self.session_messages_at_save = self.messages.len();
         self.prompt_tokens = 0;
@@ -987,7 +780,7 @@ impl App {
         let Some(info) = self.available_sessions.get(self.sessions_selected).cloned() else {
             return;
         };
-        if std::fs::remove_file(&info.path).is_ok() {
+        if session::delete(&info.path).is_ok() {
             self.refresh_sessions();
             self.set_status(format!("Deleted session '{}'", info.name));
         }
@@ -1000,8 +793,11 @@ impl App {
         let export_path = info
             .path
             .with_file_name(format!("{}.export.json", info.name));
-        if let Ok(snapshot) = std::fs::read_to_string(&info.path) {
-            if std::fs::write(&export_path, snapshot).is_ok() {
+        if let Some(snapshot) = session::load(&info.path) {
+            if serde_json::to_vec_pretty(&snapshot)
+                .ok()
+                .is_some_and(|bytes| std::fs::write(&export_path, bytes).is_ok())
+            {
                 self.set_status(format!("Exported session to {}", export_path.display()));
             }
         }
@@ -1051,7 +847,7 @@ impl App {
 
     pub fn thinking_choices(&self, model: &str) -> Vec<&'static str> {
         let provider_kind = self.config.active_provider_config().kind;
-        if provider_kind.eq_ignore_ascii_case("codex") {
+        {
             if let Some(levels) = self
                 .available_models
                 .iter()
@@ -1059,9 +855,11 @@ impl App {
                 .map(|entry| entry.reasoning_levels.as_slice())
                 .filter(|levels| !levels.is_empty())
             {
-                let mut choices = vec!["off"];
+                let mut choices = Vec::new();
                 for level in levels {
                     match level.as_str() {
+                        "none" | "off" if !choices.contains(&"off") => choices.push("off"),
+                        "minimal" if !choices.contains(&"minimal") => choices.push("minimal"),
                         "low" if !choices.contains(&"low") => choices.push("low"),
                         "medium" if !choices.contains(&"medium") => choices.push("medium"),
                         "high" if !choices.contains(&"high") => choices.push("high"),
@@ -1070,9 +868,13 @@ impl App {
                         _ => {}
                     }
                 }
-                return choices;
+                if !choices.is_empty() {
+                    return choices;
+                }
             }
-            return vec!["off", "low", "medium", "high", "xhigh", "max"];
+        }
+        if provider_kind.eq_ignore_ascii_case("codex") {
+            return vec!["low", "medium", "high"];
         }
         if provider_kind.eq_ignore_ascii_case("gemini") {
             let model = model.to_ascii_lowercase();
@@ -1155,7 +957,8 @@ impl App {
             .iter()
             .position(|choice| *choice == current)
             .unwrap_or(0);
-        self.show_thinking_modal = true;
+        self.interaction
+            .set_overlay(crate::interaction::Overlay::Thinking, true);
     }
 
     pub fn apply_thinking_modal_selection(&mut self) {
@@ -1169,7 +972,8 @@ impl App {
             .copied()
             .unwrap_or("off");
         self.set_thinking_mode_for_model(&model, mode);
-        self.show_thinking_modal = false;
+        self.interaction
+            .set_overlay(crate::interaction::Overlay::Thinking, false);
     }
 
     pub fn toggle_selected_reasoning(&mut self) {
@@ -1342,7 +1146,7 @@ impl App {
             timestamp: now,
             attachments,
         });
-        self.chat_scroll = 0; // Stick to bottom
+        self.interaction.dirty = true; // Preserve the reader viewport.
         self.refresh_context_estimate();
     }
 
@@ -1351,7 +1155,8 @@ impl App {
             return Ok(());
         };
         let snapshot = SessionSnapshot {
-            schema_version: 2,
+            schema_version: 3,
+            checkpoints: self.review.snapshot(),
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
             messages: self.messages.clone(),
@@ -1393,7 +1198,11 @@ impl App {
         self.usage_records.push(UsageRecord {
             timestamp: chrono::Local::now().to_rfc3339(),
             provider: self.config.provider.clone(),
-            model: self.config.model.clone(),
+            model: self
+                .interaction
+                .actual_model
+                .clone()
+                .unwrap_or_else(|| self.config.model.clone()),
             prompt_tokens,
             candidates_tokens,
             total_tokens,
@@ -1410,14 +1219,21 @@ impl App {
             return;
         }
 
-        if self.state != EngineState::Idle
-            && !(text.starts_with("/todo") || text.eq_ignore_ascii_case("/todos"))
-        {
-            self.set_status("Engine busy. Press Esc to cancel active stream.");
+        if self.state != EngineState::Idle && !text.starts_with('/') {
+            self.interaction
+                .queue
+                .push_back((text, std::mem::take(&mut self.draft_attachments)));
+            self.input_buffer.clear();
+            self.input_cursor = 0;
+            self.set_status("Prompt queued. /interrupt <prompt> cancels and sends immediately.");
             return;
         }
 
-        self.input_history.push(text.clone());
+        if !crate::commands::parse(&text)
+            .is_ok_and(|(spec, _)| spec.id == crate::commands::CommandId::Key)
+        {
+            self.input_history.push(text.clone());
+        }
         self.input_history_idx = None;
         self.input_buffer.clear();
         self.input_cursor = 0;
@@ -1482,6 +1298,8 @@ impl App {
     }
 
     pub fn insert_input_text(&mut self, text: &str) {
+        self.interaction
+            .remember_edit(&self.input_buffer, self.input_cursor);
         let byte_index = self
             .input_buffer
             .char_indices()
@@ -1615,57 +1433,42 @@ impl App {
     }
 
     pub fn handle_slash_command(&mut self, command_line: &str, tx: UnboundedSender<AppEvent>) {
-        let mut parts = command_line.splitn(2, |character: char| character.is_whitespace());
-        let cmd = parts.next().unwrap_or("").to_lowercase();
-        let arg = parts.next().map(|s| s.trim()).unwrap_or("");
-
-        match cmd.as_str() {
-            "/help" => {
-                self.add_message("system", 
-                    "Available Commands:\n\
-                    - /compact : Summarize conversation history to reclaim context window\n\
-                    - /models : Fetch live models & pricing from the active provider\n\
-                    - /providers : List configured and built-in providers\n\
-                    - /provider <name> : Select a configured provider\n\
-                    - /baseurl <url|default> : Set the active provider base URL\n\
-                    - /config <path|open|dir> : Inspect or open the active config file\n\
-                    - /model <name> : Switch active model (for example, gpt-4o-mini)\n\
-                    - /thinking [off|low|medium|high|xhigh|max] : Open the model-aware thinking picker\n\
-                    - /reasoning [on|off|low|medium|high|xhigh|max] : Set reasoning effort for the active model\n\
-                    - /autocompact <on|off|tokens> : Configure automatic context compaction\n\
-                    - /usage : Show persisted token usage for this session\n\
-                    - /limits : Show the active provider's usage windows\n\
-                    - /context : Show next-request context and model limit\n\
-                    - /status : Show engine/provider/session state\n\
-                    - /pwd : Show the restored project working directory\n\
-                    - /tools : List registered tools\n\
-                    - /plan [on|off|continue] : Plan, approve a structured plan, or keep planning\n\
-                    - /todos : Show the current task list\n\
-                    - /todo <add|done|remove|clear|mode> ... : Update tasks or choose next/force updates\n\
-                    - /agents : Show in-process subagent status\n\
-                    - /permissions : Configure automatic tool permission policies\n\
-                    - /attachments : List draft attachment blocks\n\
-                    - /attach <path> : Attach a text file or image\n\
-                    - /remove <n> : Remove a draft attachment block\n\
-                    - /edit <n> : Edit a draft text attachment\n\
-                    - /session <save|clear|path> : Manage the low-write resumable session\n\
-                    - /sessions : Browse, resume, export, or delete sessions\n\
-                    - /resume <name|path> : Resume a saved session directly\n\
-                    - /retry : Retry the last user request\n\
-                    - /fork : Save the current conversation as a new session\n\
-                    - /temp <float> : Adjust temperature (0.0 to 2.0)\n\
-                    - /sys [instruction|--clear] : Show effective prompt or update/clear customization\n\
-                    - /key <api_key> : Save the active provider API key\n\
-                    - /copy : Copy last assistant response to system clipboard (or Ctrl+Y)\n\
-                    - /clear or /new : Clear conversation history and start fresh\n\
-                    - /save : Save config to disk\n\
-                    - /quit or /exit : Exit application"
-                );
+        let (spec, argument) = match crate::commands::parse(command_line) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.add_message("system", error);
+                return;
             }
-            "/compact" => {
+        };
+        if spec.idle_only && self.state != EngineState::Idle {
+            self.set_status(
+                "This command requires an idle engine. Cancel or wait for the current turn.",
+            );
+            return;
+        }
+        let arg = argument.as_str();
+        match spec.id {
+            crate::commands::CommandId::Auto => {
+                match arg.trim().to_ascii_lowercase().as_str() {
+                    "on" => self.auto_mode = true,
+                    "off" => self.auto_mode = false,
+                    "" | "status" => {}
+                    _ => {
+                        self.add_message("system", "Usage: /auto <on|off|status>");
+                        return;
+                    }
+                }
+                self.add_message("system", if self.auto_mode {
+                    "AUTO REVIEW ON: codex-auto-review reviews ASK actions. ALLOW runs directly; DENY stays blocked. High-risk or unclear actions still ask you. Saved permissions are unchanged."
+                } else {
+                    "AUTO REVIEW OFF: normal per-group permissions restored (ASK remains manual; ALLOW and REVIEW retain their configured behavior)."
+                });
+            }
+            crate::commands::CommandId::Help => self.add_message("system", crate::commands::help()),
+            crate::commands::CommandId::Compact => {
                 self.compact_history(tx);
             }
-            "/plan" => match arg.to_ascii_lowercase().as_str() {
+            crate::commands::CommandId::Plan => match arg.to_ascii_lowercase().as_str() {
                 "on" | "" => {
                     self.plan_mode = true;
                     self.set_status("Plan mode enabled");
@@ -1701,9 +1504,11 @@ impl App {
                 }
                 _ => self.add_message("system", "Usage: /plan [on|off|continue]"),
             },
-            "/todos" => self.add_message("system", self.format_todos()),
-            "/agents" => self.add_message("system", self.tool_registry.agent_manager().status()),
-            "/todo" => {
+            crate::commands::CommandId::Todos => self.add_message("system", self.format_todos()),
+            crate::commands::CommandId::Agents => {
+                self.add_message("system", self.tool_registry.agent_manager().status())
+            }
+            crate::commands::CommandId::Todo => {
                 let mut todo_parts = arg.splitn(2, |character: char| character.is_whitespace());
                 let action = todo_parts.next().unwrap_or("list").to_ascii_lowercase();
                 let value = todo_parts.next().map(str::trim).unwrap_or("");
@@ -1750,7 +1555,7 @@ impl App {
                     Err(error) => self.add_message("system", error),
                 }
             }
-            "/models" => {
+            crate::commands::CommandId::Models => {
                 self.add_message(
                     "system",
                     format!("Fetching models from {}...", self.config.provider),
@@ -1765,7 +1570,7 @@ impl App {
                 }
                 self.spawn_models_fetch(tx, true);
             }
-            "/providers" => {
+            crate::commands::CommandId::Providers => {
                 let mut lines = vec!["Available providers:".to_string()];
                 for (name, provider) in &self.config.providers {
                     let marker = if name == &self.config.provider {
@@ -1789,7 +1594,7 @@ impl App {
                 lines.push("Use /provider <name> to switch.".to_string());
                 self.add_message("system", lines.join("\n"));
             }
-            "/provider" => {
+            crate::commands::CommandId::Provider => {
                 if arg.is_empty() {
                     self.add_message(
                         "system",
@@ -1798,24 +1603,8 @@ impl App {
                 } else {
                     self.config.select_provider(arg);
                     let _ = self.config.save();
-                    let provider_config = self.config.active_provider_config();
-                    let provider = ProviderKind::parse(&provider_config.kind);
-                    self.client.update_provider(
-                        provider,
-                        provider_config
-                            .base_url
-                            .or_else(|| self.config.base_url.clone()),
-                        provider_config.headers,
-                        provider_config.stream_usage,
-                        crate::client::ProviderProtocol::parse(&provider_config.protocol),
-                        AppConfig::get_codex_auth()
-                            .map(|auth| auth.account_id)
-                            .unwrap_or_default(),
-                    );
-                    if let Some(api_key) = self.config.get_api_key_for_active_provider() {
-                        self.client.update_api_key(api_key);
-                    }
-                    self.provider_limits = None;
+                    self.refresh_client_from_config();
+                    self.prefetch_models(tx.clone());
                     self.set_status(format!("Provider set to {}", self.config.provider));
                     self.add_message(
                         "system",
@@ -1823,7 +1612,7 @@ impl App {
                     );
                 }
             }
-            "/baseurl" => {
+            crate::commands::CommandId::Baseurl => {
                 if arg.is_empty() {
                     let base_url = self
                         .config
@@ -1848,19 +1637,8 @@ impl App {
                     } else {
                         self.config.base_url = base_url.clone();
                     }
-                    let provider_config = self.config.active_provider_config();
-                    self.client.update_provider(
-                        ProviderKind::parse(&provider_config.kind),
-                        provider_config
-                            .base_url
-                            .or_else(|| self.config.base_url.clone()),
-                        provider_config.headers,
-                        provider_config.stream_usage,
-                        crate::client::ProviderProtocol::parse(&provider_config.protocol),
-                        AppConfig::get_codex_auth()
-                            .map(|auth| auth.account_id)
-                            .unwrap_or_default(),
-                    );
+                    self.refresh_client_from_config();
+                    self.prefetch_models(tx.clone());
                     self.set_status("Provider base URL updated");
                     self.add_message(
                         "system",
@@ -1868,7 +1646,7 @@ impl App {
                     );
                 }
             }
-            "/config" => {
+            crate::commands::CommandId::Config => {
                 let path = AppConfig::config_path();
                 match arg.to_ascii_lowercase().as_str() {
                     "" | "path" => self.add_message(
@@ -1908,7 +1686,7 @@ impl App {
                     _ => self.add_message("system", "Usage: /config <path|open|dir>"),
                 }
             }
-            "/model" => {
+            crate::commands::CommandId::Model => {
                 if arg.is_empty() {
                     self.add_message("system", format!("Current model: {}", self.config.model));
                 } else {
@@ -1922,7 +1700,7 @@ impl App {
                     );
                 }
             }
-            "/thinking" => {
+            crate::commands::CommandId::Thinking => {
                 if matches!(
                     arg.to_ascii_lowercase().as_str(),
                     "off" | "minimal" | "low" | "medium" | "med" | "high"
@@ -1955,7 +1733,7 @@ impl App {
                     );
                 }
             }
-            "/reasoning" => {
+            crate::commands::CommandId::Reasoning => {
                 if arg.is_empty() {
                     self.open_thinking_modal();
                     self.add_message(
@@ -1997,7 +1775,7 @@ impl App {
                     );
                 }
             }
-            "/autocompact" => {
+            crate::commands::CommandId::Autocompact => {
                 if arg.is_empty() {
                     self.add_message(
                         "system",
@@ -2032,7 +1810,7 @@ impl App {
                     self.add_message("system", "Usage: /autocompact <on|off|token-threshold>");
                 }
             }
-            "/session" => match arg.to_ascii_lowercase().as_str() {
+            crate::commands::CommandId::Session => match arg.to_ascii_lowercase().as_str() {
                 "save" => match self.flush_session() {
                     Ok(()) => self.add_message("system", "Session saved."),
                     Err(error) => {
@@ -2066,11 +1844,12 @@ impl App {
                 ),
                 _ => self.add_message("system", "Usage: /session <save|clear|path>"),
             },
-            "/sessions" => {
+            crate::commands::CommandId::Sessions => {
                 self.refresh_sessions();
-                self.show_sessions_modal = true;
+                self.interaction
+                    .set_overlay(crate::interaction::Overlay::Sessions, true);
             }
-            "/resume" => {
+            crate::commands::CommandId::Resume => {
                 let path = PathBuf::from(arg);
                 let path = if path.is_file() {
                     Some(path)
@@ -2093,7 +1872,7 @@ impl App {
                     }
                 }
             }
-            "/temp" => {
+            crate::commands::CommandId::Temp => {
                 if let Ok(t) = arg.parse::<f32>() {
                     self.config.temperature = t.clamp(0.0, 2.0);
                     self.set_status(format!(
@@ -2114,7 +1893,7 @@ impl App {
                     );
                 }
             }
-            "/sys" => {
+            crate::commands::CommandId::Sys => {
                 if arg.is_empty() {
                     self.add_message(
                         "system",
@@ -2133,13 +1912,15 @@ impl App {
                     self.add_message("system", "System customization updated. Built-in guidance remains active. Use /save to persist.");
                 }
             }
-            "/key" => {
+            crate::commands::CommandId::Key => {
                 if arg.is_empty() {
                     self.add_message("system", "Usage: /key <your_provider_api_key>");
                 } else {
-                    match AppConfig::set_api_key(arg) {
+                    match self.config.set_provider_api_key(arg) {
                         Ok(()) => {
-                            self.client.update_api_key(arg.to_string());
+                            self.client.update_api_key(arg.trim().to_string());
+                            self.available_models.clear();
+                            self.prefetch_models(tx.clone());
                             self.set_status("API key updated successfully");
                             self.add_message(
                                 "system",
@@ -2152,7 +1933,8 @@ impl App {
                     }
                 }
             }
-            "/clear" => {
+            crate::commands::CommandId::Clear => {
+                self.interaction.reset_transcript();
                 self.messages.clear();
                 self.usage_records.clear();
                 self.chat_scroll = 0;
@@ -2168,13 +1950,11 @@ impl App {
                 self.add_message("system", "Conversation history cleared.");
                 let _ = self.flush_session();
             }
-            "/retry" => {
-                if let Some(last_user) = self
-                    .messages
-                    .iter()
-                    .rposition(|message| message.role == "user")
-                {
-                    self.messages.truncate(last_user + 1);
+            crate::commands::CommandId::Retry => {
+                if self.messages.iter().any(|message| message.role == "user") {
+                    // Retry the continuation without destroying completed tool work or history.
+                    self.interaction.reset_transcript();
+                    self.chat_scroll = 0;
                     self.current_thought_buffer.clear();
                     self.current_response_buffer.clear();
                     self.pending_tool_call = None;
@@ -2182,13 +1962,15 @@ impl App {
                     self.pending_tool_executions = 0;
                     self.state = EngineState::Idle;
                     let _ = self.flush_session();
-                    self.set_status("Retrying last request");
+                    self.set_status(
+                        "Retrying with conversation and completed tool results preserved",
+                    );
                     self.trigger_generation(tx);
                 } else {
                     self.add_message("system", "No user request is available to retry.");
                 }
             }
-            "/fork" => {
+            crate::commands::CommandId::Fork => {
                 self.session_path = session::new_session_path(&self.config.session_name);
                 self.session_messages_at_save = 0;
                 self.add_message("system", "Forked the conversation into a new session.");
@@ -2197,10 +1979,10 @@ impl App {
                     Err(error) => self.add_message("system", error),
                 }
             }
-            "/new" => {
+            crate::commands::CommandId::New => {
                 self.start_new_session();
             }
-            "/usage" => {
+            crate::commands::CommandId::Usage => {
                 let prompt: u64 = self.usage_records.iter().map(|r| r.prompt_tokens).sum();
                 let candidates: u64 = self.usage_records.iter().map(|r| r.candidates_tokens).sum();
                 let total: u64 = self.usage_records.iter().map(|r| r.total_tokens).sum();
@@ -2220,7 +2002,7 @@ impl App {
                     ),
                 );
             }
-            "/limits" => {
+            crate::commands::CommandId::Limits => {
                 let client = self.client.clone();
                 tokio::spawn(async move {
                     let message = client
@@ -2231,7 +2013,7 @@ impl App {
                 });
                 self.add_message("system", "Fetching provider usage limits...");
             }
-            "/context" => {
+            crate::commands::CommandId::Context => {
                 let limit = self.context_limit();
                 let limit_text = limit
                     .map(|value| value.to_string())
@@ -2253,8 +2035,9 @@ impl App {
                         self.total_tokens
                     ),
                 );
+                self.add_message("system", self.context_breakdown());
             }
-            "/status" => {
+            crate::commands::CommandId::Status => {
                 let context_limit = self
                     .context_limit()
                     .map(|value| value.to_string())
@@ -2280,7 +2063,7 @@ impl App {
                     ),
                 );
             }
-            "/pwd" => {
+            crate::commands::CommandId::Pwd => {
                 self.add_message(
                     "system",
                     format!(
@@ -2293,7 +2076,7 @@ impl App {
                     ),
                 );
             }
-            "/tools" => {
+            crate::commands::CommandId::Tools => {
                 let all_tools = self.tool_registry.names();
                 let discovered = self.tool_registry.discovered_tools();
                 let metrics = self.tool_registry.context_metrics();
@@ -2317,12 +2100,13 @@ impl App {
                     ),
                 );
             }
-            "/permissions" => {
-                self.show_permissions_modal = true;
+            crate::commands::CommandId::Permissions => {
+                self.interaction
+                    .set_overlay(crate::interaction::Overlay::Permissions, true);
                 self.permissions_selected = 0;
                 self.modal_scroll = 0;
             }
-            "/attachments" => {
+            crate::commands::CommandId::Attachments => {
                 if self.draft_attachments.is_empty() {
                     self.add_message("system", "No draft attachments.");
                 } else {
@@ -2347,22 +2131,22 @@ impl App {
                     self.add_message("system", lines.join("\n"));
                 }
             }
-            "/attach" => {
+            crate::commands::CommandId::Attach => {
                 if arg.is_empty() {
                     self.add_message("system", "Usage: /attach <path>");
                 } else {
                     self.attach_path(arg);
                 }
             }
-            "/remove" => match arg.parse::<usize>() {
+            crate::commands::CommandId::Remove => match arg.parse::<usize>() {
                 Ok(index) if index > 0 => self.remove_attachment(index - 1),
                 _ => self.add_message("system", "Usage: /remove <attachment-number>"),
             },
-            "/edit" => match arg.parse::<usize>() {
+            crate::commands::CommandId::Edit => match arg.parse::<usize>() {
                 Ok(index) if index > 0 => self.edit_attachment(index - 1),
                 _ => self.add_message("system", "Usage: /edit <text-attachment-number>"),
             },
-            "/save" => match self.config.save() {
+            crate::commands::CommandId::Save => match self.config.save() {
                 Ok(()) => {
                     self.set_status("Configuration saved");
                     self.add_message("system", "Configuration saved to disk.");
@@ -2371,25 +2155,28 @@ impl App {
                     self.add_message("system", format!("Error saving configuration: {}", e));
                 }
             },
-            "/copy" => {
-                self.copy_last_response();
+            crate::commands::CommandId::Copy => {
+                self.copy_selection(arg, tx);
             }
-            "/quit" | "/exit" => {
+            crate::commands::CommandId::Quit => {
                 self.should_quit = true;
             }
-            _ => {
-                self.add_message(
-                    "system",
-                    format!("Unknown command: '{}'. Type /help for assistance.", cmd),
-                );
-            }
+            other => self.handle_workspace_command(other, arg, tx),
         }
     }
 
-    /// Clears conversation state while preserving provider, model, and client
-    /// configuration. Frontends use this to begin a fresh interaction without
-    /// restarting the Holiday process.
     pub fn start_new_session(&mut self) {
+        self.auto_mode = false;
+        self.interaction.reset_transcript();
+        let old = self
+            .session_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.interaction.drafts.insert(
+            old,
+            (self.input_buffer.clone(), self.draft_attachments.clone()),
+        );
         self.messages.clear();
         self.session_instruction = None;
         self.session_capabilities.clear();
@@ -2406,72 +2193,88 @@ impl App {
         self.tool_registry.clear_discovered_tools();
         self.pending_todo_notice = None;
         self.session_path = session::new_session_path(&self.config.session_name);
+        self.review = crate::review::ReviewStore::default();
+        if let Some(path) = &self.session_path {
+            let _ = self.review.bind(path, false);
+        }
         self.session_messages_at_save = 0;
         self.set_status("New session started");
         self.add_message("system", "Started a new session.");
         let _ = self.flush_session();
     }
 
-    pub fn copy_last_response(&mut self) {
-        // Find last assistant message
-        let last_model_msg = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "model")
-            .map(|m| m.content.clone());
-
-        match last_model_msg {
-            Some(text) => {
-                let char_len = text.len();
-                tokio::spawn(async move {
-                    #[cfg(windows)]
-                    {
-                        use std::process::Stdio;
-                        use tokio::io::AsyncWriteExt;
-                        use tokio::process::Command;
-
-                        if let Ok(mut child) = Command::new("clip").stdin(Stdio::piped()).spawn() {
-                            if let Some(mut stdin) = child.stdin.take() {
-                                let _ = stdin.write_all(text.as_bytes()).await;
-                            }
-                            let _ = child.wait().await;
-                        }
-                    }
-
-                    #[cfg(not(windows))]
-                    {
-                        use std::process::Stdio;
-                        use tokio::io::AsyncWriteExt;
-                        use tokio::process::Command;
-
-                        if let Ok(mut child) = Command::new("xclip")
-                            .arg("-selection")
-                            .arg("clipboard")
-                            .stdin(Stdio::piped())
-                            .spawn()
-                        {
-                            if let Some(mut stdin) = child.stdin.take() {
-                                let _ = stdin.write_all(text.as_bytes()).await;
-                            }
-                            let _ = child.wait().await;
-                        }
-                    }
-                });
-
-                self.set_status("Copied response to clipboard");
-                self.add_message(
-                    "system",
-                    format!(
-                        "Copied last assistant response ({} chars) to system clipboard.",
-                        char_len
-                    ),
-                );
-            }
-            None => {
-                self.add_message("system", "No assistant response found to copy.");
-            }
+    pub fn copy_selection(&mut self, arg: &str, tx: UnboundedSender<AppEvent>) {
+        let mut parts = arg.split_whitespace();
+        let selection = parts.next().and_then(|s| s.parse::<usize>().ok());
+        let message = if let Some(index) = selection {
+            index.checked_sub(1).and_then(|i| self.messages.get(i))
+        } else {
+            self.messages.iter().rev().find(|m| m.role == "model")
+        };
+        let Some(message) = message else {
+            self.set_status("No matching message to copy");
+            return;
+        };
+        let mut text = message.content.clone();
+        if parts.next() == Some("code") {
+            let index = parts
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            let blocks = text
+                .split("```")
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(_, b)| b.split_once('\n').map(|(_, code)| code).unwrap_or(b))
+                .collect::<Vec<_>>();
+            let Some(code) = index.checked_sub(1).and_then(|i| blocks.get(i)) else {
+                self.set_status("Code block not found");
+                return;
+            };
+            text = (*code).into();
         }
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut cmd = if cfg!(windows) {
+                tokio::process::Command::new("clip")
+            } else if cfg!(target_os = "macos") {
+                tokio::process::Command::new("pbcopy")
+            } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                tokio::process::Command::new("wl-copy")
+            } else {
+                let mut c = tokio::process::Command::new("xclip");
+                c.args(["-selection", "clipboard"]);
+                c
+            };
+            #[cfg(windows)]
+            {
+                cmd.creation_flags(0x08000000);
+            }
+            let result = async {
+                let mut child = cmd
+                    .stdin(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+                if let Some(mut input) = child.stdin.take() {
+                    input
+                        .write_all(text.as_bytes())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                if !child.wait().await.map_err(|e| e.to_string())?.success() {
+                    return Err("Clipboard utility failed".to_string());
+                }
+                Ok::<_, String>(())
+            };
+            let message =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), result).await {
+                    Ok(Ok(())) => "Copied to clipboard".into(),
+                    Ok(Err(e)) => format!("Clipboard failed: {e}"),
+                    Err(_) => "Clipboard utility timed out".into(),
+                };
+            let _ = tx.send(AppEvent::SystemNotification(message));
+        });
     }
 
     pub fn trigger_generation(&mut self, tx: UnboundedSender<AppEvent>) {
@@ -2483,26 +2286,28 @@ impl App {
             self.add_message("system", notice);
         }
 
+        if self.config.model.trim().is_empty() {
+            self.stream_epoch += 1;
+            let _ = tx.send(AppEvent::Stream {
+                epoch: self.stream_epoch,
+                signal: StreamSignal::Error(
+                    "No model selected for this provider. Use /model <id> or /models.".to_string(),
+                ),
+            });
+            return;
+        }
         let context_estimate = self.estimated_context_tokens();
         self.context_tokens = context_estimate;
         self.context_tokens_estimated = true;
         self.request_context_tokens = context_estimate;
 
-        let output_budget = self
-            .config
-            .active_model_profile()
-            .max_output_tokens
-            .unwrap_or(8192) as u64;
-        let output_would_overflow = self
-            .context_limit()
-            .is_some_and(|limit| context_estimate.saturating_add(output_budget) >= limit);
+        let output_would_overflow = self.context_would_overflow(context_estimate);
         if self.config.auto_compact
             && self.messages.len() > 2
             && (context_estimate >= self.config.auto_compact_threshold_tokens
                 || output_would_overflow)
         {
             self.pending_generation_after_compaction = true;
-            self.state = EngineState::Compacting;
             self.compact_history(tx);
             return;
         }
@@ -2537,10 +2342,17 @@ impl App {
 
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<StreamSignal>();
 
+        self.interaction.actual_model = None;
+        self.interaction.actual_protocol = None;
+        let tasks = self.tool_registry.tasks.clone();
+        let (request_task, mut cancel) = tasks.start(&format!("generation {model}"), epoch);
+        self.interaction.request_task = Some(request_task.clone());
+        let error_tx = stream_tx.clone();
         let stream_handle = tokio::spawn(async move {
-            client
-                .stream_generate_content(&model, &fallback_models, max_retries, &request, stream_tx)
-                .await;
+            tokio::select! {
+                _=client.stream_generate_content(&model,&fallback_models,max_retries,&request,stream_tx)=>{},
+                _=cancel.changed()=>{let _=error_tx.send(StreamSignal::Error("Generation cancelled".into()));},
+            }
         });
 
         self.active_stream_task = Some(stream_handle);
@@ -2548,9 +2360,77 @@ impl App {
         let app_tx = tx.clone();
         tokio::spawn(async move {
             while let Some(sig) = stream_rx.recv().await {
+                match &sig {
+                    StreamSignal::TextDelta(text) => tasks.log(&request_task, text),
+                    StreamSignal::Finished { .. } => tasks.finish(&request_task, "completed"),
+                    StreamSignal::Error(e) => {
+                        tasks.log(&request_task, e);
+                        tasks.finish(&request_task, "failed");
+                    }
+                    _ => {}
+                }
                 let _ = app_tx.send(AppEvent::Stream { epoch, signal: sig });
             }
         });
+    }
+
+    pub fn context_breakdown(&self) -> String {
+        let request = self.build_request();
+        let estimate = |n: usize| n.div_ceil(4);
+        let instructions = request
+            .system_instruction
+            .as_ref()
+            .and_then(|v| serde_json::to_vec(v).ok())
+            .map(|v| estimate(v.len()))
+            .unwrap_or(0);
+        let schemas = request
+            .tools
+            .as_ref()
+            .and_then(|v| serde_json::to_vec(v).ok())
+            .map(|v| estimate(v.len()))
+            .unwrap_or(0);
+        let mut conversation = 0;
+        let mut tools = 0;
+        let mut attachments = 0;
+        let mut images = 0;
+        for message in &self.messages {
+            if matches!(message.role.as_str(), "function" | "model_tool_call") {
+                tools += estimate(message.content.len());
+            } else if matches!(message.role.as_str(), "model" | "user" | "summary") {
+                conversation += estimate(message.content.len());
+            }
+            for attachment in &message.attachments {
+                if let Some(text) = &attachment.text {
+                    attachments += estimate(text.len());
+                }
+                if attachment.kind == "image" {
+                    images += 1;
+                }
+            }
+        }
+        let profile = self.config.active_model_profile();
+        let source = if profile.context_window.is_some() || profile.input_token_limit.is_some() {
+            "explicit model profile override"
+        } else {
+            self.available_models
+                .iter()
+                .find(|m| same_model_id(&m.id, &self.config.model))
+                .map(|m| m.metadata_source.as_str())
+                .unwrap_or("unknown")
+        };
+        let source = format!(
+            "{}; actual route: {} / {}",
+            source,
+            self.interaction
+                .actual_model
+                .as_deref()
+                .unwrap_or("not requested yet"),
+            self.interaction
+                .actual_protocol
+                .as_deref()
+                .unwrap_or("not requested yet")
+        );
+        format!("Context inspector (approximate, not tokenizer counts):\nInstructions ~{instructions}\nConversation ~{conversation}\nTool history ~{tools}\nTool schemas ~{schemas}\nText attachments ~{attachments}; images {images} (not text-tokenized)\nOutput reserve {}\nLimit source: {source}\nProvider: {} | requested model: {} | protocol: {}\nReasoning: {}",self.output_budget(),self.config.provider,self.config.model,self.config.active_provider_config().protocol,self.thinking_mode(&self.config.model))
     }
 
     fn estimated_context_tokens(&self) -> u64 {
@@ -2562,6 +2442,11 @@ impl App {
     }
 
     pub fn cancel_generation(&mut self) {
+        if let Some(id) = self.interaction.request_task.take() {
+            self.tool_registry.tasks.finish(&id, "cancelled");
+        }
+        self.tool_registry.tasks.cancel_parent(self.stream_epoch);
+        self.stream_epoch += 1;
         if let Some(handle) = self.active_stream_task.take() {
             handle.abort();
         }
@@ -2585,6 +2470,7 @@ impl App {
         self.pending_tool_call = None;
         self.queued_tool_calls.clear();
         self.stream_start_time = None;
+        self.pending_generation_after_compaction = false;
         self.set_status("Generation stopped");
     }
 
@@ -2599,6 +2485,62 @@ impl App {
         }
 
         match sig {
+            StreamSignal::ToolReviewed {
+                mut pending,
+                result,
+            } => {
+                if self.tool_turn_failed || pending.epoch != epoch {
+                    return;
+                }
+                let explanation = match &result {
+                    Ok(d) => d.explanation(),
+                    Err(e) => format!("Automatic review unavailable: {e}. Confirm this exact action in writing or reject it."),
+                };
+                self.add_message(
+                    "system",
+                    format!("Auto-review {}: {}", pending.tool_name, explanation),
+                );
+                let policy = self.effective_permission_mode(
+                    self.tool_registry.permission_group(&pending.tool_name),
+                );
+                if policy == PermissionMode::Deny || (self.plan_mode && pending.preview.is_mutation)
+                {
+                    self.reject_tool_call(
+                        epoch,
+                        pending.tool_name,
+                        pending.call_id,
+                        "Current policy blocks this action".into(),
+                        tx,
+                    );
+                } else if policy == PermissionMode::Allow
+                    || (policy == PermissionMode::Review
+                        && result.as_ref().is_ok_and(|d| d.may_approve()))
+                {
+                    self.execute_tool(epoch, pending.tool_name, pending.call_id, pending.args, tx);
+                } else if result.as_ref().is_ok_and(|d| d.is_denied()) {
+                    self.reject_tool_call(
+                        epoch,
+                        pending.tool_name,
+                        pending.call_id,
+                        explanation,
+                        tx,
+                    );
+                } else {
+                    pending.preview.reason = Some(explanation);
+                    if self.pending_tool_call.is_none() {
+                        self.pending_tool_call = Some(pending);
+                        self.state = EngineState::AwaitingHitlApproval;
+                        self.modal_scroll = 0;
+                        self.set_status("Auto-review requires your confirmation");
+                    } else {
+                        self.queued_tool_calls.push_back(pending);
+                    }
+                }
+            }
+            StreamSignal::ModelSelected { model, protocol } => {
+                self.interaction.actual_model = Some(model);
+                self.interaction.actual_protocol = Some(protocol);
+            }
             StreamSignal::ThoughtDelta(chunk) => {
                 self.current_thought_buffer.push_str(&chunk);
             }
@@ -2670,9 +2612,19 @@ impl App {
                 }
 
                 if let Some(tool) = self.tool_registry.get(&name) {
-                    let preview = tool.generate_preview(&args);
+                    let mut preview = tool.generate_preview(&args);
+                    if preview.reason.is_none() {
+                        // Use public narration only, never private reasoning or invented intent.
+                        preview.reason = self
+                            .messages
+                            .iter()
+                            .rev()
+                            .take_while(|m| m.role != "user")
+                            .find(|m| m.role == "model" && !m.content.trim().is_empty())
+                            .map(|m| m.content.clone());
+                    }
                     let permission_group = self.tool_registry.permission_group(&name);
-                    let permission_mode = self.config.permission_mode_for(permission_group);
+                    let permission_mode = self.effective_permission_mode(permission_group);
 
                     if self.plan_mode && preview.is_mutation {
                         self.add_message(
@@ -2698,9 +2650,19 @@ impl App {
                             tx,
                         );
                     } else if permission_mode == PermissionMode::Allow
-                        || self.session_allowed_tools.contains(&name)
+                        || (permission_mode != PermissionMode::Review
+                            && self.session_allowed_tools.contains(&name))
                     {
                         self.execute_tool(self.stream_epoch, name, id, args, tx);
+                    } else if permission_mode == PermissionMode::Review {
+                        let pending = PendingToolCall {
+                            epoch: self.stream_epoch,
+                            call_id: id,
+                            tool_name: name,
+                            args,
+                            preview,
+                        };
+                        self.start_auto_review(pending, tx);
                     } else {
                         let pending = PendingToolCall {
                             epoch: self.stream_epoch,
@@ -2775,7 +2737,8 @@ impl App {
                     self.state = EngineState::Idle;
                     let reason = finish_reason.unwrap_or_else(|| "STOP".to_string());
                     if self.plan_mode && self.latest_model_has_plan() {
-                        self.show_plan_modal = true;
+                        self.interaction
+                            .set_overlay(crate::interaction::Overlay::Plan, true);
                         self.plan_modal_selected = 0;
                         self.set_status("Plan ready for review");
                     } else {
@@ -2802,8 +2765,8 @@ impl App {
                     let response = std::mem::take(&mut self.current_response_buffer);
                     self.add_message("model", response);
                 }
-                let _ = self.flush_session();
                 self.add_message("system", format!("Error: {}", err));
+                let _ = self.flush_session();
                 // A failed stream cannot resume a tool approval that was
                 // emitted by that stream. Drop it so the UI cannot leave a
                 // ghost HITL modal over the normal input box.
@@ -2816,13 +2779,55 @@ impl App {
         }
     }
 
+    fn start_auto_review(&mut self, pending: PendingToolCall, tx: UnboundedSender<AppEvent>) {
+        let client = self.client.clone();
+        let context = crate::auto_review::review_context(&self.messages);
+        let root = self.tool_registry.working_dir();
+        self.state = if self.pending_tool_call.is_some() {
+            EngineState::AwaitingHitlApproval
+        } else {
+            EngineState::ExecutingTool
+        };
+        self.set_status("Reviewing exact action with codex-auto-review (30s deadline)...");
+        tokio::spawn(async move {
+            let result = match context {
+                Ok(context) => crate::auto_review::review(&client, &context, &root, &pending).await,
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(AppEvent::Stream {
+                epoch: pending.epoch,
+                signal: StreamSignal::ToolReviewed { pending, result },
+            });
+        });
+    }
+
+    pub fn effective_permission_mode(&self, group: &str) -> PermissionMode {
+        let saved = self.config.permission_mode_for(group);
+        if self.auto_mode && saved == PermissionMode::Ask {
+            PermissionMode::Review
+        } else {
+            saved
+        }
+    }
+
+    pub fn pending_requires_review(&self) -> bool {
+        self.pending_tool_call.as_ref().is_some_and(|pending| {
+            self.effective_permission_mode(self.tool_registry.permission_group(&pending.tool_name))
+                == PermissionMode::Review
+        })
+    }
+
     pub fn approve_pending_tool(
         &mut self,
         whitelist_for_session: bool,
         tx: UnboundedSender<AppEvent>,
     ) {
         if let Some(pending) = self.pending_tool_call.take() {
-            if whitelist_for_session {
+            if whitelist_for_session
+                && self.effective_permission_mode(
+                    self.tool_registry.permission_group(&pending.tool_name),
+                ) != PermissionMode::Review
+            {
                 self.session_allowed_tools.insert(pending.tool_name.clone());
             }
             self.execute_tool(
@@ -2856,7 +2861,11 @@ impl App {
                 result: Err(reason),
             });
         });
-        self.state = EngineState::ExecutingTool;
+        self.state = if self.pending_tool_call.is_some() {
+            EngineState::AwaitingHitlApproval
+        } else {
+            EngineState::ExecutingTool
+        };
     }
 
     pub fn deny_pending_tool(&mut self, tx: UnboundedSender<AppEvent>) {
@@ -2879,10 +2888,30 @@ impl App {
         args: serde_json::Value,
         tx: UnboundedSender<AppEvent>,
     ) {
+        if tool_name == "spawn_agent" {
+            self.tool_registry.install_agent_tools(
+                self.client.clone(),
+                self.config.model.clone(),
+                self.config.effective_fallback_models(),
+                self.config.max_retries,
+            );
+            let mut runtime = self
+                .tool_registry
+                .worker_runtime(&self.config, self.review.clone());
+            runtime.tools.retain(|name, _| {
+                !self.session_disabled_tools.contains(name)
+                    && !(self.plan_mode && matches!(name.as_str(), "write_file" | "edit_file"))
+            });
+            self.tool_registry.agent_manager().configure(runtime);
+        }
         if tool_name == "search_tools" {
             self.tool_registry.discover_from_query(&args);
         }
-        self.state = EngineState::ExecutingTool;
+        self.state = if self.pending_tool_call.is_some() {
+            EngineState::AwaitingHitlApproval
+        } else {
+            EngineState::ExecutingTool
+        };
         self.set_status(format!("Executing tool '{}'...", tool_name));
 
         if let Some(tool) = self.tool_registry.get(&tool_name) {
@@ -2890,8 +2919,47 @@ impl App {
             let t_name = tool_name.clone();
             let c_id = call_id.clone();
 
+            let tasks = self.tool_registry.tasks.clone();
+            let review = self.review.clone();
+            let root = self.tool_registry.working_dir();
+            let (task_id, mut cancel) = tasks.start(&t_name, epoch);
             tokio::spawn(async move {
-                let res = tool.execute(args).await;
+                let pending = if matches!(t_name.as_str(), "write_file" | "edit_file") {
+                    args.get("path")
+                        .and_then(|v| v.as_str())
+                        .map(|path| review.before(&root, path, epoch))
+                } else {
+                    None
+                };
+                let res = match pending {
+                    Some(Err(error)) => {
+                        Err(format!("Checkpoint failed; tool was not run: {error}"))
+                    }
+                    pending => {
+                        let mut args = args;
+                        if t_name == "run_command" {
+                            args["_holiday_epoch"] = json!(epoch);
+                        }
+                        let result = if *cancel.borrow() {
+                            Err("Task cancelled".to_string())
+                        } else {
+                            tokio::select! { biased; _=cancel.changed()=>Err("Task cancelled".to_string()), result=tool.execute(args)=>result }
+                        };
+                        if let Some(Ok(pending)) = pending {
+                            if let Err(error) = review.after(pending) {
+                                tasks.log(&task_id, &format!("Checkpoint warning: {error}"));
+                            }
+                        }
+                        result
+                    }
+                };
+                tasks.log(
+                    &task_id,
+                    res.as_ref()
+                        .map(|s| s.as_str())
+                        .unwrap_or_else(|s| s.as_str()),
+                );
+                tasks.finish(&task_id, if res.is_ok() { "completed" } else { "failed" });
                 let _ = app_tx.send(AppEvent::ToolExecutionResult {
                     epoch,
                     tool_name: t_name,
@@ -3315,7 +3383,7 @@ impl App {
             }),
             generation_config: Some(GenerationConfig {
                 temperature: Some(model_profile.temperature.unwrap_or(self.config.temperature)),
-                max_output_tokens: Some(model_profile.max_output_tokens.unwrap_or(8192)),
+                max_output_tokens: Some(self.output_budget()),
                 thinking_config,
                 reasoning_effort: if !is_gemini && explicit_reasoning {
                     Some(if reasoning_enabled {
@@ -3340,6 +3408,14 @@ impl App {
     }
 
     pub fn compact_history(&mut self, tx: UnboundedSender<AppEvent>) {
+        if self.state == EngineState::Compacting {
+            return;
+        }
+        if self.state != EngineState::Idle {
+            self.set_status("Stop the active turn before compacting.");
+            self.pending_generation_after_compaction = false;
+            return;
+        }
         let count = self.messages.len();
         if count <= 2 {
             self.pending_generation_after_compaction = false;
@@ -3351,7 +3427,9 @@ impl App {
             return;
         }
 
-        self.set_status("Compacting conversation history...");
+        self.stream_epoch += 1;
+        let epoch = self.stream_epoch;
+        self.set_status("Compacting: one request, 60-second deadline (Esc cancels)...");
         self.state = EngineState::Compacting;
         self.add_message(
             "system",
@@ -3384,7 +3462,7 @@ impl App {
                 temperature: Some(0.2),
                 max_output_tokens: Some(2048),
                 thinking_config: None,
-                reasoning_effort: None,
+                reasoning_effort: Some("low".into()),
                 extra: None,
             }),
             safety_settings: None,
@@ -3393,31 +3471,34 @@ impl App {
 
         let client = self.client.clone();
         let model = self.config.model.clone();
-        let fallback_models = self.config.effective_fallback_models();
-        let max_retries = self.config.max_retries;
-
-        tokio::spawn(async move {
-            let res = client
-                .generate_content_with_fallback(&model, &fallback_models, max_retries, &request)
-                .await;
-            let _ = tx.send(AppEvent::CompactionFinished(res));
-        });
+        self.active_stream_task = Some(tokio::spawn(async move {
+            let res = client.generate_bounded(&model, &request, 60).await;
+            let _ = tx.send(AppEvent::CompactionFinished(epoch, res));
+        }));
     }
 
     pub fn handle_compaction_result(
         &mut self,
+        epoch: u64,
         result: Result<String, String>,
         tx: UnboundedSender<AppEvent>,
     ) {
+        if epoch != self.stream_epoch {
+            return;
+        }
+        self.active_stream_task = None;
         let result = result.and_then(|summary| {
             if summary.trim().is_empty() {
                 Err("The summarizer returned an empty handoff; history was retained.".to_string())
+            } else if !summary.trim_end().ends_with("Checkpoint complete.") {
+                Err("Incomplete checkpoint; history was retained".into())
             } else {
                 Ok(summary)
             }
         });
         match result {
             Ok(summary) => {
+                self.interaction.reset_transcript();
                 let original_count = self.messages.len();
                 self.messages.clear();
                 self.chat_scroll = 0;
@@ -3445,12 +3526,16 @@ impl App {
                 self.state = EngineState::Idle;
                 let _ = self.flush_session();
                 if continue_generation {
+                    // One compaction per continuation, even with a very low threshold.
+                    let auto_compact = self.config.auto_compact;
+                    self.config.auto_compact = false;
                     self.trigger_generation(tx);
+                    self.config.auto_compact = auto_compact;
                 }
             }
             Err(e) => {
                 self.set_status("Compaction failed");
-                self.add_message("system", format!("Compaction failed: {}", e));
+                self.add_message("system", format!("Compaction failed: {}. History retained; no automatic retry. Use /compact to retry explicitly.", e));
                 self.pending_generation_after_compaction = false;
                 self.state = EngineState::Idle;
             }
@@ -3483,7 +3568,10 @@ async fn fetch_models(
                         input_price_per_m: None,
                         output_price_per_m: None,
                         input_token_limit: None,
+                        context_window: None,
+                        output_token_limit: None,
                         reasoning_levels: Vec::new(),
+                        metadata_source: "provider catalog".into(),
                     });
                 }
             }
@@ -3497,7 +3585,10 @@ async fn fetch_models(
                 input_price_per_m: None,
                 output_price_per_m: None,
                 input_token_limit: None,
+                context_window: None,
+                output_token_limit: None,
                 reasoning_levels: Vec::new(),
+                metadata_source: "provider catalog".into(),
             }])
         }
         Err(_error) if !configured_models.is_empty() => Ok(configured_models
@@ -3514,7 +3605,10 @@ async fn fetch_models(
                 input_price_per_m: None,
                 output_price_per_m: None,
                 input_token_limit: None,
+                context_window: None,
+                output_token_limit: None,
                 reasoning_levels: Vec::new(),
+                metadata_source: "provider catalog".into(),
             })
             .collect()),
         Err(error) => Err(error),
@@ -3609,5 +3703,692 @@ fn gemini_budget_for_mode(mode: &str) -> i32 {
 fn attachment_name(attachment: &DraftAttachment) -> &str {
     match attachment {
         DraftAttachment::Text { name, .. } | DraftAttachment::Image { name, .. } => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate_tool_output, App, Attachment, ChatMessage, MAX_TOOL_RESULT_CHARS};
+    use crate::client::types::{FunctionCallPayload, FunctionResponsePayload, Part};
+    use crate::config::AppConfig;
+    use serde_json::json;
+
+    fn message(role: &str, part: Part) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: serde_json::to_string(&part).unwrap(),
+            timestamp: String::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn catalog_model(id: &str) -> crate::client::types::ModelInfo {
+        crate::client::types::ModelInfo {
+            id: id.into(),
+            display_name: id.into(),
+            description: String::new(),
+            input_price_per_m: None,
+            output_price_per_m: None,
+            input_token_limit: None,
+            context_window: Some(128_000),
+            output_token_limit: Some(1024),
+            reasoning_levels: vec!["minimal".into(), "high".into()],
+            metadata_source: "test catalog".into(),
+        }
+    }
+
+    fn review_pending(epoch: u64) -> super::PendingToolCall {
+        super::PendingToolCall {
+            epoch,
+            call_id: Some("review-call".into()),
+            tool_name: "run_command".into(),
+            args: serde_json::json!({"command":"echo test"}),
+            preview: crate::tools::ToolPreview {
+                title: "test".into(),
+                details: vec![],
+                reason: None,
+                expected_effect: None,
+                command: None,
+                diff_hunks: vec![],
+                is_mutation: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_mode_allowed_directory_listing_never_calls_reviewer() {
+        let mut app = App::new(AppConfig::default(), "invalid-test-key".into());
+        app.auto_mode = true;
+        app.config
+            .set_permission_mode("read_only", crate::config::PermissionMode::Allow);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = app.stream_epoch;
+        app.handle_stream_signal(
+            epoch,
+            crate::events::StreamSignal::ToolCall {
+                id: Some("list-allowed".into()),
+                name: "list_directory".into(),
+                args: serde_json::json!({"path":".", "max_entries":1}),
+                thought_signature: None,
+            },
+            tx,
+        );
+        assert!(app.pending_tool_call.is_none());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            crate::events::AppEvent::ToolExecutionResult {
+                tool_name, result, ..
+            } => {
+                assert_eq!(tool_name, "list_directory");
+                assert!(result.is_ok(), "{result:?}");
+            }
+            other => panic!("Allowed listing unexpectedly entered review: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_auto_override_is_temporary_and_preserves_denials() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        app.config
+            .set_permission_mode("host_execution", crate::config::PermissionMode::Ask);
+        app.config
+            .set_permission_mode("read_only", crate::config::PermissionMode::Allow);
+        app.config
+            .set_permission_mode("destructive", crate::config::PermissionMode::Deny);
+        assert!(!app.auto_mode);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_slash_command("/auto on", tx.clone());
+        assert!(app.auto_mode);
+        assert_eq!(
+            app.effective_permission_mode("host_execution"),
+            crate::config::PermissionMode::Review
+        );
+        assert_eq!(
+            app.effective_permission_mode("read_only"),
+            crate::config::PermissionMode::Allow
+        );
+        assert_eq!(
+            app.effective_permission_mode("destructive"),
+            crate::config::PermissionMode::Deny
+        );
+        assert_eq!(
+            app.config.permission_mode_for("host_execution"),
+            crate::config::PermissionMode::Ask
+        );
+        app.handle_slash_command("/auto off", tx.clone());
+        assert_eq!(
+            app.effective_permission_mode("host_execution"),
+            crate::config::PermissionMode::Ask
+        );
+        assert_eq!(
+            app.effective_permission_mode("read_only"),
+            crate::config::PermissionMode::Allow
+        );
+        app.handle_slash_command("/auto nonsense", tx);
+        assert!(!app.auto_mode);
+    }
+
+    #[test]
+    fn auto_toggle_requires_idle_and_new_session_clears_it() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.state = super::EngineState::ExecutingTool;
+        app.handle_slash_command("/auto on", tx.clone());
+        assert!(!app.auto_mode);
+        app.state = super::EngineState::Idle;
+        app.handle_slash_command("/auto on", tx);
+        assert!(app.auto_mode);
+        app.start_new_session();
+        assert!(!app.auto_mode);
+    }
+
+    #[test]
+    fn review_error_asks_and_stale_reviews_are_ignored() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        app.config
+            .set_permission_mode("host_execution", crate::config::PermissionMode::Review);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = app.stream_epoch;
+        app.handle_stream_signal(
+            epoch + 1,
+            crate::events::StreamSignal::ToolReviewed {
+                pending: review_pending(epoch + 1),
+                result: Err("timeout".into()),
+            },
+            tx.clone(),
+        );
+        assert!(app.pending_tool_call.is_none());
+        app.handle_stream_signal(
+            epoch,
+            crate::events::StreamSignal::ToolReviewed {
+                pending: review_pending(epoch),
+                result: Err("timeout".into()),
+            },
+            tx.clone(),
+        );
+        assert!(app.pending_requires_review());
+        assert_eq!(app.state, super::EngineState::AwaitingHitlApproval);
+        assert!(app
+            .pending_tool_call
+            .as_ref()
+            .unwrap()
+            .preview
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("timeout"));
+        app.cancel_generation();
+        app.handle_stream_signal(
+            epoch,
+            crate::events::StreamSignal::ToolReviewed {
+                pending: review_pending(epoch),
+                result: Err("late".into()),
+            },
+            tx,
+        );
+        assert!(app.pending_tool_call.is_none());
+    }
+
+    #[test]
+    fn failed_turn_cannot_accept_review_result() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        app.tool_turn_failed = true;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = app.stream_epoch;
+        app.handle_stream_signal(
+            epoch,
+            crate::events::StreamSignal::ToolReviewed {
+                pending: review_pending(epoch),
+                result: Err("late".into()),
+            },
+            tx,
+        );
+        assert!(app.pending_tool_call.is_none());
+    }
+
+    #[test]
+    fn stale_and_incomplete_compaction_cannot_replace_history() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        app.add_message("user", "Keep this objective");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_compaction_result(
+            app.stream_epoch + 1,
+            Ok("stale Checkpoint complete.".into()),
+            tx.clone(),
+        );
+        assert_eq!(app.messages.len(), 1);
+        app.handle_compaction_result(app.stream_epoch, Ok("truncated checkpoint".into()), tx);
+        assert_eq!(app.messages[0].content, "Keep this objective");
+        assert!(!app.messages.iter().any(|m| m.role == "summary"));
+    }
+
+    #[tokio::test]
+    async fn compaction_is_single_flight_and_cancellable() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        for _ in 0..3 {
+            app.add_message("user", "Keep this objective");
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.compact_history(tx.clone());
+        let epoch = app.stream_epoch;
+        app.compact_history(tx);
+        assert_eq!(app.stream_epoch, epoch);
+        assert!(app.active_stream_task.is_some());
+        app.cancel_generation();
+        assert!(app.active_stream_task.is_none());
+        assert_eq!(app.state, super::EngineState::Idle);
+        assert!(app.stream_epoch > epoch);
+        assert!(!app.pending_generation_after_compaction);
+    }
+
+    #[test]
+    fn successful_checkpoint_replaces_history() {
+        let mut app = App::new(AppConfig::default(), "test".into());
+        app.add_message("user", "Keep this objective");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_compaction_result(
+            app.stream_epoch,
+            Ok("Objective retained. Checkpoint complete.".into()),
+            tx,
+        );
+        assert_eq!(app.messages[0].role, "summary");
+        assert!(app.messages[0].content.contains("Objective retained"));
+    }
+
+    #[test]
+    fn input_only_limits_do_not_reserve_output_tokens() {
+        let mut app = App::new(AppConfig::default(), "test-key".into());
+        let mut model = catalog_model(&app.config.model);
+        model.context_window = None;
+        model.input_token_limit = Some(1000);
+        app.available_models = vec![model];
+        assert!(!app.context_would_overflow(999));
+        assert!(app.context_would_overflow(1000));
+        app.available_models[0].context_window = Some(1500);
+        assert!(app.context_would_overflow(999));
+    }
+
+    #[test]
+    fn refresh_invalidates_catalog_and_rejects_stale_fetches() {
+        let mut app = App::new(AppConfig::default(), "test-key".into());
+        let epoch = app.models_epoch;
+        assert!(app.install_models(epoch, vec![catalog_model(&app.config.model)]));
+        app.refresh_client_from_config();
+        assert!(app.available_models.is_empty());
+        assert!(!app.install_models(epoch, vec![catalog_model("stale")]));
+        assert!(app.available_models.is_empty());
+        assert!(app.install_models(app.models_epoch, vec![catalog_model("current")]));
+    }
+
+    #[test]
+    fn configured_context_override_works_without_catalog() {
+        let mut app = App::new(AppConfig::default(), "test-key".into());
+        let key = app.config.model_profile_key();
+        app.config
+            .model_profiles
+            .entry(key)
+            .or_default()
+            .context_window = Some(64_000);
+        assert_eq!(app.context_limit(), Some(64_000));
+        app.available_models = vec![catalog_model(&app.config.model)];
+        assert_eq!(app.context_limit(), Some(64_000));
+    }
+
+    #[test]
+    fn output_budget_is_clamped_and_used_in_payload() {
+        let mut app = App::new(AppConfig::default(), "test-key".into());
+        app.available_models = vec![catalog_model(&app.config.model)];
+        assert_eq!(app.output_budget(), 1024);
+        assert_eq!(
+            app.build_request()
+                .generation_config
+                .unwrap()
+                .max_output_tokens,
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn compatible_provider_uses_catalog_reasoning_capabilities() {
+        let mut app = App::new(AppConfig::default(), "test-key".into());
+        app.config.provider = "bearlab".into();
+        app.available_models = vec![catalog_model(&app.config.model)];
+        assert_eq!(
+            app.thinking_choices(&app.config.model),
+            vec!["minimal", "high"]
+        );
+    }
+
+    #[test]
+    fn drops_orphaned_openai_tool_calls_but_keeps_completed_calls() {
+        let mut config = AppConfig::default();
+        config.providers.get_mut("gemini").unwrap().kind = "openai-compatible".to_string();
+        let mut app = App::new(config, "test-key".to_string());
+        app.messages = vec![
+            message(
+                "model_tool_call",
+                Part::FunctionCall {
+                    function_call: FunctionCallPayload {
+                        name: "read_file".to_string(),
+                        args: json!({"path": "orphan.rs"}),
+                        id: Some("call-orphan".to_string()),
+                    },
+                    thought_signature: None,
+                },
+            ),
+            ChatMessage {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                timestamp: String::new(),
+                attachments: Vec::new(),
+            },
+        ];
+        let request = app.build_request();
+        assert!(request.contents.iter().all(|content| {
+            content
+                .parts
+                .iter()
+                .all(|part| !matches!(part, Part::FunctionCall { .. }))
+        }));
+
+        app.messages.push(message(
+            "model_tool_call",
+            Part::FunctionCall {
+                function_call: FunctionCallPayload {
+                    name: "read_file".to_string(),
+                    args: json!({"path": "done.rs"}),
+                    id: Some("call-done".to_string()),
+                },
+                thought_signature: None,
+            },
+        ));
+        app.messages.push(message(
+            "function",
+            Part::FunctionResponse {
+                function_response: FunctionResponsePayload {
+                    name: "read_file".to_string(),
+                    response: json!({"output": "ok"}),
+                    id: Some("call-done".to_string()),
+                },
+            },
+        ));
+        let request = app.build_request();
+        assert!(request.contents.iter().any(|content| {
+            content.parts.iter().any(|part| {
+                matches!(part, Part::FunctionCall { function_call, .. } if function_call.id.as_deref() == Some("call-done"))
+            })
+        }));
+    }
+
+    #[test]
+    fn drops_orphaned_codex_tool_calls_and_outputs() {
+        let config = AppConfig {
+            provider: "codex".into(),
+            model: "gpt-test".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(config, "test-key".to_string());
+        app.messages = vec![
+            message(
+                "model_tool_call",
+                Part::FunctionCall {
+                    function_call: FunctionCallPayload {
+                        name: "read_file".to_string(),
+                        args: json!({"path": "orphan.rs"}),
+                        id: Some("call-orphan".to_string()),
+                    },
+                    thought_signature: None,
+                },
+            ),
+            message(
+                "function",
+                Part::FunctionResponse {
+                    function_response: FunctionResponsePayload {
+                        name: "read_file".to_string(),
+                        response: json!({"output": "orphan output"}),
+                        id: Some("call-unrelated".to_string()),
+                    },
+                },
+            ),
+            ChatMessage {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                timestamp: String::new(),
+                attachments: Vec::new(),
+            },
+        ];
+
+        let request = app.build_request();
+        assert!(request.contents.iter().all(|content| {
+            content.parts.iter().all(|part| {
+                !matches!(
+                    part,
+                    Part::FunctionCall { .. } | Part::FunctionResponse { .. }
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn request_uses_maintained_prompt_and_sys_only_changes_customization() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.project_instructions = "Project convention: use tabs.".to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_slash_command("/sys Respond in Polish.", tx.clone());
+        app.plan_mode = true;
+        let request = app.build_request();
+        let system = request.system_instruction.unwrap();
+        let Part::Text { text, .. } = &system.parts[0] else {
+            panic!("missing system text")
+        };
+        assert!(text.starts_with(crate::prompts::MAIN.trim()));
+        assert!(text.contains("Respond in Polish."));
+        assert!(text.contains("Project convention: use tabs."));
+        assert!(text.ends_with(crate::prompts::PLAN.trim()));
+        app.handle_slash_command("/sys --clear", tx);
+        assert!(app.config.system_instruction.is_empty());
+        assert!(app
+            .effective_system_instruction()
+            .starts_with(crate::prompts::MAIN.trim()));
+    }
+
+    #[test]
+    fn runtime_session_instruction_is_request_scoped() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.set_session_instruction(Some("Speak for this frontend session.".to_string()));
+        assert!(app
+            .effective_system_instruction()
+            .contains("--- BEGIN Session instructions ---\nSpeak for this frontend session."));
+        app.start_new_session();
+        assert!(!app
+            .effective_system_instruction()
+            .contains("Speak for this frontend session."));
+    }
+
+    #[test]
+    fn compaction_preserves_attachment_evidence_and_rejects_empty_summary() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.add_message_with_attachments(
+            "user",
+            "Review this",
+            vec![
+                Attachment {
+                    kind: "text".into(),
+                    name: "source.rs".into(),
+                    mime_type: None,
+                    text: Some("fn supplied_code() {}".into()),
+                    data: None,
+                },
+                Attachment {
+                    kind: "image".into(),
+                    name: "screen.png".into(),
+                    mime_type: Some("image/png".into()),
+                    text: None,
+                    data: Some("IMAGE_PAYLOAD_SHOULD_NOT_BE_COPIED".into()),
+                },
+            ],
+        );
+        app.add_message("thought", "PRIVATE_REASONING");
+        let transcript = super::compaction_transcript(&app.messages);
+        assert!(transcript.contains("fn supplied_code() {}"));
+        assert!(transcript.contains("screen.png"));
+        assert!(!transcript.contains("IMAGE_PAYLOAD_SHOULD_NOT_BE_COPIED"));
+        assert!(!transcript.contains("PRIVATE_REASONING"));
+        for line in transcript.lines() {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
+        }
+        let original = app.messages[0].content.clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_compaction_result(app.stream_epoch, Ok("  ".into()), tx);
+        assert_eq!(app.messages[0].content, original);
+        assert_eq!(app.messages[0].attachments.len(), 2);
+        assert!(!app.messages.iter().any(|message| message.role == "summary"));
+    }
+
+    #[test]
+    fn context_metric_is_not_last_request_total() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.add_message("user", "A short prompt");
+        app.total_tokens = 900_000;
+        assert!(app.context_tokens < 900_000);
+        assert!(app.context_tokens_estimated);
+    }
+
+    #[test]
+    fn compact_summary_is_replayed_as_model_input() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.messages.push(ChatMessage {
+            role: "summary".to_string(),
+            content: "Compact History Summary:\nThe user is fixing session restore.".to_string(),
+            timestamp: String::new(),
+            attachments: Vec::new(),
+        });
+        app.messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: "UI-only notice".to_string(),
+            timestamp: String::new(),
+            attachments: Vec::new(),
+        });
+        let request = app.build_request();
+        assert!(request.contents.iter().any(|content| {
+            content.parts.iter().any(
+                |part| matches!(part, Part::Text { text, .. } if text.contains("session restore")),
+            )
+        }));
+        assert!(request.contents.iter().all(|content| {
+            content
+                .parts
+                .iter()
+                .all(|part| !matches!(part, Part::Text { text, .. } if text == "UI-only notice"))
+        }));
+    }
+
+    #[test]
+    fn tool_output_truncation_is_unicode_safe() {
+        let output = "界".repeat(MAX_TOOL_RESULT_CHARS + 256);
+        let truncated = truncate_tool_output(&output);
+        assert!(truncated.contains("tool output truncated"));
+        assert!(truncated.starts_with("界"));
+        assert!(truncated.ends_with("界"));
+    }
+
+    #[test]
+    fn structured_plan_requires_a_heading_and_step() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.add_message(
+            "model",
+            "## Plan\n1. Inspect the project\n2. Propose the fix",
+        );
+        assert!(app.latest_model_has_plan());
+        app.messages.push(ChatMessage {
+            role: "model".to_string(),
+            content: "I have some ideas, but no executable outline yet.".to_string(),
+            timestamp: String::new(),
+            attachments: Vec::new(),
+        });
+        assert!(!app.latest_model_has_plan());
+    }
+
+    #[test]
+    fn attachments_are_sent_after_prompt_with_text_last() {
+        let mut config = AppConfig::default();
+        config.providers.get_mut("gemini").unwrap().kind = "gemini".to_string();
+        let mut app = App::new(config, "test-key".to_string());
+        app.add_message_with_attachments(
+            "user",
+            "question",
+            vec![
+                Attachment {
+                    kind: "image".to_string(),
+                    name: "screen.png".to_string(),
+                    mime_type: Some("image/png".to_string()),
+                    text: None,
+                    data: Some("base64-image".to_string()),
+                },
+                Attachment {
+                    kind: "text".to_string(),
+                    name: "paste-1.txt".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some("actual pasted content".to_string()),
+                    data: None,
+                },
+            ],
+        );
+
+        let request = app.build_request();
+        let user = request
+            .contents
+            .iter()
+            .find(|content| content.role.as_deref() == Some("user"))
+            .unwrap();
+        assert!(matches!(&user.parts[0], Part::InlineData { .. }));
+        assert!(
+            matches!(&user.parts[1], Part::Text { text, .. } if text.contains("actual pasted content"))
+        );
+        assert!(matches!(&user.parts[2], Part::Text { text, .. } if text == "question"));
+    }
+
+    #[test]
+    fn attachment_commands_operate_on_draft_instead_of_clearing_it() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.draft_attachments.push(super::DraftAttachment::Text {
+            name: "paste-1.txt".to_string(),
+            text: "editable paste".to_string(),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        app.input_buffer = "/attachments".to_string();
+        app.input_cursor = app.input_buffer.chars().count();
+        app.handle_enter(tx.clone());
+        assert_eq!(app.draft_attachments.len(), 1);
+
+        app.input_buffer = "/edit 1".to_string();
+        app.input_cursor = app.input_buffer.chars().count();
+        app.handle_enter(tx);
+        assert!(app.draft_attachments.is_empty());
+        assert_eq!(app.input_buffer, "editable paste");
+    }
+
+    #[test]
+    fn ctrl_c_clears_draft_before_quitting() {
+        let mut app = App::new(AppConfig::default(), "test-key".to_string());
+        app.input_buffer = "unsent text".to_string();
+        app.input_cursor = app.input_buffer.chars().count();
+
+        app.handle_ctrl_c();
+        assert!(app.input_buffer.is_empty());
+        assert!(!app.should_quit);
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Press Ctrl+C again")));
+
+        app.handle_ctrl_c();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn retry_preserves_all_history_even_after_one_long_user_turn() {
+        let mut app = App::new(AppConfig::default(), "".into());
+        app.session_path = None;
+        app.config.model.clear(); // No network or runtime needed for this regression.
+        app.add_message("user", "implement this");
+        app.add_message("model", "Checking files");
+        app.add_message("tool", "completed edit");
+        app.add_message("function", "saved result");
+        app.add_message("system", "Error: connection lost");
+        let before = serde_json::to_string(&app.messages).unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_slash_command("/retry", tx);
+        assert_eq!(serde_json::to_string(&app.messages).unwrap(), before);
+        assert_eq!(app.chat_scroll, 0);
+    }
+
+    #[test]
+    fn permission_preview_uses_public_narration_not_thoughts() {
+        let mut app = App::new(AppConfig::default(), "".into());
+        app.session_path = None;
+        app.add_message("user", "check files");
+        app.current_response_buffer = "I will list files to locate the configuration.".into();
+        app.current_thought_buffer = "Private reasoning must not be shown as justification".into();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_stream_signal(
+            app.stream_epoch,
+            crate::events::StreamSignal::ToolCall {
+                id: Some("call-1".into()),
+                name: "run_command".into(),
+                args: json!({"command":"dir"}),
+                thought_signature: None,
+            },
+            tx,
+        );
+        let pending = app.pending_tool_call.expect("approval requested");
+        assert_eq!(
+            pending.preview.reason.as_deref(),
+            Some("I will list files to locate the configuration.")
+        );
     }
 }

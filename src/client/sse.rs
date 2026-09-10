@@ -142,9 +142,9 @@ pub async fn stream_sse_response(response: Response, tx: UnboundedSender<StreamS
         // finishReason. Flush the final line and guarantee a terminal event.
         parser.process_chunk(b"\n", &tx);
         if !parser.is_finished() {
-            let _ = tx.send(StreamSignal::Finished {
-                finish_reason: Some("STOP".to_string()),
-            });
+            let _ = tx.send(StreamSignal::Error(
+                "Stream ended without a completion event; response is incomplete".to_string(),
+            ));
         }
     }
 }

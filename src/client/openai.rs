@@ -251,7 +251,6 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut tools: BTreeMap<usize, (Option<String>, String, String)> = BTreeMap::new();
-    let mut finished = false;
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
@@ -269,16 +268,29 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
                         continue;
                     };
                     if data == "[DONE]" {
-                        emit_tools(&mut tools, &tx);
+                        if !emit_tools(&mut tools, &tx) {
+                            return;
+                        }
                         let _ = tx.send(StreamSignal::Finished {
                             finish_reason: Some("STOP".to_string()),
                         });
-                        finished = true;
+                        return;
+                    }
+                    if data.is_empty() {
                         continue;
                     }
                     let Ok(value) = serde_json::from_str::<Value>(data) else {
-                        continue;
+                        let _ = tx.send(StreamSignal::Error(
+                            "Malformed JSON in provider stream".to_string(),
+                        ));
+                        return;
                     };
+                    if let Some(error) = value.get("error") {
+                        let _ = tx.send(StreamSignal::Error(format!(
+                            "Provider stream error: {error}"
+                        )));
+                        return;
+                    }
                     if let Some(usage) = value.get("usage") {
                         emit_usage(usage, &tx);
                     }
@@ -323,6 +335,14 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
                                 entry.2.push_str(args);
                             }
                         }
+                        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                            if matches!(reason, "length" | "content_filter") {
+                                let _ = tx.send(StreamSignal::Error(format!(
+                                    "Response incomplete: {reason}"
+                                )));
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -335,19 +355,15 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
             }
         }
     }
-    emit_tools(&mut tools, &tx);
-    if !finished {
-        let _ = tx.send(StreamSignal::Finished {
-            finish_reason: Some("STOP".to_string()),
-        });
-    }
+    let _ = tx.send(StreamSignal::Error(
+        "Stream ended without a completion event; response is incomplete".to_string(),
+    ));
 }
 
 pub async fn stream_responses_response(response: Response, tx: UnboundedSender<StreamSignal>) {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut tools: BTreeMap<String, (Option<String>, String, String)> = BTreeMap::new();
-    let mut finished = false;
 
     while let Some(chunk) = stream.next().await {
         match chunk {
@@ -366,16 +382,29 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
                         continue;
                     };
                     if data == "[DONE]" {
-                        emit_responses_tools(&mut tools, &tx);
+                        if !emit_responses_tools(&mut tools, &tx) {
+                            return;
+                        }
                         let _ = tx.send(StreamSignal::Finished {
                             finish_reason: Some("STOP".to_string()),
                         });
-                        finished = true;
+                        return;
+                    }
+                    if data.is_empty() {
                         continue;
                     }
                     let Ok(value) = serde_json::from_str::<Value>(data) else {
-                        continue;
+                        let _ = tx.send(StreamSignal::Error(
+                            "Malformed JSON in provider stream".to_string(),
+                        ));
+                        return;
                     };
+                    if let Some(error) = value.get("error") {
+                        let _ = tx.send(StreamSignal::Error(format!(
+                            "Provider stream error: {error}"
+                        )));
+                        return;
+                    }
                     let event_type = value
                         .get("type")
                         .and_then(Value::as_str)
@@ -463,11 +492,26 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
                             if let Some(usage) = value.pointer("/response/usage") {
                                 emit_responses_usage(usage, &tx);
                             }
-                            emit_responses_tools(&mut tools, &tx);
+                            if !emit_responses_tools(&mut tools, &tx) {
+                                return;
+                            }
                             let _ = tx.send(StreamSignal::Finished {
                                 finish_reason: Some("STOP".to_string()),
                             });
-                            finished = true;
+                            return;
+                        }
+                        "response.incomplete" => {
+                            if let Some(usage) = value.pointer("/response/usage") {
+                                emit_responses_usage(usage, &tx);
+                            }
+                            let reason = value
+                                .pointer("/response/incomplete_details/reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown reason");
+                            let _ = tx.send(StreamSignal::Error(format!(
+                                "Response incomplete: {reason}"
+                            )));
+                            return;
                         }
                         "response.failed" | "error" => {
                             let message = value
@@ -495,12 +539,9 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
             }
         }
     }
-    if !finished {
-        emit_responses_tools(&mut tools, &tx);
-        let _ = tx.send(StreamSignal::Finished {
-            finish_reason: Some("STOP".to_string()),
-        });
-    }
+    let _ = tx.send(StreamSignal::Error(
+        "Stream ended without a completion event; response is incomplete".to_string(),
+    ));
 }
 
 pub fn responses_text(value: &Value) -> Option<String> {
@@ -533,20 +574,37 @@ pub fn responses_text(value: &Value) -> Option<String> {
 fn emit_responses_tools(
     tools: &mut BTreeMap<String, (Option<String>, String, String)>,
     tx: &UnboundedSender<StreamSignal>,
-) {
-    for (_, (id, name, arguments)) in std::mem::take(tools) {
-        if name.is_empty() {
-            continue;
+) -> bool {
+    emit_validated_tools(std::mem::take(tools).into_values(), tx)
+}
+
+fn emit_validated_tools(
+    tools: impl Iterator<Item = (Option<String>, String, String)>,
+    tx: &UnboundedSender<StreamSignal>,
+) -> bool {
+    let mut validated = Vec::new();
+    for (id, name, arguments) in tools {
+        let args = serde_json::from_str::<Value>(&arguments);
+        if name.is_empty()
+            || id.as_deref().is_none_or(str::is_empty)
+            || !matches!(&args, Ok(Value::Object(_)))
+        {
+            let _ = tx.send(StreamSignal::Error(
+                "Provider returned an incomplete or malformed tool call".to_string(),
+            ));
+            return false;
         }
-        let args = serde_json::from_str(&arguments)
-            .unwrap_or_else(|_| json!({ "raw_arguments": arguments }));
-        let _ = tx.send(StreamSignal::ToolCall {
+        validated.push(StreamSignal::ToolCall {
             id,
             name,
-            args,
+            args: args.unwrap(),
             thought_signature: None,
         });
     }
+    for call in validated {
+        let _ = tx.send(call);
+    }
+    true
 }
 
 fn emit_responses_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
@@ -572,17 +630,8 @@ fn emit_responses_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
 fn emit_tools(
     tools: &mut BTreeMap<usize, (Option<String>, String, String)>,
     tx: &UnboundedSender<StreamSignal>,
-) {
-    for (_, (id, name, arguments)) in std::mem::take(tools) {
-        let args = serde_json::from_str(&arguments)
-            .unwrap_or_else(|_| json!({ "raw_arguments": arguments }));
-        let _ = tx.send(StreamSignal::ToolCall {
-            id,
-            name,
-            args,
-            thought_signature: None,
-        });
-    }
+) -> bool {
+    emit_validated_tools(std::mem::take(tools).into_values(), tx)
 }
 
 fn emit_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
@@ -609,6 +658,140 @@ fn emit_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
 mod tests {
     use super::*;
     use crate::client::types::{Content, GenerateContentRequest, Part};
+
+    async fn fixture(body: &'static str, responses: bool) -> Vec<StreamSignal> {
+        let response = reqwest::Response::from(http::Response::new(body));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if responses {
+            stream_responses_response(response, tx).await;
+        } else {
+            stream_response(response, tx).await;
+        }
+        let mut signals = Vec::new();
+        while let Ok(signal) = rx.try_recv() {
+            signals.push(signal);
+        }
+        signals
+    }
+
+    #[tokio::test]
+    async fn eof_without_terminal_event_is_not_success() {
+        for responses in [false, true] {
+            let signals = fixture("data: {}\n\n", responses).await;
+            assert!(signals.iter().any(|s| matches!(s, StreamSignal::Error(_))));
+            assert!(!signals
+                .iter()
+                .any(|s| matches!(s, StreamSignal::Finished { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_responses_preserve_usage_but_do_not_dispatch_tools() {
+        let signals = fixture(concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item1\",\"call_id\":\"call1\",\"name\":\"run_command\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
+        ), true).await;
+        assert!(signals.iter().any(|s| matches!(
+            s,
+            StreamSignal::Usage {
+                prompt_tokens: 10,
+                ..
+            }
+        )));
+        assert!(signals
+            .iter()
+            .any(|s| matches!(s, StreamSignal::Error(e) if e.contains("max_output_tokens"))));
+        assert!(!signals.iter().any(|s| matches!(
+            s,
+            StreamSignal::Finished { .. } | StreamSignal::ToolCall { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn responses_finish_exactly_once() {
+        let signals = fixture(
+            "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n",
+            true,
+        )
+        .await;
+        assert_eq!(
+            signals
+                .iter()
+                .filter(|s| matches!(s, StreamSignal::Finished { .. }))
+                .count(),
+            1
+        );
+        assert!(!signals.iter().any(|s| matches!(s, StreamSignal::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn malformed_stream_json_fails_closed() {
+        for responses in [false, true] {
+            let signals = fixture("data: {bad json}\n\ndata: [DONE]\n\n", responses).await;
+            assert!(matches!(signals.as_slice(), [StreamSignal::Error(_)]));
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_length_limit_is_incomplete_even_with_done_marker() {
+        let signals = fixture("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", false).await;
+        assert!(matches!(
+            signals.as_slice(),
+            [StreamSignal::TextDelta(_), StreamSignal::Error(_)]
+        ));
+    }
+
+    #[test]
+    fn review_json_contract_is_present_in_both_protocols() {
+        let prompt = include_str!("../prompts/auto_review.md");
+        let request = super::GenerateContentRequest {
+            contents: vec![],
+            system_instruction: Some(super::Content {
+                role: Some("system".into()),
+                parts: vec![super::Part::Text {
+                    text: prompt.into(),
+                    thought: None,
+                }],
+            }),
+            generation_config: None,
+            safety_settings: None,
+            tools: None,
+        };
+        let chat = super::request_payload("codex-auto-review", &request, false, false);
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][0]["content"], prompt);
+        let responses = super::responses_request_payload("codex-auto-review", &request, false);
+        assert_eq!(responses["instructions"], prompt);
+        assert!(prompt.contains("exactly one JSON object"));
+    }
+
+    #[test]
+    fn malformed_tool_batch_dispatches_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tools = vec![
+            (Some("a".into()), "read_file".into(), "{}".into()),
+            (
+                Some("b".into()),
+                "run_command".into(),
+                "{\"command\":".into(),
+            ),
+        ];
+        assert!(!emit_validated_tools(tools.into_iter(), &tx));
+        assert!(matches!(rx.try_recv().unwrap(), StreamSignal::Error(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_chat_stream_succeeds() {
+        let signals = fixture(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n",
+            false,
+        )
+        .await;
+        assert!(
+            matches!(signals.as_slice(), [StreamSignal::TextDelta(t), StreamSignal::Finished { .. }] if t == "hello")
+        );
+    }
 
     #[test]
     fn converts_gemini_request_to_openai_chat_payload() {

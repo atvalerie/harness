@@ -66,7 +66,7 @@ pub fn render_hitl_modal(app: &App, frame: &mut Frame, area: Rect) {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let mut body_lines = Vec::new();
-    if pending.preview.command.is_some() {
+    {
         body_lines.push(Line::from(Span::styled("Why:", section_style)));
         body_lines.push(Line::from(format!(
             "  {}",
@@ -109,7 +109,7 @@ pub fn render_hitl_modal(app: &App, frame: &mut Frame, area: Rect) {
         body_area,
     );
     let footer = if pending.preview.diff_hunks.is_empty() {
-        "[Y] approve once   [A] allow this session   [N/Esc] reject"
+        "[Up/Down] scroll   [Y] once   [A] allow session   [N/Esc] reject"
     } else {
         "[↑/↓] scroll diff   [Y] approve once   [A] allow   [N/Esc] reject"
     };
@@ -137,7 +137,10 @@ fn render_diff_line(hunk: &DiffHunk) -> Line<'static> {
 }
 
 pub fn render_permissions_modal(app: &App, frame: &mut Frame, area: Rect) {
-    if !app.show_permissions_modal {
+    if !app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Permissions)
+    {
         return;
     }
     let popup_area = centered_rect(86, 82, area);
@@ -157,18 +160,22 @@ pub fn render_permissions_modal(app: &App, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Allow executes automatically; Ask shows the approval preview; Deny rejects."),
+        Line::from(
+            "Allow bypasses review; Review uses codex-auto-review; Ask asks you; Deny rejects.",
+        ),
         Line::from(""),
     ];
     for (index, (key, label)) in TOOL_PERMISSION_GROUPS.iter().enumerate() {
         let selected = index == app.permissions_selected;
         let mode = app.config.permission_mode_for(key);
         let mode_label = match mode {
+            PermissionMode::Review => "REVIEW",
             PermissionMode::Allow => "ALLOW",
             PermissionMode::Ask => "ASK",
             PermissionMode::Deny => "DENY",
         };
         let mode_color = match mode {
+            PermissionMode::Review => Color::Cyan,
             PermissionMode::Allow => Color::Green,
             PermissionMode::Ask => Color::Yellow,
             PermissionMode::Deny => Color::Red,
@@ -249,7 +256,10 @@ pub fn render_permissions_modal(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
-    if !app.show_models_modal {
+    if !app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Models)
+    {
         return;
     }
 
@@ -399,7 +409,10 @@ pub fn render_models_modal(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 pub fn render_thinking_modal(app: &App, frame: &mut Frame, area: Rect) {
-    if !app.show_thinking_modal {
+    if !app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Thinking)
+    {
         return;
     }
     let popup_area = centered_rect(52, 45, area);
@@ -459,7 +472,10 @@ pub fn render_thinking_modal(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 pub fn render_plan_modal(app: &App, frame: &mut Frame, area: Rect) {
-    if !app.show_plan_modal {
+    if !app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Plan)
+    {
         return;
     }
     let popup_area = centered_rect(62, 38, area);
@@ -524,7 +540,10 @@ pub fn render_plan_modal(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 pub fn render_sessions_modal(app: &App, frame: &mut Frame, area: Rect) {
-    if !app.show_sessions_modal {
+    if !app
+        .interaction
+        .is_overlay(crate::interaction::Overlay::Sessions)
+    {
         return;
     }
     let popup_area = centered_rect(75, 65, area);

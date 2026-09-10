@@ -238,3 +238,311 @@ remain approval-gated.
 Lightpanda controls websites and DOMs, not native Windows applications or
 arbitrary screen pixels. The future Windows computer-automation layer is a
 separate integration.
+
+## Provider credentials and model metadata
+
+API keys saved with `/key` are now scoped to the selected provider and stored only
+in the native credential store (Windows Credential Manager, macOS Keychain, or
+Linux Secret Service). Storage errors are reported; new plaintext fallback files
+are not written. On headless Linux without an unlocked Secret Service, use the
+provider's configured `api_key_env` instead.
+
+**Migration:** legacy shared `.key` files and the unscoped `api_key` keyring entry
+are no longer read automatically: they contain no indication of which provider
+owns the key. Select the intended provider and enter `/key` again, or configure its
+environment variable. Existing files are not deleted. Legacy provider-specific
+Codex credential files remain readable for compatibility; newly saved credentials
+use the secure store.
+
+A provider with no configured or remembered model now requires an explicit model
+selection rather than inheriting the previous provider's model. An empty
+`providers.<name>.fallback_models` list disables fallbacks for that provider.
+Provider, endpoint, and key changes refresh model metadata; outdated asynchronous
+catalog results are ignored. Headless generation also attempts a bounded metadata
+lookup before constructing its request.
+
+### Context limits for compatible providers (including BearLab)
+
+Catalog context limits, input-only limits, and output limits are distinct. When a
+provider's `/models` response omits limits, Holiday does **not** infer them from the
+model name. Set a verified provider/model-scoped override in `model_profiles`:
+
+```json
+{
+  "model_profiles": {
+    "bearlab:YOUR_MODEL_ID": {
+      "context_window": 128000,
+      "max_output_tokens": 8192
+    }
+  }
+}
+```
+
+The numbers above are illustrative, **not verified BearLab limits**. Replace them
+with limits confirmed for your endpoint and model. `context_window` is the combined
+input/output window; `input_token_limit` can be set separately for a provider that
+also limits input. Positive explicit context overrides take precedence over catalog
+metadata. Output budgets are clamped to a catalog's advertised output maximum.
+Token counts remain estimates, not a model-specific tokenizer calculation.
+
+Streaming now treats an unexpected EOF, malformed tool arguments, and explicit
+incomplete responses as errors rather than successful completion. Generation uses
+a connection deadline and a read-idle timeout rather than a fixed 120-second total
+lifetime; catalog requests retain a bounded total timeout.
+
+
+## Interactive workspace
+
+### Commands, palette, and composer
+
+- **Ctrl+K** or `/palette`: searchable command palette. Enter inserts the selected
+  command; press Enter in the composer to execute it. `/help`, command dispatch,
+  aliases, and command-name completion share `src/commands.rs`.
+- **Tab** completes command names and provider/model arguments. `/attach` and
+  `/resume` also offer filesystem completions. Ambiguous command names open the
+  palette; ambiguous arguments show candidates in the status line. Paths with
+  spaces can be quoted.
+- **Ctrl+R** or `/history TEXT`: search previous prompts and restore one without
+  immediately sending it. `/key` is deliberately excluded from prompt history.
+- **Ctrl+Z / Ctrl+Y**: undo/redo draft edits. **Ctrl+Left / Ctrl+Right** move by word;
+  **Ctrl+Backspace** deletes the preceding word. Horizontal editing respects
+  grapheme boundaries; wrapping uses terminal display width.
+- `/editor`: edit the text draft in `$VISUAL` or `$EDITOR`, defaulting to Notepad on
+  Windows and `vi` elsewhere. The variable must be an executable name/path, not a
+  shell command with arguments. Attachment blocks remain separate. This is an
+  interactive-terminal action, not a headless command.
+- Enter while the engine is busy queues the prompt and attachments. `/queue TEXT`
+  queues explicitly; `/interrupt TEXT` cancels the current turn and sends new text.
+  **Ctrl+G** cancels without sending a new prompt. Queued prompts run in FIFO order
+  once the interactive engine becomes idle. Drafts are retained when switching
+  between sessions within the running application.
+
+Provider/model changes and destructive conversation commands are marked **idle
+only** in help. They are rejected during generation rather than mutating an active
+request. Overlay state is centralized; reasoning settings can return to the model
+picker, and Escape closes the active overlay.
+
+### Transcript and context
+
+Transcript items show stable-in-the-current-history numbers. `/inspect N` toggles
+expanded details; expanding a tool record also reveals its provider output.
+Reasoning summaries are collapsed until expanded. `/search TEXT` filters the
+transcript, and `/search` clears the filter. `/jump N`, `/jump prev`, `/jump next`,
+and `/jump error` focus a message, adjacent user turn, or latest error; Alt+Up/Down
+navigate user turns. `/search` also clears this focus. `/copy N` copies a message;
+`/copy N code B` copies its B-th fenced code block. `/copy` copies the latest answer.
+Clipboard failures are reported instead of silently claiming success.
+
+Scrolling up anchors the viewport while new output arrives. Completed Markdown
+is cached, only viewport lines are submitted to the terminal widget, and idle
+rendering no longer rebuilds frames at 60 FPS. Active animations use a bounded
+12.5 FPS tick. Terminal polling runs on a dedicated input thread, paused while the
+external editor owns the terminal.
+
+`/context` now includes an estimated breakdown of instructions, conversation,
+tool history, schemas and text attachments; image count; output reserve; metadata
+source; and requested versus actually selected model/protocol. JSONL consumers
+also receive a `model_selected` event. Usage records use the actual selected model
+when the provider falls back. Estimates are not exact tokenizer measurements.
+
+### Managed tasks and scoped workers
+
+`/tasks` opens the task panel. Type `task-N` to inspect its bounded live output,
+or `cancel task-N` and Enter to request cancellation. The equivalent commands are
+`/tasks task-N` and `/tasks cancel task-N`. Model generations, tool calls, shell
+processes, and workers have task records. Completed records are pruned as new
+records arrive; active tasks remain inspectable.
+
+Background `run_command` calls no longer discard output or merely detach a PID.
+They return a managed task ID. Shell stdout/stderr is drained continuously with
+bounded retention. Timeouts and cancellation terminate the tracked shell, with
+Windows `taskkill /T` or Unix process-group termination for descendants. These are
+non-interactive commands (stdin is closed), not a PTY/sandbox or a guarantee of
+control over deliberately detached processes. Background tasks are still subject
+to their configured timeout and end when the harness runtime exits.
+
+Workers inherit only filesystem tools whose parent permission is explicitly
+`allow`. They cannot grant approvals, invoke shell/MCP tools, or escape the recorded
+workspace root. A worker is read-only unless `spawn_agent` receives `write_paths`,
+a list of exact files, and the parent already allows workspace writes. Overlapping
+active worker write scopes are rejected. Workers have a 12-tool-round limit and
+an approximate 64k-token serialized-input budget per work cycle. Stop requests
+interrupt generation rather than waiting for a model response. This implementation
+uses shared-workspace file scopes, **not isolated Git worktrees**; parent shell
+commands and unrelated external editors are not isolated by those scopes.
+
+### File review and recovery
+
+`/review` opens checkpoint history; type a checkpoint number to inspect its diff.
+`/rollback N` restores that file checkpoint only if its current bytes still match
+the checkpoint's recorded after-state and it remains in the current workspace.
+It does **not** rewind conversation state, run Git reset, or overwrite detected
+later edits. `/fork`, `/retry`, and `/clear` operate on conversation state only.
+
+Automatic checkpoints cover `write_file` and `edit_file` within the workspace,
+including edits made through worker tools. Files above 2 MB or paths whose parent
+cannot be resolved cannot be checkpointed, and these tool calls fail before the
+edit. Arbitrary shell commands, MCP side effects, directory operations, and moves
+are **not** automatically reversible. Checkpoints retain file bytes, not original
+filesystem metadata/ACLs; rollback uses optimistic conflict detection, not an OS
+transaction against concurrent external editors.
+
+Session persistence now includes an append-only `.events.jsonl` write-ahead log,
+with incremental history records and periodic full checkpoints. A truncated final
+record is ignored during recovery. `.changes.jsonl` separately persists file
+checkpoints, including worker changes that complete while the parent is idle.
+Keep these sidecars with the session JSON. Export uses recovered current state;
+deleting a session also removes its journals. Journals contain conversation and
+file contents and should be treated as sensitive. They currently have no automatic
+disk-retention policy. Live process handles are not restored after a crash.
+
+### BearLab metadata fallback
+
+For a provider named `bearlab` (or containing that name), exact model-ID matches
+can inherit missing context, output, and reasoning metadata from the Codex catalog.
+An explicit mapping can also be configured for any compatible provider:
+
+```json
+{
+  "model_profiles": {
+    "bearlab:YOUR_GATEWAY_MODEL": {
+      "codex_model": "EXACT_CODEX_CATALOG_MODEL_ID"
+    }
+  }
+}
+```
+
+No approximate name matching is performed. Gateway limits are retained, and
+explicit profile overrides take precedence. The source is labelled as a Codex
+fallback, not a verified gateway guarantee. The resolver uses a cached catalog or
+independently stored Codex OAuth credentials for a bounded refresh; it **never sends
+BearLab credentials to Codex**. Without a catalog or Codex credentials, missing
+limits remain unknown and explicit overrides continue to work.
+
+### Development checks
+
+```text
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
+```
+
+Tests include command aliases/quoted paths, overlay rendering at small terminal
+sizes, draft undo/redo, queueing, stale catalogs, scoped path rejection, optimistic
+rollback, journal recovery, and actual managed-process cancellation. Live provider
+compatibility, native clipboard/editor integrations, and all target operating
+systems still need end-to-end verification before a release.
+
+
+### Recovery and transcript controls
+
+- Typing `/` displays live command suggestions above the prompt. Up/Down selects,
+  Tab inserts, and Esc dismisses. Enter submits the command as typed. Ctrl+K still
+  opens the full searchable palette.
+- Message IDs appear beside timestamps, e.g. `12:34:56 #20`. Use `/inspect 20`
+  (alias `/expand 20`) to toggle expansion and focus that item. Tool expansion
+  shows recorded arguments and readable output, within the persisted output cap.
+  Ctrl+O toggles the focused item, or the latest tool/thought/assistant item when
+  no item is focused. `/search` with no arguments clears the focused view.
+- `/retry` now retries the continuation with conversation and completed tool
+  results preserved. It does not delete the previous assistant/tool turn or undo
+  filesystem changes. A provider failure is not evidence that a tool's side effects
+  were undone.
+- Approval panels show the shell tool's reason, or the model's most recent public
+  narration in the current user turn. Missing explanations are labeled explicitly;
+  private reasoning is never substituted. Shell schemas require `reason` and
+  `expected_effect`; other MCP tool schemas are passed through unchanged.
+- MCP startup failures are recorded in the transcript. Streamable HTTP supports
+  incremental SSE responses, negotiated protocol headers, session IDs and paginated
+  tool discovery. Legacy HTTP+SSE (`transport: "sse"`) is not implemented; use a
+  server's Streamable HTTP endpoint rather than its legacy SSE endpoint.
+
+
+### Bounded compaction and unattended review
+
+Compaction now makes **one request**, with no automatic retry or model fallback and a
+**60-second total deadline**. A 504 may mean the provider is still processing the
+request; retry explicitly with `/compact` rather than silently duplicating it.
+Esc cancels the local task; late results cannot overwrite the conversation. Failure,
+empty output, or an incomplete checkpoint retains the original history. The handoff
+prompt prioritizes authorization, the next step, verification evidence and pending
+non-idempotent operations. Local cancellation cannot guarantee provider cancellation.
+
+For selective unattended execution, open `/permissions` and cycle the desired groups
+to **REVIEW**. Policies are: ASK (human), ALLOW (no review), REVIEW (model review),
+and DENY (blocked). Save the permissions screen to persist the choices. REVIEW is
+opt-in; existing policies are unchanged. It ignores session-wide tool allowances and
+reviews each invocation separately. Plan-mode mutation restrictions and DENY still win.
+
+For the JSONL frontend, use `--tools review`, for example:
+
+```powershell
+holiday.exe --chat --format jsonl --tools review
+```
+
+This uses the exact `codex-auto-review` model on the **active provider**, with a
+30-second deadline, no tools, and no retries or fallback to another model. The provider
+must expose that model using its configured protocol. Missing model support, timeout,
+malformed decisions, or more than 160 KB of review input require human approval; context
+is not silently truncated. No live-provider availability is assumed.
+
+The reviewer evaluates user intent, exact scope, risk, reversibility and whether the
+step is worth taking. Only sufficiently authorized low/medium-risk actions can be
+auto-approved. High-risk, ambiguous or consequential actions pause with a concrete
+question; explicit violations are denied. JSONL emits `auto_review` and, when needed,
+`approval_required`. Reply using the matching approval ID, for example:
+
+```json
+{"event":"approval_response","approval_id":"<from approval_required>","approved":true,"method":"text"}
+```
+
+Review escalations require `text`, `keybind`, or `ui`, not voice or an unspecified
+method. TUI users can approve the exact displayed action once or reject it; choosing
+session allowance does not whitelist REVIEW actions. No response means no execution.
+`--tools auto` retains its legacy unconditional approval behavior for non-REVIEW gates;
+it is **not** the safe unattended-review mode. A model reviewer reduces interruptions,
+but is not an OS sandbox or a guarantee that arbitrary commands are safe.
+
+
+### Quick global auto-review toggle
+
+Keep your usual permission groups on ASK, then use:
+
+- `/auto on` ? temporarily review **ASK groups** with `codex-auto-review`,
+  ALLOW runs directly and DENY stays blocked. The status bar shows **AUTO REVIEW**.
+- `/auto off` ? restore your normal group policies without rewriting settings.
+- `/auto` or `/auto status` ? show the current mode.
+
+Toggle while idle; stop an active turn first. This does not retroactively approve a
+pending action or bypass DENY/plan mode. High-risk and uncertain actions still pause
+for confirmation. Session-wide allowlists cannot bypass this override. Scoped workers inherit only explicitly ALLOW-listed filesystem tools; ASK and REVIEW
+tools are not granted to workers.
+
+The toggle is runtime-only, starts off on launch, and resets on `/new`. It is not
+saved in config or session snapshots. `/auto off` restores your configured policies,
+not force-manual behavior: groups already on ALLOW or REVIEW keep those settings.
+`--tools review` enables the same override for JSONL runs without changing group settings.
+
+Auto-review uses a separate, stateless request, not the coding-agent conversation.
+It sends an explicit review task and policy, a JSON-escaped evidence packet, the exact
+planned action, and a final reminder to assess rather than execute. No coding-agent
+system prompt, private reasoning, assistant dialogue or attachment payloads are replayed.
+Authorization messages, previous summaries and recorded denials/review notices are kept
+within a 48 KB budget; excess authorization evidence requires human confirmation rather
+than silently dropping constraints. At most six recent tool records (16 KB total) are
+included, with explicit omission counts. Prior summaries are evidence, not new consent.
+
+The response uses Guardian-style fields: `outcome`, `risk_level`, `user_authorization`,
+and `rationale`. Holiday retains its `ask` outcome and requires the full assessment;
+it does not infer low risk from a bare `{"outcome":"allow"}`. Existing authorization and
+high-risk confirmation rules remain unchanged. This is an adaptation of the public
+Codex contract, not a copy of its complete permission policy or execution environment.
+
+The client requests a strict JSON schema via Responses `text.format` or Chat Completions
+`response_format`, according to the configured protocol. Unsupported schema requests fail
+closed without retries, protocol switching or fallback models. Plain JSON or a single
+JSON code fence is accepted; arbitrary prose and incomplete decisions are not approvals.
+Errors report response shape and size, not raw potentially sensitive output. Already-ALLOW
+actions never call the reviewer. Live compatibility of the new request format still needs
+verification; the prior four-request diagnostic does not validate this revision.

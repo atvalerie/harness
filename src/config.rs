@@ -7,7 +7,6 @@ use std::fs;
 use std::path::PathBuf;
 
 const KEYRING_SERVICE: &str = "holiday";
-const KEYRING_USER: &str = "api_key";
 const CODEX_ACCESS_USER: &str = "codex_access_token";
 const CODEX_REFRESH_USER: &str = "codex_refresh_token";
 const CODEX_ACCOUNT_USER: &str = "codex_account_id";
@@ -53,6 +52,7 @@ pub fn tool_permission_description(group: &str) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     Ask,
+    Review,
     Allow,
     Deny,
 }
@@ -60,6 +60,7 @@ pub enum PermissionMode {
 impl PermissionMode {
     pub fn parse(value: &str) -> Self {
         match value {
+            "review" => Self::Review,
             "allow" => Self::Allow,
             "deny" => Self::Deny,
             _ => Self::Ask,
@@ -69,6 +70,7 @@ impl PermissionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ask => "ask",
+            Self::Review => "review",
             Self::Allow => "allow",
             Self::Deny => "deny",
         }
@@ -77,10 +79,12 @@ impl PermissionMode {
     pub fn cycle(self, reverse: bool) -> Self {
         match (self, reverse) {
             (Self::Ask, false) => Self::Allow,
-            (Self::Allow, false) => Self::Deny,
+            (Self::Allow, false) => Self::Review,
+            (Self::Review, false) => Self::Deny,
             (Self::Deny, false) => Self::Ask,
             (Self::Ask, true) => Self::Deny,
-            (Self::Deny, true) => Self::Allow,
+            (Self::Deny, true) => Self::Review,
+            (Self::Review, true) => Self::Allow,
             (Self::Allow, true) => Self::Ask,
         }
     }
@@ -142,6 +146,12 @@ fn default_stdio_transport() -> String {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelProfile {
+    /// Explicit mapping to a Codex catalog model for metadata fallback.
+    pub codex_model: Option<String>,
+    /// Explicit combined context window override for catalogs that omit limits.
+    pub context_window: Option<u64>,
+    /// Separate input-only limit; output tokens are not subtracted from this.
+    pub input_token_limit: Option<u64>,
     pub temperature: Option<f32>,
     pub thinking_budget: Option<i32>,
     pub reasoning_enabled: Option<bool>,
@@ -422,6 +432,8 @@ impl AppConfig {
                 .and_then(|provider| provider.model.clone())
         }) {
             self.model = model;
+        } else {
+            self.model.clear();
         }
     }
 
@@ -431,12 +443,10 @@ impl AppConfig {
     }
 
     pub fn effective_fallback_models(&self) -> Vec<String> {
-        let profile = self.active_provider_config();
-        if profile.fallback_models.is_empty() {
-            self.fallback_models.clone()
-        } else {
-            profile.fallback_models
-        }
+        self.providers
+            .get(&self.provider)
+            .map(|profile| profile.fallback_models.clone())
+            .unwrap_or_else(|| self.fallback_models.clone())
     }
 
     pub fn configured_models(&self) -> Vec<String> {
@@ -581,14 +591,13 @@ impl AppConfig {
 
     pub fn get_api_key_for(provider: &str) -> Option<String> {
         // 1. Check environment variable first
-        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("codex") {
-            vec!["OPENAI_API_KEY"]
-        } else if provider.eq_ignore_ascii_case("openai")
+        let variables: Vec<&str> = if provider.eq_ignore_ascii_case("codex")
+            || provider.eq_ignore_ascii_case("openai")
             || provider.eq_ignore_ascii_case("openai-compatible")
         {
-            vec!["OPENAI_API_KEY", "GEMINI_API_KEY"]
+            vec!["OPENAI_API_KEY"]
         } else if provider.eq_ignore_ascii_case("gemini") {
-            vec!["GEMINI_API_KEY", "OPENAI_API_KEY"]
+            vec!["GEMINI_API_KEY"]
         } else {
             Vec::new()
         };
@@ -601,30 +610,12 @@ impl AppConfig {
             }
         }
 
-        // 2. Check native OS keyring
-        if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if let Ok(secret) = entry.get_password() {
-                let trimmed = secret.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-
-        // 3. Check fallback local .env or config directory file
-        if let Some(cfg_dir) = Self::config_dir() {
-            let key_file = cfg_dir.join(".key");
-            if key_file.exists() {
-                if let Ok(key) = fs::read_to_string(key_file) {
-                    let trimmed = key.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
-                    }
-                }
-            }
-        }
-
-        None
+        // Shared legacy keys have no provider identity: never guess their owner.
+        Entry::new(KEYRING_SERVICE, &format!("api_key:{}", provider.trim()))
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
     }
 
     pub fn get_api_key_for_active_provider(&self) -> Option<String> {
@@ -667,16 +658,11 @@ impl AppConfig {
         })
     }
 
-    fn set_secret(user: &str, secret: &str) {
-        if let Ok(entry) = Entry::new(KEYRING_SERVICE, user) {
-            let _ = entry.set_password(secret);
-        }
-        if let Some(path) = Self::codex_secret_path(user) {
-            if let Some(dir) = path.parent() {
-                let _ = fs::create_dir_all(dir);
-            }
-            let _ = fs::write(path, secret);
-        }
+    fn set_secret(user: &str, secret: &str) -> Result<(), String> {
+        let entry = Entry::new(KEYRING_SERVICE, user)
+            .map_err(|error| format!("Could not open secure credential store: {error}"))?;
+        entry.set_password(secret)
+            .map_err(|error| format!("Could not save credential securely: {error}. Configure an environment variable instead."))
     }
 
     pub fn get_codex_auth() -> Option<CodexAuth> {
@@ -692,43 +678,22 @@ impl AppConfig {
         if auth.access_token.trim().is_empty() {
             return Err("Codex access token cannot be empty".to_string());
         }
-        Self::set_secret(CODEX_ACCESS_USER, auth.access_token.trim());
+        Self::set_secret(CODEX_ACCESS_USER, auth.access_token.trim())?;
         if !auth.refresh_token.trim().is_empty() {
-            Self::set_secret(CODEX_REFRESH_USER, auth.refresh_token.trim());
+            Self::set_secret(CODEX_REFRESH_USER, auth.refresh_token.trim())?;
         }
         if !auth.account_id.trim().is_empty() {
-            Self::set_secret(CODEX_ACCOUNT_USER, auth.account_id.trim());
+            Self::set_secret(CODEX_ACCOUNT_USER, auth.account_id.trim())?;
         }
         Ok(())
     }
 
-    pub fn set_api_key(key: &str) -> Result<(), String> {
+    pub fn set_provider_api_key(&self, key: &str) -> Result<(), String> {
         let trimmed = key.trim();
         if trimmed.is_empty() {
             return Err("API key cannot be empty".to_string());
         }
-
-        // Try OS keyring first
-        let mut keyring_saved = false;
-        if let Ok(entry) = Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-            if entry.set_password(trimmed).is_ok() {
-                keyring_saved = true;
-            }
-        }
-
-        // Also save to config dir .key file as reliable fallback
-        if let Some(cfg_dir) = Self::config_dir() {
-            let _ = fs::create_dir_all(&cfg_dir);
-            let key_file = cfg_dir.join(".key");
-            let _ = fs::write(key_file, trimmed);
-        }
-
-        if keyring_saved {
-            Ok(())
-        } else {
-            // If fallback file was written, consider success
-            Ok(())
-        }
+        Self::set_secret(&format!("api_key:{}", self.provider.trim()), trimmed)
     }
 }
 
@@ -739,10 +704,31 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn provider_without_default_does_not_inherit_previous_model() {
+        let mut config = AppConfig::default();
+        config.select_provider("openai");
+        assert!(config.model.is_empty());
+        config.select_provider("gemini");
+        assert_eq!(config.model, super::DEFAULT_GEMINI_MODEL);
+    }
+
+    #[test]
+    fn empty_provider_fallbacks_disable_global_chain() {
+        let mut config = AppConfig {
+            fallback_models: vec!["wrong-provider-model".into()],
+            ..Default::default()
+        };
+        config.select_provider("codex");
+        assert!(config.effective_fallback_models().is_empty());
+    }
+
+    #[test]
     fn prompt_migration_preserves_customization_and_is_idempotent() {
-        let mut legacy = AppConfig::default();
-        legacy.prompt_config_version = 0;
-        legacy.system_instruction = LEGACY_SYSTEM_INSTRUCTION.to_string();
+        let mut legacy = AppConfig {
+            prompt_config_version: 0,
+            system_instruction: LEGACY_SYSTEM_INSTRUCTION.into(),
+            ..Default::default()
+        };
         let migrated = AppConfig::migrate_prompt_config(legacy.clone());
         assert!(migrated.system_instruction.is_empty());
         assert_eq!(migrated.prompt_config_version, PROMPT_CONFIG_VERSION);
@@ -811,12 +797,11 @@ mod tests {
 
     #[test]
     fn migrates_old_generated_gemini_defaults() {
-        let mut config = AppConfig::default();
-        config.model = "gemini-3.8-flash".to_string();
-        config.fallback_models = vec![
-            "gemini-2.5-flash-lite".to_string(),
-            "gemini-2.5-flash".to_string(),
-        ];
+        let mut config = AppConfig {
+            model: "gemini-3.8-flash".into(),
+            fallback_models: vec!["gemini-2.5-flash-lite".into(), "gemini-2.5-flash".into()],
+            ..Default::default()
+        };
         config.providers.get_mut("gemini").unwrap().fallback_models =
             config.fallback_models.clone();
 
@@ -885,7 +870,7 @@ mod tests {
             PermissionMode::Deny
         );
         assert_eq!(PermissionMode::Ask.cycle(false), PermissionMode::Allow);
-        assert_eq!(PermissionMode::Allow.cycle(false), PermissionMode::Deny);
-        assert_eq!(PermissionMode::Deny.cycle(true), PermissionMode::Allow);
+        assert_eq!(PermissionMode::Allow.cycle(false), PermissionMode::Review);
+        assert_eq!(PermissionMode::Deny.cycle(true), PermissionMode::Review);
     }
 }

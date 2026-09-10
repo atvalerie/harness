@@ -99,7 +99,7 @@ pub fn tool_risk(name: &str) -> ToolRisk {
         | "session_list"
         | "session_new"
         | "extract"
-            if name.starts_with("mcp__") =>
+            if name.starts_with("mcp__lightpanda__") =>
         {
             ToolRisk::ReadOnly
         }
@@ -145,7 +145,7 @@ fn normalize_lightpanda_args(tool_name: &str, mut args: Value) -> Value {
 
 enum Transport {
     Stdio {
-        _child: Child,
+        _child: Box<Child>,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
     },
@@ -154,6 +154,7 @@ enum Transport {
         url: String,
         headers: BTreeMap<String, String>,
         session_id: Option<String>,
+        protocol_version: String,
     },
 }
 
@@ -188,6 +189,29 @@ impl McpConnection {
                     {
                         return Err("MCP server exited unexpectedly".to_string());
                     }
+                    // With no sampling/roots capabilities advertised, reject unsupported
+                    // server requests instead of silently deadlocking the server.
+                    if let Ok(incoming) = serde_json::from_str::<Value>(&line) {
+                        if let (Some(request_id), Some(method)) = (
+                            incoming.get("id"),
+                            incoming.get("method").and_then(Value::as_str),
+                        ) {
+                            let reply = if method == "ping" {
+                                json!({"jsonrpc":"2.0","id":request_id,"result":{}})
+                            } else {
+                                json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Client does not support this method"}})
+                            };
+                            stdin
+                                .write_all(format!("{reply}\n").as_bytes())
+                                .await
+                                .map_err(|e| format!("MCP reply failed: {e}"))?;
+                            stdin
+                                .flush()
+                                .await
+                                .map_err(|e| format!("MCP flush failed: {e}"))?;
+                            continue;
+                        }
+                    }
                     if let Some(value) = parse_matching_json(&line, id) {
                         return value;
                     }
@@ -198,12 +222,13 @@ impl McpConnection {
                 url,
                 headers,
                 session_id,
+                protocol_version,
             } => {
                 let mut req = client
                     .post(&*url)
                     .header("Accept", "application/json, text/event-stream")
                     .header("Content-Type", "application/json")
-                    .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+                    .header("MCP-Protocol-Version", protocol_version.as_str())
                     .json(&request);
                 for (key, value) in headers.iter() {
                     req = req.header(key, value);
@@ -229,16 +254,7 @@ impl McpConnection {
                         response.text().await.unwrap_or_default()
                     ));
                 }
-                let body = response
-                    .text()
-                    .await
-                    .map_err(|e| format!("MCP HTTP response failed: {}", e))?;
-                for line in body.lines() {
-                    if let Some(value) = parse_matching_json(line, id) {
-                        return value;
-                    }
-                }
-                Err("MCP HTTP response contained no matching JSON-RPC result".to_string())
+                read_http_result(response, id).await
             }
         }
     }
@@ -262,12 +278,13 @@ impl McpConnection {
                 url,
                 headers,
                 session_id,
+                protocol_version,
             } => {
                 let mut req = client
                     .post(&*url)
                     .header("Accept", "application/json, text/event-stream")
                     .header("Content-Type", "application/json")
-                    .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+                    .header("MCP-Protocol-Version", protocol_version.as_str())
                     .json(&request);
                 for (key, value) in headers.iter() {
                     req = req.header(key, value);
@@ -286,6 +303,55 @@ impl McpConnection {
             }
         }
     }
+}
+
+// Do not wait for EOF on SSE: servers may keep the connection open after
+// the matching response. Buffer bytes so split UTF-8 and multiline data work.
+async fn read_http_result(mut response: reqwest::Response, id: u64) -> Result<Value, String> {
+    let sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().unwrap_or("").trim() == "text/event-stream");
+    let mut buffer = Vec::new();
+    let mut data = String::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("MCP response read failed: {e}"))?
+    {
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() + data.len() > 8 * 1024 * 1024 {
+            return Err("MCP response exceeded 8 MiB".into());
+        }
+        if !sse {
+            continue;
+        }
+        while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+            let bytes: Vec<_> = buffer.drain(..=end).collect();
+            let line = std::str::from_utf8(&bytes)
+                .map_err(|_| "MCP SSE contains invalid UTF-8")?
+                .trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if let Some(result) = parse_matching_json(&data, id) {
+                    return result;
+                }
+                data.clear();
+            } else if let Some(value) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+    }
+    if !sse {
+        let body = std::str::from_utf8(&buffer).map_err(|_| "MCP JSON contains invalid UTF-8")?;
+        if let Some(result) = parse_matching_json(body, id) {
+            return result;
+        }
+    }
+    Err("MCP HTTP response ended without a matching JSON-RPC result".into())
 }
 
 fn parse_matching_json(line: &str, id: u64) -> Option<Result<Value, String>> {
@@ -335,7 +401,7 @@ impl Tool for McpTool {
         }
     }
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let args = normalize_lightpanda_args(&self.original_name, args);
+        let args = normalize_lightpanda_args(self.public_name, args);
         let result = timeout(
             Duration::from_secs(120),
             self.connection.request(
@@ -370,7 +436,10 @@ impl Tool for McpTool {
     }
 }
 
-pub async fn connect_all(configs: &BTreeMap<String, McpServerConfig>) -> Vec<Arc<dyn Tool>> {
+pub async fn connect_all(
+    configs: &BTreeMap<String, McpServerConfig>,
+) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+    let mut errors = Vec::new();
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut used_names = HashSet::new();
     for (server_name, config) in configs {
@@ -379,10 +448,10 @@ pub async fn connect_all(configs: &BTreeMap<String, McpServerConfig>) -> Vec<Arc
         }
         match connect_server(server_name, config, &mut used_names).await {
             Ok(server_tools) => tools.extend(server_tools),
-            Err(error) => eprintln!("MCP server '{}': {}", server_name, error),
+            Err(error) => errors.push(format!("{server_name}: {error}")),
         }
     }
-    tools
+    (tools, errors)
 }
 
 async fn connect_server(
@@ -390,9 +459,11 @@ async fn connect_server(
     config: &McpServerConfig,
     used_names: &mut HashSet<String>,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
+    if config.transport.eq_ignore_ascii_case("sse") {
+        return Err("Legacy HTTP+SSE transport is not supported; configure a streamable-http endpoint instead".into());
+    }
     let transport = if config.transport.eq_ignore_ascii_case("http")
         || config.transport.eq_ignore_ascii_case("streamable-http")
-        || config.transport.eq_ignore_ascii_case("sse")
     {
         let url = config
             .url
@@ -403,10 +474,12 @@ async fn connect_server(
             url,
             headers: config.headers.clone(),
             session_id: None,
+            protocol_version: MCP_PROTOCOL_VERSION.to_string(),
         }
     } else {
         let mut command = Command::new(&config.command);
         command
+            .kill_on_drop(true)
             .args(&config.args)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
@@ -424,7 +497,7 @@ async fn connect_server(
             .take()
             .ok_or_else(|| "MCP stdout unavailable".to_string())?;
         Transport::Stdio {
-            _child: child,
+            _child: Box::new(child),
             stdin,
             stdout: BufReader::new(stdout),
         }
@@ -433,26 +506,65 @@ async fn connect_server(
         transport: Mutex::new(transport),
         next_id: AtomicU64::new(1),
     });
-    timeout(Duration::from_secs(10), connection.request("initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"holiday","version":env!("CARGO_PKG_VERSION")}}))).await.map_err(|_| "initialize timed out".to_string())??;
+    let initialized = timeout(Duration::from_secs(10), connection.request("initialize", json!({"protocolVersion":MCP_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"holiday","version":env!("CARGO_PKG_VERSION")}}))).await.map_err(|_| "initialize timed out".to_string())??;
+    let negotiated = initialized
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "MCP initialize omitted protocolVersion".to_string())?;
+    if ![
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+        MCP_PROTOCOL_VERSION,
+    ]
+    .contains(&negotiated)
+    {
+        return Err(format!("Unsupported MCP protocol version: {negotiated}"));
+    }
+    if let Transport::Http {
+        protocol_version, ..
+    } = &mut *connection.transport.lock().await
+    {
+        *protocol_version = negotiated.to_string();
+    }
     timeout(
         Duration::from_secs(10),
         connection.notify("notifications/initialized", json!({})),
     )
     .await
     .map_err(|_| "initialized notification timed out".to_string())??;
-    let result = timeout(
-        Duration::from_secs(10),
-        connection.request("tools/list", json!({})),
-    )
-    .await
-    .map_err(|_| "tools/list timed out".to_string())??;
+    let mut catalog = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        let params = cursor
+            .as_ref()
+            .map(|c| json!({"cursor":c}))
+            .unwrap_or_else(|| json!({}));
+        let result = timeout(
+            Duration::from_secs(10),
+            connection.request("tools/list", params),
+        )
+        .await
+        .map_err(|_| "tools/list timed out".to_string())??;
+        let page = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "MCP tools/list omitted tools array".to_string())?;
+        catalog.extend(page.iter().cloned());
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(next) = &cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) || seen_cursors.len() > 100 {
+            return Err("MCP tools/list pagination repeated a cursor or exceeded 100 pages".into());
+        }
+    }
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    for tool in result
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for tool in &catalog {
         let original_name = tool
             .get("name")
             .and_then(Value::as_str)
@@ -496,6 +608,17 @@ mod tests {
     use crate::tools::ToolRisk;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn unknown_servers_do_not_inherit_lightpanda_read_permissions() {
+        for tool in ["search", "extract", "getEnv", "session_new"] {
+            assert_eq!(
+                tool_risk(&format!("mcp__untrusted__{tool}")),
+                ToolRisk::ExternalSideEffect
+            );
+        }
+        assert_eq!(tool_risk("mcp__lightpanda__markdown"), ToolRisk::ReadOnly);
+    }
 
     #[test]
     fn parses_streamable_http_sse_json_rpc_data() {
@@ -558,5 +681,134 @@ mod tests {
             json!({"url":"", "waitUntil":"load"}),
         );
         assert_eq!(goto, json!({"url":"", "waitUntil":"load"}));
+    }
+
+    #[tokio::test]
+    async fn pretty_json_and_rpc_errors_are_parsed() {
+        let response = reqwest::Response::from(http::Response::new(
+            "{\n\"id\":1,\n\"result\":{\"ok\":true}\n}",
+        ));
+        assert_eq!(
+            super::read_http_result(response, 1).await.unwrap()["ok"],
+            true
+        );
+        let response = reqwest::Response::from(http::Response::new(
+            r#"{"id":1,"error":{"code":-1,"message":"broken"}}"#,
+        ));
+        assert!(super::read_http_result(response, 1)
+            .await
+            .unwrap_err()
+            .contains("broken"));
+    }
+
+    #[tokio::test]
+    async fn sse_returns_before_eof_with_fragmented_utf8_and_multiline_data() {
+        use futures_util::StreamExt;
+        let bytes = "data: {\"id\":99,\"result\":{}}\r\n\r\n: keepalive\r\ndata: {\"id\":1,\r\ndata: \"result\":{\"text\":\"漢字\"}}\r\n\r\n".as_bytes();
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            bytes.iter().map(|b| Ok(vec![*b])).collect();
+        let body = reqwest::Body::wrap_stream(
+            futures_util::stream::iter(chunks).chain(futures_util::stream::pending()),
+        );
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .header("content-type", "text/event-stream; charset=utf-8")
+                .body(body)
+                .unwrap(),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::read_http_result(response, 1),
+        )
+        .await
+        .expect("must not wait for EOF")
+        .unwrap();
+        assert_eq!(result["text"], "漢字");
+    }
+
+    #[tokio::test]
+    async fn truncated_sse_is_not_a_success() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body("data: {\"id\":1,\"result\":{}")
+                .unwrap(),
+        );
+        assert!(super::read_http_result(response, 1).await.is_err());
+    }
+    #[tokio::test]
+    async fn http_negotiates_session_version_and_paginates_catalog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                let header_end = loop {
+                    let mut byte = [0u8];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    data.push(byte[0]);
+                    if data.ends_with(b"\r\n\r\n") {
+                        break data.len();
+                    }
+                };
+                let headers = String::from_utf8(data.clone()).unwrap().to_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                data.resize(header_end + length, 0);
+                socket.read_exact(&mut data[header_end..]).await.unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&data[header_end..]).unwrap();
+                if step > 0 {
+                    assert!(headers.contains("mcp-protocol-version: 2025-03-26"));
+                    assert!(headers.contains("mcp-session-id: session-test"));
+                }
+                let result = match step {
+                    0 => {
+                        assert_eq!(request["method"], "initialize");
+                        json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "notifications/initialized");
+                        json!({})
+                    }
+                    2 => {
+                        assert!(request["params"].get("cursor").is_none());
+                        json!({"tools":[{"name":"first","inputSchema":{"type":"object"}}],"nextCursor":"page-2"})
+                    }
+                    _ => {
+                        assert_eq!(request["params"]["cursor"], "page-2");
+                        json!({"tools":[{"name":"second","inputSchema":{"type":"object"}}]})
+                    }
+                };
+                let body = if step == 1 {
+                    String::new()
+                } else {
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string()
+                };
+                let status = if step == 1 { "202 Accepted" } else { "200 OK" };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nMcp-Session-Id: session-test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let config = serde_json::from_value(
+            json!({"transport":"streamable-http","url":format!("http://{addr}/mcp")}),
+        )
+        .unwrap();
+        let tools = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::connect_server("fixture", &config, &mut HashSet::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1].name(), "mcp__fixture__second");
+        server.await.unwrap();
     }
 }
