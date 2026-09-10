@@ -163,6 +163,9 @@ pub struct ModelProfile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Explicit USD rates in microdollars per million tokens, keyed by provider:model.
+    #[serde(default)]
+    pub usage_pricing: std::collections::BTreeMap<String, crate::usage::Pricing>,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
@@ -243,6 +246,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),
+            usage_pricing: Default::default(),
             base_url: None,
             model: DEFAULT_GEMINI_MODEL.to_string(),
             fallback_models: default_fallback_models(),

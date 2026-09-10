@@ -46,6 +46,12 @@ pub struct UsageRecord {
     pub estimated: bool,
     pub duration_ms: u64,
     pub status: String,
+    #[serde(default)]
+    pub details: crate::usage::TokenUsage,
+    #[serde(default)]
+    pub cost_nano_usd: Option<u64>,
+    #[serde(default)]
+    pub pricing: Option<crate::usage::Pricing>,
 }
 
 #[derive(Debug, Clone)]

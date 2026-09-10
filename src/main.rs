@@ -15,6 +15,7 @@ mod session;
 mod tasks;
 mod tools;
 mod ui;
+mod usage;
 mod worker;
 
 use app::{App, EngineState};
@@ -661,11 +662,12 @@ async fn run_headless_jsonl(
                         prompt_tokens,
                         candidates_tokens,
                         total_tokens,
+                        details,
                     } => emit_jsonl(
                         &run_id,
                         &mut sequence,
                         "usage",
-                        json!({"prompt_tokens": prompt_tokens, "candidates_tokens": candidates_tokens, "total_tokens": total_tokens}),
+                        json!({"prompt_tokens": prompt_tokens, "candidates_tokens": candidates_tokens, "total_tokens": total_tokens, "details": details}),
                     )?,
                     StreamSignal::Finished { .. } => {
                         generation_finished = true;

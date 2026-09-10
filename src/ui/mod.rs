@@ -23,6 +23,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         render_workspace_overlay(app, frame);
         return;
     }
+    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
+    status::render_usage(app, frame, outer[1]);
     let status_bar_at_bottom = app.config.status_bar_at_bottom();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -43,7 +45,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 Constraint::Length(input::input_height(app, frame.area().width))
             },
         ])
-        .split(frame.area());
+        .split(outer[0]);
 
     let (status_area, chat_area, input_area) = if status_bar_at_bottom {
         (chunks[2], chunks[0], chunks[1])

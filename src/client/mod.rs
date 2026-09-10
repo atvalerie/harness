@@ -28,6 +28,8 @@ pub struct AiClient {
     adapter: Arc<dyn ProviderAdapter>,
     zen_session_id: Arc<String>,
     zen_request_counter: Arc<AtomicU64>,
+    usage_provider: String,
+    usage_pricing: Arc<BTreeMap<String, crate::usage::Pricing>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +86,7 @@ impl AiClient {
 
     pub fn from_config(api_key: String, config: &AppConfig) -> Self {
         let provider = config.active_provider_config();
-        Self::with_provider(
+        let mut client = Self::with_provider(
             api_key,
             ProviderKind::parse(&provider.kind),
             provider.base_url.or_else(|| config.base_url.clone()),
@@ -94,7 +96,23 @@ impl AiClient {
             AppConfig::get_codex_auth()
                 .map(|auth| auth.account_id)
                 .unwrap_or_default(),
-        )
+        );
+        client.configure_usage(config);
+        client
+    }
+
+    pub fn configure_usage(&mut self, config: &AppConfig) {
+        self.usage_provider = config.provider.clone();
+        self.usage_pricing = Arc::new(config.usage_pricing.clone());
+    }
+
+    fn usage_attempt(&self, model: &str, mode: &'static str) -> crate::usage::Attempt {
+        let mut attempt = crate::usage::Attempt::new(&self.base_url, model, mode);
+        attempt.pricing = self
+            .usage_pricing
+            .get(&format!("{}:{}", self.usage_provider, model))
+            .cloned();
+        attempt
     }
 
     pub fn with_provider(
@@ -130,6 +148,8 @@ impl AiClient {
                     .as_nanos()
             )),
             zen_request_counter: Arc::new(AtomicU64::new(0)),
+            usage_provider: String::new(),
+            usage_pricing: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -154,6 +174,40 @@ impl AiClient {
         self.api_key = new_key;
     }
 
+    async fn account_stream(
+        &self,
+        response: reqwest::Response,
+        tx: UnboundedSender<StreamSignal>,
+        mut attempt: crate::usage::Attempt,
+        protocol: &str,
+    ) {
+        let (usage_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let parser = async {
+            match protocol {
+                "responses" => openai::stream_responses_response(response, usage_tx).await,
+                "chat" => openai::stream_response(response, usage_tx).await,
+                _ => sse::stream_sse_response(response, usage_tx).await,
+            }
+        };
+        tokio::pin!(parser);
+        let mut parsed = false;
+        loop {
+            tokio::select! {
+                _ = &mut parser, if !parsed => { parsed = true; }
+                signal = rx.recv() => {
+                    let Some(signal) = signal else { break; };
+                    match &signal {
+                        StreamSignal::Usage { details, .. } => attempt.usage.merge(details),
+                        StreamSignal::Finished { .. } => attempt.status = "completed".into(),
+                        StreamSignal::Error(_) => attempt.status = "failed".into(),
+                        _ => {}
+                    }
+                    let _ = tx.send(signal);
+                }
+            }
+        }
+    }
+
     pub async fn stream_generate_content(
         &self,
         model: &str,
@@ -171,6 +225,8 @@ impl AiClient {
         let mut last_error = String::new();
         'models: for (model_index, candidate) in models.iter().enumerate() {
             for attempt in 0..=max_retries {
+                let mut accounting = self.usage_attempt(candidate, "stream");
+                accounting.status = "failed".into();
                 let url = format!(
                     "{}/models/{}:streamGenerateContent?alt=sse&key={}",
                     self.base_url,
@@ -198,7 +254,9 @@ impl AiClient {
                                 candidate
                             )));
                         }
-                        sse::stream_sse_response(response, tx).await;
+                        accounting.status = "interrupted".into();
+                        self.account_stream(response, tx, accounting, "gemini")
+                            .await;
                         return;
                     }
                     Ok(response) => {
@@ -252,6 +310,7 @@ impl AiClient {
         if self.is_openai_protocol_provider() {
             return self.generate_openai(model, request).await;
         }
+        let mut accounting = self.usage_attempt(model, "non_stream");
         let clean_model = if model.starts_with("models/") {
             model.strip_prefix("models/").unwrap_or(model)
         } else {
@@ -285,6 +344,10 @@ impl AiClient {
             .await
             .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
 
+        if let Some(usage) = &resp.usage_metadata {
+            accounting.usage = usage.normalized();
+        }
+        accounting.status = "completed".into();
         if let Some(candidates) = resp.candidates {
             for cand in candidates {
                 if let Some(content) = cand.content {
@@ -494,6 +557,8 @@ impl AiClient {
                 return;
             }
             for attempt in 0..=max_retries {
+                let mut accounting = self.usage_attempt(candidate, "stream");
+                accounting.status = "failed".into();
                 let use_responses = self.uses_responses(candidate);
                 let endpoint = if use_responses {
                     "responses"
@@ -529,11 +594,14 @@ impl AiClient {
                                 candidate
                             )));
                         }
-                        if use_responses {
-                            openai::stream_responses_response(response, tx).await;
-                        } else {
-                            openai::stream_response(response, tx).await;
-                        }
+                        accounting.status = "interrupted".into();
+                        self.account_stream(
+                            response,
+                            tx,
+                            accounting,
+                            if use_responses { "responses" } else { "chat" },
+                        )
+                        .await;
                         return;
                     }
                     Ok(response) => {
@@ -583,6 +651,7 @@ impl AiClient {
         model: &str,
         request: &GenerateContentRequest,
     ) -> Result<String, String> {
+        let mut accounting = self.usage_attempt(model, "non_stream");
         if self.uses_responses(model) {
             let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
             let mut payload = openai::responses_request_payload(model, request, false);
@@ -599,6 +668,9 @@ impl AiClient {
             }
             let json: serde_json::Value = serde_json::from_str(&body)
                 .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+            accounting.usage =
+                crate::usage::TokenUsage::openai(&json["usage"], true).unwrap_or_default();
+            accounting.status = "completed".into();
             return openai::responses_text(&json)
                 .ok_or_else(|| "No text output produced by Responses API".to_string());
         }
@@ -619,6 +691,9 @@ impl AiClient {
         }
         let json: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+        accounting.usage =
+            crate::usage::TokenUsage::openai(&json["usage"], false).unwrap_or_default();
+        accounting.status = "completed".into();
         json.pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
             .map(str::to_string)

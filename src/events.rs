@@ -20,6 +20,7 @@ pub enum StreamSignal {
         prompt_tokens: u64,
         candidates_tokens: u64,
         total_tokens: u64,
+        details: crate::usage::TokenUsage,
     },
     Finished {
         finish_reason: Option<String>,

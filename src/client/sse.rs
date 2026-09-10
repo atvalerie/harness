@@ -68,11 +68,10 @@ impl SseParser {
                         }
 
                         if let Some(usage) = resp.usage_metadata {
-                            let _ = tx.send(StreamSignal::Usage {
-                                prompt_tokens: usage.prompt_token_count.unwrap_or(0),
-                                candidates_tokens: usage.candidates_token_count.unwrap_or(0),
-                                total_tokens: usage.total_token_count.unwrap_or(0),
-                            });
+                            let usage = usage.normalized();
+                            if usage.has_counts() {
+                                let _ = tx.send(usage.signal());
+                            }
                         }
 
                         if let Some(candidates) = resp.candidates {

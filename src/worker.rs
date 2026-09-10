@@ -45,7 +45,7 @@ pub async fn run(
     conversation: &mut Vec<Content>,
     write_paths: &[PathBuf],
 ) -> Result<String, String> {
-    let tools = runtime
+    let mut tools = runtime
         .tools
         .iter()
         .filter(|(name, _)| {
@@ -57,6 +57,7 @@ pub async fn run(
             parameters: tool.parameters_schema(),
         })
         .collect::<Vec<_>>();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
     for _ in 0..12 {
         if serde_json::to_vec(conversation)
             .map_err(|e| e.to_string())?

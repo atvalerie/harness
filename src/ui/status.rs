@@ -8,6 +8,134 @@ use ratatui::{
     Frame,
 };
 
+pub fn render_usage(app: &App, frame: &mut Frame, area: Rect) {
+    let streaming = app.state == EngineState::Streaming;
+    let usage = if streaming {
+        Some(&app.request_usage)
+    } else {
+        app.usage_records.last().map(|r| &r.details)
+    };
+    let input = usage
+        .and_then(|u| u.input_tokens)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| format!("~{}", app.context_tokens));
+    let output = usage
+        .and_then(|u| u.output_tokens)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| {
+            if streaming {
+                format!(
+                    "~{}",
+                    (app.current_response_buffer.len() + app.current_thought_buffer.len())
+                        .div_ceil(4)
+                )
+            } else {
+                "unknown".into()
+            }
+        });
+    let total = usage
+        .and_then(|u| u.total())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let cached = usage
+        .and_then(|u| u.cache_read_tokens)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into());
+    let rate = app.usage_summary.cache_rate();
+    let known = app.usage_summary.cache_known;
+    let cost = app
+        .usage_records
+        .last()
+        .and_then(|r| r.cost_nano_usd)
+        .map(|n| format!("${:.6}", n as f64 / 1_000_000_000.0))
+        .unwrap_or_else(|| "unpriced".into());
+    let text = format!(
+        " {} | in {} out {} total {} | cached {} | cache {} ({}/{}) | {} | ~ estimated",
+        if streaming { "Live" } else { "Last request" },
+        input,
+        output,
+        total,
+        cached,
+        rate,
+        known,
+        app.usage_records.len(),
+        if streaming { "cost pending" } else { &cost }
+    );
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
+        area,
+    );
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn footer_switches_from_estimated_stream_to_reported_totals() {
+        let mut app = App::new(crate::config::AppConfig::default(), String::new());
+        app.state = EngineState::Streaming;
+        app.current_response_buffer = "12345678".into();
+        let backend = ratatui::backend::TestBackend::new(180, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_usage(&app, frame, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Live"));
+        assert!(text.contains("out ~2"));
+        app.request_usage = crate::usage::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_read_tokens: Some(80),
+            ..Default::default()
+        };
+        terminal
+            .draw(|frame| render_usage(&app, frame, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("in 100 out 20 total 120"));
+        assert!(text.contains("cached 80"));
+        app.state = EngineState::Idle;
+        app.usage_records.push(crate::session::UsageRecord {
+            timestamp: String::new(),
+            provider: "test".into(),
+            model: "test".into(),
+            prompt_tokens: 100,
+            candidates_tokens: 20,
+            total_tokens: 120,
+            estimated: false,
+            duration_ms: 1,
+            status: "ok".into(),
+            details: app.request_usage.clone(),
+            cost_nano_usd: None,
+            pricing: None,
+        });
+        terminal
+            .draw(|frame| render_usage(&app, frame, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Last request | in 100 out 20 total 120"));
+    }
+}
+
 pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     let (in_p, out_p) = get_model_pricing(&app.config.model);
     let pricing_str = match (in_p, out_p) {

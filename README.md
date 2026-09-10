@@ -1,5 +1,50 @@
 # Holiday
 
+Usage accounting now preserves provider-reported input, output, cache-read and
+reasoning counts. The bottom footer shows live output estimates (`~`) until usage
+is reported, then retains the last request totals and cache counts. Its cache
+percentage is weighted by input tokens and includes reporting coverage. `/usage`
+also reports all attempts in the current process, including compaction, reviews,
+workers and subagents. These process counters reset on restart; chat counters
+restore with the session.
+
+Every model HTTP attempt appends one small JSON record under the platform config
+directory's `usage/YYYY-MM-DD-PID.jsonl`. Records include actual requested model,
+endpoint (without credentials/query), status, duration, optional token counts and
+optional pricing. Journals survive clearing or forking a conversation. There is no
+SQLite database, background queue, retained ledger history, per-token write, or
+per-request fsync. Writes go directly to the OS at attempt completion; abrupt
+process termination can lose in-flight attempts, and power loss can lose recent
+buffered writes. Historical journals are retained for external reporting; no
+automatic deletion or invoice reconciliation is performed. Missing usage stays
+unknown. JSONL `usage` events include a `details` object with nullable counts.
+
+Optional flat USD token prices use integer microdollars per million tokens, keyed
+by the exact configured provider and model. For example (illustrative rates):
+
+```json
+{
+  "usage_pricing": {
+    "openai:example-model": {
+      "version": "my-rate-card-2026-01",
+      "input_micro_usd_per_m": 2000000,
+      "output_micro_usd_per_m": 8000000,
+      "cached_input_micro_usd_per_m": 500000
+    }
+  }
+}
+```
+
+These represent $2 input, $8 output and $0.50 cached input per million tokens.
+Omit cached pricing when all input has the same rate. If discounted caching is
+configured but cache counts are absent, cost remains unpriced. Applied rates and
+estimated cost in integer nanodollars are stored with each record; prices are
+never inferred from model names. Tiered, cache-storage, cache-write and tool fees
+need provider-specific pricing and are not included in this flat-rate estimate.
+Codex subscription usage is not assigned API dollar prices unless explicitly
+configured. Stable sorting of tools and session capabilities avoids incidental
+request-prefix changes; no live cache-hit improvement is claimed.
+
 Holiday supports Gemini, direct ChatGPT/Codex authentication and requests, OpenAI-compatible APIs, per-model reasoning profiles, resumable sessions, automatic compaction, and MCP tools.
 
 Configuration is saved with `/save` under the platform config directory. A compact example:

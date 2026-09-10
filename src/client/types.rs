@@ -158,6 +158,25 @@ pub struct UsageMetadata {
     pub candidates_token_count: Option<u64>,
     #[serde(rename = "totalTokenCount")]
     pub total_token_count: Option<u64>,
+    #[serde(rename = "cachedContentTokenCount")]
+    pub cached_content_token_count: Option<u64>,
+    #[serde(rename = "thoughtsTokenCount")]
+    pub thoughts_token_count: Option<u64>,
+}
+
+impl UsageMetadata {
+    pub fn normalized(&self) -> crate::usage::TokenUsage {
+        crate::usage::TokenUsage {
+            input_tokens: self.prompt_token_count,
+            output_tokens: self
+                .candidates_token_count
+                .map(|n| n.saturating_add(self.thoughts_token_count.unwrap_or(0))),
+            total_tokens: self.total_token_count,
+            cache_read_tokens: self.cached_content_token_count,
+            reasoning_tokens: self.thoughts_token_count,
+            ..Default::default()
+        }
+    }
 }
 
 // Models API types

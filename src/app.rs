@@ -99,6 +99,8 @@ pub struct App {
     pub current_thought_buffer: String,
     pub current_response_buffer: String,
     pub usage_records: Vec<UsageRecord>,
+    pub request_usage: crate::usage::TokenUsage,
+    pub usage_summary: crate::usage::Summary,
     request_usage_received: bool,
     request_started_at: Option<std::time::Instant>,
     request_context_tokens: u64,
@@ -289,6 +291,8 @@ impl App {
             current_thought_buffer: String::new(),
             current_response_buffer: String::new(),
             usage_records: Vec::new(),
+            request_usage: Default::default(),
+            usage_summary: Default::default(),
             request_usage_received: false,
             request_started_at: None,
             request_context_tokens: 0,
@@ -373,6 +377,7 @@ impl App {
     }
 
     pub fn refresh_client_from_config(&mut self) {
+        self.client.configure_usage(&self.config);
         let provider_config = self.config.active_provider_config();
         self.client.update_provider(
             ProviderKind::parse(&provider_config.kind),
@@ -722,6 +727,8 @@ impl App {
         self.review.bind(path, true)?;
         self.messages = snapshot.messages;
         self.usage_records = snapshot.usage;
+        self.usage_summary = Default::default();
+        for record in &self.usage_records { self.usage_summary.add(&record.details); }
         let restored_working_dir = snapshot
             .working_dir
             .clone()
@@ -1180,21 +1187,17 @@ impl App {
         let estimated_output =
             ((self.current_thought_buffer.len() + self.current_response_buffer.len()) as u64 / 4)
                 .max(1);
-        let prompt_tokens = if self.request_usage_received {
-            self.prompt_tokens
-        } else {
-            self.request_context_tokens
-        };
-        let candidates_tokens = if self.request_usage_received {
-            self.candidates_tokens
-        } else {
-            estimated_output
-        };
+        let prompt_tokens = self.request_usage.input_tokens.unwrap_or(self.request_context_tokens);
+        let candidates_tokens = self.request_usage.output_tokens.unwrap_or(estimated_output);
         let total_tokens = if self.request_usage_received && self.total_tokens > 0 {
             self.total_tokens
         } else {
             prompt_tokens.saturating_add(candidates_tokens)
         };
+        let actual_model = self.interaction.actual_model.as_deref().unwrap_or(&self.config.model);
+        let pricing = self.config.usage_pricing.get(&format!("{}:{}", self.config.provider, actual_model)).cloned();
+        let cost_nano_usd = pricing.as_ref().and_then(|p| p.cost_nano_usd(&self.request_usage));
+        self.usage_summary.add(&self.request_usage);
         self.usage_records.push(UsageRecord {
             timestamp: chrono::Local::now().to_rfc3339(),
             provider: self.config.provider.clone(),
@@ -1209,6 +1212,9 @@ impl App {
             estimated: !self.request_usage_received,
             duration_ms: started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
+            details: self.request_usage.clone(),
+            pricing,
+            cost_nano_usd,
         });
         self.request_usage_received = false;
     }
@@ -1820,6 +1826,8 @@ impl App {
                 "clear" => {
                     self.messages.clear();
                     self.usage_records.clear();
+                    self.usage_summary = Default::default();
+                    self.request_usage = Default::default();
                     self.prompt_tokens = 0;
                     self.candidates_tokens = 0;
                     self.total_tokens = 0;
@@ -1937,6 +1945,8 @@ impl App {
                 self.interaction.reset_transcript();
                 self.messages.clear();
                 self.usage_records.clear();
+                    self.usage_summary = Default::default();
+                    self.request_usage = Default::default();
                 self.chat_scroll = 0;
                 self.prompt_tokens = 0;
                 self.candidates_tokens = 0;
@@ -1983,6 +1993,8 @@ impl App {
                 self.start_new_session();
             }
             crate::commands::CommandId::Usage => {
+                let all = crate::usage::process_summary();
+                self.add_message("system", format!("Process usage (all model calls, including auxiliary): {} attempts, {} input + {} output reported tokens; complete usage {}/{}; cached {} tokens, cache rate {} (coverage {}/{}). Journal: {}/usage", all.requests, all.input, all.output, all.reported, all.requests, all.cache_read, all.cache_rate(), all.cache_known, all.requests, AppConfig::config_dir().map(|p| p.display().to_string()).unwrap_or_else(|| "unavailable".into())));
                 let prompt: u64 = self.usage_records.iter().map(|r| r.prompt_tokens).sum();
                 let candidates: u64 = self.usage_records.iter().map(|r| r.candidates_tokens).sum();
                 let total: u64 = self.usage_records.iter().map(|r| r.total_tokens).sum();
@@ -2183,6 +2195,8 @@ impl App {
         self.session_tool_profile = None;
         self.session_disabled_tools.clear();
         self.usage_records.clear();
+                    self.usage_summary = Default::default();
+                    self.request_usage = Default::default();
         self.chat_scroll = 0;
         self.prompt_tokens = 0;
         self.candidates_tokens = 0;
@@ -2329,6 +2343,7 @@ impl App {
         self.candidates_tokens = 0;
         self.total_tokens = 0;
         self.request_usage_received = false;
+        self.request_usage = Default::default();
         self.request_started_at = Some(std::time::Instant::now());
         self.stream_start_time = Some(std::time::Instant::now());
         self.candidate_chunks_count = 0;
@@ -2702,15 +2717,17 @@ impl App {
                 prompt_tokens,
                 candidates_tokens,
                 total_tokens,
+                details,
             } => {
-                self.prompt_tokens = prompt_tokens;
-                self.candidates_tokens = candidates_tokens;
-                self.total_tokens = total_tokens;
+                self.request_usage.merge(&details);
+                self.prompt_tokens = self.request_usage.input_tokens.unwrap_or(prompt_tokens);
+                self.candidates_tokens = self.request_usage.output_tokens.unwrap_or(candidates_tokens);
+                self.total_tokens = self.request_usage.total().unwrap_or(total_tokens);
                 if prompt_tokens > 0 {
                     self.context_tokens = prompt_tokens;
                     self.context_tokens_estimated = false;
                 }
-                self.request_usage_received = true;
+                self.request_usage_received = self.request_usage.complete();
 
                 if let Some(start) = self.stream_start_time {
                     let elapsed = start.elapsed().as_secs_f64();
@@ -3372,6 +3389,9 @@ impl App {
             }
         }
 
+        for declaration in &mut tools {
+            declaration.function_declarations.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         crate::client::types::GenerateContentRequest {
             contents,
             system_instruction: Some(Content {

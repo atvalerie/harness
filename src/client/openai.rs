@@ -608,23 +608,9 @@ fn emit_validated_tools(
 }
 
 fn emit_responses_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
-    let prompt = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let completion = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total = usage
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(prompt + completion);
-    let _ = tx.send(StreamSignal::Usage {
-        prompt_tokens: prompt,
-        candidates_tokens: completion,
-        total_tokens: total,
-    });
+    if let Some(usage) = crate::usage::TokenUsage::openai(usage, true) {
+        let _ = tx.send(usage.signal());
+    }
 }
 
 fn emit_tools(
@@ -635,29 +621,35 @@ fn emit_tools(
 }
 
 fn emit_usage(usage: &Value, tx: &UnboundedSender<StreamSignal>) {
-    let prompt = usage
-        .get("prompt_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let completion = usage
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total = usage
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(prompt + completion);
-    let _ = tx.send(StreamSignal::Usage {
-        prompt_tokens: prompt,
-        candidates_tokens: completion,
-        total_tokens: total,
-    });
+    if let Some(usage) = crate::usage::TokenUsage::openai(usage, false) {
+        let _ = tx.send(usage.signal());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::types::{Content, GenerateContentRequest, Part};
+
+    #[tokio::test]
+    async fn cache_usage_survives_stream_and_null_is_ignored() {
+        let signals = fixture(concat!(
+            "data: {\"usage\":null,\"choices\":[]}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":80},\"completion_tokens_details\":{\"reasoning_tokens\":5}},\"choices\":[]}\n\n",
+            "data: [DONE]\n\n"
+        ), false).await;
+        let usage = signals
+            .iter()
+            .filter_map(|s| match s {
+                StreamSignal::Usage { details, .. } => Some(details),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].cache_read_tokens, Some(80));
+        assert_eq!(usage[0].reasoning_tokens, Some(5));
+        assert_eq!(usage[0].total(), Some(120));
+    }
 
     async fn fixture(body: &'static str, responses: bool) -> Vec<StreamSignal> {
         let response = reqwest::Response::from(http::Response::new(body));
