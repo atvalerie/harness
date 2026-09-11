@@ -190,6 +190,8 @@ pub struct AppConfig {
     /// restarting Holiday returns to the user's actual choices.
     #[serde(default)]
     pub last_models: BTreeMap<String, String>,
+    #[serde(default)]
+    pub auto_review_model: Option<String>,
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
     #[serde(default = "default_auto_compact_threshold")]
@@ -258,6 +260,7 @@ impl Default for AppConfig {
             providers: default_provider_configs(),
             model_profiles: BTreeMap::new(),
             last_models: BTreeMap::new(),
+            auto_review_model: None,
             auto_compact: default_auto_compact(),
             auto_compact_threshold_tokens: default_auto_compact_threshold(),
             todo_change_mode: default_todo_change_mode(),

@@ -196,15 +196,45 @@ fn build_review_request(
 
 pub async fn review(
     client: &AiClient,
+    model: &str,
     context: &str,
     root: &Path,
     pending: &PendingToolCall,
 ) -> Result<Decision, String> {
     let request = build_review_request(context, root, pending)?;
-    let output = client
-        .generate_bounded_structured("codex-auto-review", &request, 30, decision_schema())
-        .await?;
-    parse_decision(&output)
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut attempt = 0;
+    let operation = async {
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let output = client
+                .generate_bounded_structured(
+                    model,
+                    &request,
+                    remaining.as_secs(),
+                    decision_schema(),
+                )
+                .await?;
+            match parse_decision(&output) {
+                Ok(decision) => return Ok(decision),
+                Err(error) => {
+                    // Retry invalid output, never a valid ask or deny decision.
+                    let delay = std::time::Duration::from_secs((1u64 << attempt.min(5)).min(30));
+                    if deadline.saturating_duration_since(tokio::time::Instant::now()) <= delay {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| {
+            "Auto-review total deadline exceeded (300s); no approval decision could be read"
+                .to_string()
+        })?
 }
 
 #[cfg(test)]

@@ -149,6 +149,8 @@ pub struct App {
     pub pending_generation_after_compaction: bool,
     pub pending_todo_notice: Option<String>,
     pub session_path: Option<std::path::PathBuf>,
+    /// Runtime-only exclusive ownership of the active saved session.
+    pub session_lock: Option<session::SessionLock>,
     pub session_messages_at_save: usize,
     pub project_root: Option<PathBuf>,
     pub project_instructions: String,
@@ -328,6 +330,7 @@ impl App {
             pending_generation_after_compaction: false,
             pending_todo_notice: None,
             session_path,
+            session_lock: None,
             session_messages_at_save: 0,
             project_root,
             project_instructions,
@@ -341,6 +344,17 @@ impl App {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
+    }
+
+    pub fn acquire_session_lock(&mut self) -> Result<(), String> {
+        if self.session_lock.is_some() {
+            return Ok(());
+        }
+        let Some(path) = self.session_path.as_ref() else {
+            return Ok(());
+        };
+        self.session_lock = Some(session::SessionLock::acquire(path)?);
+        Ok(())
     }
 
     /// Implements the two-stage terminal interrupt used by the TUI. The
@@ -710,6 +724,10 @@ impl App {
     }
 
     pub fn restore_session(&mut self, path: &Path) -> Result<(), String> {
+        // A restored session must be exclusively owned before it is read or
+        // rebound. The lock is released automatically if any later step fails.
+        self.session_lock.take();
+        let session_lock = session::SessionLock::acquire(path)?;
         let old = self
             .session_path
             .as_ref()
@@ -728,7 +746,9 @@ impl App {
         self.messages = snapshot.messages;
         self.usage_records = snapshot.usage;
         self.usage_summary = Default::default();
-        for record in &self.usage_records { self.usage_summary.add(&record.details); }
+        for record in &self.usage_records {
+            self.usage_summary.add(&record.details);
+        }
         let restored_working_dir = snapshot
             .working_dir
             .clone()
@@ -766,6 +786,7 @@ impl App {
         self.request_usage_received = false;
         self.active_stream_task = None;
         self.session_path = Some(path.to_path_buf());
+        self.session_lock = Some(session_lock);
         let (text, blocks) = self
             .interaction
             .drafts
@@ -1158,6 +1179,7 @@ impl App {
     }
 
     pub fn flush_session(&mut self) -> Result<(), String> {
+        self.acquire_session_lock()?;
         let Some(path) = &self.session_path else {
             return Ok(());
         };
@@ -1187,16 +1209,29 @@ impl App {
         let estimated_output =
             ((self.current_thought_buffer.len() + self.current_response_buffer.len()) as u64 / 4)
                 .max(1);
-        let prompt_tokens = self.request_usage.input_tokens.unwrap_or(self.request_context_tokens);
+        let prompt_tokens = self
+            .request_usage
+            .input_tokens
+            .unwrap_or(self.request_context_tokens);
         let candidates_tokens = self.request_usage.output_tokens.unwrap_or(estimated_output);
         let total_tokens = if self.request_usage_received && self.total_tokens > 0 {
             self.total_tokens
         } else {
             prompt_tokens.saturating_add(candidates_tokens)
         };
-        let actual_model = self.interaction.actual_model.as_deref().unwrap_or(&self.config.model);
-        let pricing = self.config.usage_pricing.get(&format!("{}:{}", self.config.provider, actual_model)).cloned();
-        let cost_nano_usd = pricing.as_ref().and_then(|p| p.cost_nano_usd(&self.request_usage));
+        let actual_model = self
+            .interaction
+            .actual_model
+            .as_deref()
+            .unwrap_or(&self.config.model);
+        let pricing = self
+            .config
+            .usage_pricing
+            .get(&format!("{}:{}", self.config.provider, actual_model))
+            .cloned();
+        let cost_nano_usd = pricing
+            .as_ref()
+            .and_then(|p| p.cost_nano_usd(&self.request_usage));
         self.usage_summary.add(&self.request_usage);
         self.usage_records.push(UsageRecord {
             timestamp: chrono::Local::now().to_rfc3339(),
@@ -1465,9 +1500,9 @@ impl App {
                     }
                 }
                 self.add_message("system", if self.auto_mode {
-                    "AUTO REVIEW ON: codex-auto-review reviews ASK actions. ALLOW runs directly; DENY stays blocked. High-risk or unclear actions still ask you. Saved permissions are unchanged."
+                    format!("AUTO REVIEW ON: {} reviews ASK actions. ALLOW runs directly; DENY stays blocked. High-risk or unclear actions still ask you. Saved permissions are unchanged.", self.config.auto_review_model.as_deref().unwrap_or("codex-auto-review"))
                 } else {
-                    "AUTO REVIEW OFF: normal per-group permissions restored (ASK remains manual; ALLOW and REVIEW retain their configured behavior)."
+                    "AUTO REVIEW OFF: normal per-group permissions restored (ASK remains manual; ALLOW and REVIEW retain their configured behavior).".to_string()
                 });
             }
             crate::commands::CommandId::Help => self.add_message("system", crate::commands::help()),
@@ -1945,8 +1980,8 @@ impl App {
                 self.interaction.reset_transcript();
                 self.messages.clear();
                 self.usage_records.clear();
-                    self.usage_summary = Default::default();
-                    self.request_usage = Default::default();
+                self.usage_summary = Default::default();
+                self.request_usage = Default::default();
                 self.chat_scroll = 0;
                 self.prompt_tokens = 0;
                 self.candidates_tokens = 0;
@@ -2178,6 +2213,7 @@ impl App {
     }
 
     pub fn start_new_session(&mut self) {
+        self.session_lock.take();
         self.auto_mode = false;
         self.interaction.reset_transcript();
         let old = self
@@ -2195,8 +2231,8 @@ impl App {
         self.session_tool_profile = None;
         self.session_disabled_tools.clear();
         self.usage_records.clear();
-                    self.usage_summary = Default::default();
-                    self.request_usage = Default::default();
+        self.usage_summary = Default::default();
+        self.request_usage = Default::default();
         self.chat_scroll = 0;
         self.prompt_tokens = 0;
         self.candidates_tokens = 0;
@@ -2207,6 +2243,9 @@ impl App {
         self.tool_registry.clear_discovered_tools();
         self.pending_todo_notice = None;
         self.session_path = session::new_session_path(&self.config.session_name);
+        if let Err(error) = self.acquire_session_lock() {
+            self.set_status(format!("Could not lock new session: {error}"));
+        }
         self.review = crate::review::ReviewStore::default();
         if let Some(path) = &self.session_path {
             let _ = self.review.bind(path, false);
@@ -2721,7 +2760,10 @@ impl App {
             } => {
                 self.request_usage.merge(&details);
                 self.prompt_tokens = self.request_usage.input_tokens.unwrap_or(prompt_tokens);
-                self.candidates_tokens = self.request_usage.output_tokens.unwrap_or(candidates_tokens);
+                self.candidates_tokens = self
+                    .request_usage
+                    .output_tokens
+                    .unwrap_or(candidates_tokens);
                 self.total_tokens = self.request_usage.total().unwrap_or(total_tokens);
                 if prompt_tokens > 0 {
                     self.context_tokens = prompt_tokens;
@@ -2805,10 +2847,11 @@ impl App {
         } else {
             EngineState::ExecutingTool
         };
-        self.set_status("Reviewing exact action with codex-auto-review (30s deadline)...");
+        self.set_status(format!("Reviewing exact action with {} (5m deadline; transient failures retry)...", self.config.auto_review_model.as_deref().unwrap_or("codex-auto-review")));
+        let model = self.config.auto_review_model.clone().unwrap_or_else(|| "codex-auto-review".to_string());
         tokio::spawn(async move {
             let result = match context {
-                Ok(context) => crate::auto_review::review(&client, &context, &root, &pending).await,
+                Ok(context) => crate::auto_review::review(&client, &model, &context, &root, &pending).await,
                 Err(error) => Err(error),
             };
             let _ = tx.send(AppEvent::Stream {
@@ -3390,7 +3433,9 @@ impl App {
         }
 
         for declaration in &mut tools {
-            declaration.function_declarations.sort_by(|a, b| a.name.cmp(&b.name));
+            declaration
+                .function_declarations
+                .sort_by(|a, b| a.name.cmp(&b.name));
         }
         crate::client::types::GenerateContentRequest {
             contents,
