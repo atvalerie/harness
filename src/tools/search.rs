@@ -138,3 +138,138 @@ impl Tool for SearchFilesTool {
         }
     }
 }
+
+pub struct FindSymbolsTool {
+    cwd: SharedWorkingDir,
+}
+
+impl FindSymbolsTool {
+    pub fn new(cwd: SharedWorkingDir) -> Self {
+        Self { cwd }
+    }
+}
+
+#[async_trait]
+impl Tool for FindSymbolsTool {
+    fn name(&self) -> &'static str {
+        "find_symbols"
+    }
+
+    fn description(&self) -> &'static str {
+        "Finds symbol definitions (functions, structs, classes, enums, traits, methods, constants) across codebase without loading indices into RAM."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Symbol name or substring to search for"},
+                "path": {"type": "string", "description": "Optional subdirectory or file to scope search to"},
+                "kind": {"type": "string", "description": "Optional symbol kind: fn, struct, class, enum, trait, const, type, interface"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum matches to return (default: 50)"}
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn generate_preview(&self, args: &serde_json::Value) -> ToolPreview {
+        let query = args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<missing query>");
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(".");
+        let resolved_path = resolve_path(path, &working_dir_path(&self.cwd));
+        ToolPreview {
+            title: "Find Symbols (on-demand streaming)".to_string(),
+            details: vec![
+                format!("Query: {}", query),
+                format!("Path: {}", resolved_path.display()),
+            ],
+            reason: None,
+            expected_effect: None,
+            command: None,
+            diff_hunks: Vec::new(),
+            is_mutation: false,
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        let query = args
+            .get("query")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "Missing required parameter 'query'".to_string())?;
+        if query.is_empty() {
+            return Err("Symbol query cannot be empty".to_string());
+        }
+
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or(".");
+        let max_results = args
+            .get("max_results")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 500);
+
+        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Construct targeted regex for definition keywords
+        let pattern = if !kind.is_empty() {
+            format!(r"\b{}\s+.*{}\b", regex_escape(kind), regex_escape(query))
+        } else {
+            format!(r"\b(fn|function|def|struct|class|enum|interface|trait|type|const)\s+.*{}\b", regex_escape(query))
+        };
+
+        let mut command = Command::new("rg");
+        command
+            .arg("--line-number")
+            .arg("--column")
+            .arg("--with-filename")
+            .arg("--color")
+            .arg("never")
+            .arg("--max-count")
+            .arg(max_results.to_string())
+            .arg("-e")
+            .arg(pattern);
+
+        let resolved_path = resolve_path(path, &working_dir_path(&self.cwd));
+        command
+            .arg(resolved_path)
+            .current_dir(working_dir_path(&self.cwd))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = command.output().await.map_err(|error| {
+            format!("Could not run ripgrep for symbol search: {}", error)
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match output.status.code() {
+            Some(0) => {
+                let lines: Vec<&str> = stdout.lines().take(max_results as usize).collect();
+                if lines.is_empty() {
+                    Ok(format!("No symbols found matching {:?}.", query))
+                } else {
+                    Ok(lines.join("\n"))
+                }
+            }
+            Some(1) => Ok(format!("No symbols found matching {:?}.", query)),
+            _ => Err(format!("ripgrep failed: {}", stderr.trim())),
+        }
+    }
+}
+
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}

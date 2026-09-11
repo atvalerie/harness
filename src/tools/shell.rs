@@ -153,8 +153,8 @@ impl Tool for RunCommandTool {
                 c.args(["/V:ON", "/C", &wrapped]);
             } else {
                 let wrapped = format!(
-                    "{}; $holidaySuccess=$?; $holidayExit=$LASTEXITCODE; if ($null -eq $holidayExit) {{ $holidayExit=0 }}; if (-not $holidaySuccess -and $holidayExit -eq 0) {{ $holidayExit=1 }}; Write-Output (\"{}\" + (Get-Location).Path); exit $holidayExit",
-                    command_str, CWD_MARKER
+                    "& {{ {}; $holidaySuccess=$?; $holidayExit=$LASTEXITCODE; if ($null -eq $holidayExit) {{ $holidayExit = if ($holidaySuccess) {{ 0 }} else {{ 1 }} }}; Write-Output (\"{}\\n\" + (Get-Location).Path); exit $holidayExit }}",
+                    command_str.trim_end(), CWD_MARKER
                 );
                 c.args([
                     "-NoLogo",
@@ -258,10 +258,10 @@ fn select_windows_shell(requested: &str, command: &str) -> &'static str {
         "cmd" => "cmd",
         "powershell" | "pwsh" => "powershell",
         "sh" => "powershell",
-        _ if command.contains("&&")
-            || command.contains("||")
-            || command.contains("%CD%")
-            || command.contains("!CD!") =>
+        _ if (command.contains("&&") || command.contains("||"))
+            && !command.contains('\n')
+            && !command.contains(';')
+            && !command.contains('$') =>
         {
             "cmd"
         }

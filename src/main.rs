@@ -445,7 +445,7 @@ async fn run_headless_jsonl(
     app.trigger_generation(event_tx.clone());
 
     enum HeadlessEvent {
-        App(Option<AppEvent>),
+        App(Box<Option<AppEvent>>),
         Input(Option<String>),
     }
 
@@ -462,7 +462,7 @@ async fn run_headless_jsonl(
                     final_status = "cancelled";
                     break 'run;
                 }
-                event = event_rx.recv() => HeadlessEvent::App(event),
+                event = event_rx.recv() => HeadlessEvent::App(Box::new(event)),
                 line = input_rx.recv() => HeadlessEvent::Input(line),
             }
         } else {
@@ -472,7 +472,7 @@ async fn run_headless_jsonl(
                     final_status = "cancelled";
                     break 'run;
                 }
-                event = event_rx.recv() => HeadlessEvent::App(event),
+                event = event_rx.recv() => HeadlessEvent::App(Box::new(event)),
             }
         };
 
@@ -612,10 +612,10 @@ async fn run_headless_jsonl(
             continue;
         }
 
-        let HeadlessEvent::App(event) = event else {
+        let HeadlessEvent::App(boxed_event) = event else {
             unreachable!("input handled above");
         };
-        let Some(event) = event else {
+        let Some(event) = *boxed_event else {
             break 'run;
         };
 
@@ -1451,7 +1451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = render_interval.tick() => {
                 if app.interaction.external_editor_requested { edit_external_draft(&mut app); }
                 if app.interaction.dirty || app.state != EngineState::Idle || app.tool_registry.tasks.running() {
-                    terminal.draw(|f| ui::render(&app, f))?;
+                    terminal.draw(|f| ui::render(&mut app, f))?;
                     app.interaction.dirty=false;
                 }
                 app.send_queued_prompt(tx.clone());
@@ -1480,6 +1480,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         AppEvent::Mouse(mouse) => {
                             match mouse.kind {
+                                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                                | crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                                    if let Some(chat_area) = app.chat_area {
+                                        let col = mouse.column;
+                                        let row = mouse.row;
+                                        // Scrollbar column on right edge of chat box
+                                        if col == chat_area.right().saturating_sub(1)
+                                            && row >= chat_area.top().saturating_add(1)
+                                            && row < chat_area.bottom().saturating_sub(1)
+                                        {
+                                            let track_height = chat_area.height.saturating_sub(2).max(1) as f64;
+                                            let click_offset = (row.saturating_sub(chat_area.top().saturating_add(1))) as f64;
+                                            let fraction = (click_offset / track_height).clamp(0.0, 1.0);
+                                            // Top of track = oldest history (chat_max_scroll), bottom = latest (0)
+                                            let target_scroll = ((1.0 - fraction) * app.chat_max_scroll as f64).round() as usize;
+                                            app.chat_scroll = target_scroll.min(app.chat_max_scroll);
+                                        }
+                                    }
+                                }
                                 crossterm::event::MouseEventKind::ScrollUp => {
                                     if app.state == EngineState::AwaitingHitlApproval {
                                         app.modal_scroll = app.modal_scroll.saturating_sub(5);

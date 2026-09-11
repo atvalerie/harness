@@ -884,7 +884,38 @@ fn apply_exact_edit(
     if old_string.is_empty() {
         return Err("'old_string' cannot be empty".to_string());
     }
+
+    // Direct match first.
     let occurrences = source.matches(old_string).count();
+    if occurrences > 0 {
+        if occurrences > 1 && !replace_all {
+            return Err(format!(
+                "old_string matched {} places; provide more context or set replace_all=true",
+                occurrences
+            ));
+        }
+        let updated = if replace_all {
+            source.replace(old_string, new_string)
+        } else {
+            source.replacen(old_string, new_string, 1)
+        };
+        return Ok((updated, if replace_all { occurrences } else { 1 }));
+    }
+
+    // Fallback: Line-ending normalization (CRLF <-> LF) for cross-platform robustness.
+    let source_has_crlf = source.contains("\r\n");
+    let norm_old = if source_has_crlf {
+        old_string.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        old_string.replace("\r\n", "\n")
+    };
+    let norm_new = if source_has_crlf {
+        new_string.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        new_string.replace("\r\n", "\n")
+    };
+
+    let occurrences = source.matches(&norm_old).count();
     if occurrences == 0 {
         return Err("old_string was not found exactly in the target file".to_string());
     }
@@ -895,9 +926,9 @@ fn apply_exact_edit(
         ));
     }
     let updated = if replace_all {
-        source.replace(old_string, new_string)
+        source.replace(&norm_old, &norm_new)
     } else {
-        source.replacen(old_string, new_string, 1)
+        source.replacen(&norm_old, &norm_new, 1)
     };
     Ok((updated, if replace_all { occurrences } else { 1 }))
 }

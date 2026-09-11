@@ -2,6 +2,7 @@ pub mod fs;
 pub mod grounding;
 pub mod search;
 pub mod shell;
+pub mod skill;
 
 use crate::agents::{AgentManager, AgentTool, AgentToolKind};
 use crate::client::types::{FunctionDeclaration, GeminiToolDeclaration};
@@ -401,6 +402,14 @@ impl ToolRegistry {
         reg.register_with_descriptor(
             Arc::new(search::SearchFilesTool::new(reg.working_dir.clone())),
             ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::FindSymbolsTool::new(reg.working_dir.clone())),
+            ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(skill::SkillTool::new(reg.working_dir.clone())),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
         );
 
         reg

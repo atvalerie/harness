@@ -193,9 +193,12 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         EngineState::Idle => String::new(),
     };
 
-    let line = Line::from(vec![
+    let is_narrow = area.width < 90;
+    let is_compact = area.width < 60;
+
+    let mut spans = vec![
         Span::styled(
-            " HOLIDAY ",
+            if is_compact { " H " } else { " HOLIDAY " },
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -208,89 +211,81 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 .bg(state_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            if app.auto_mode { " AUTO REVIEW " } else { " " },
+    ];
+
+    if app.auto_mode {
+        spans.push(Span::styled(
+            if is_compact { " AUTO " } else { " AUTO REVIEW " },
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(activity, Style::default().fg(Color::LightCyan)),
-        Span::styled(
-            &app.config.model,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(pricing_str, Style::default().fg(Color::DarkGray)),
-        if provider_limit_parts.is_some() {
-            Span::raw(" \u{2502} ")
-        } else {
-            Span::raw("")
-        },
-        if let Some(parts) = provider_limit_parts.as_ref() {
-            Span::styled(
+        ));
+    }
+
+    spans.push(Span::styled(activity, Style::default().fg(Color::LightCyan)));
+    spans.push(Span::styled(
+        &app.config.model,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    if !is_narrow {
+        spans.push(Span::styled(pricing_str, Style::default().fg(Color::DarkGray)));
+    }
+
+    if let Some(parts) = provider_limit_parts.as_ref() {
+        if !is_compact {
+            spans.push(Span::raw(" │ "));
+            spans.push(Span::styled(
                 parts.first().cloned().unwrap_or_default(),
                 Style::default().fg(Color::LightGreen),
-            )
-        } else {
-            Span::raw("")
-        },
-        if provider_limit_parts
-            .as_ref()
-            .is_some_and(|parts| parts.len() > 1)
-        {
-            Span::raw(" \u{2502} ")
-        } else {
-            Span::raw("")
-        },
-        if let Some(part) = provider_limit_parts.as_ref().and_then(|parts| parts.get(1)) {
-            Span::styled(part.clone(), Style::default().fg(Color::LightGreen))
-        } else {
-            Span::raw("")
-        },
-        if provider_limit_parts
-            .as_ref()
-            .is_some_and(|parts| parts.len() > 2)
-        {
-            Span::raw(" \u{2502} ")
-        } else {
-            Span::raw("")
-        },
-        if let Some(part) = provider_limit_parts.as_ref().and_then(|parts| parts.get(2)) {
-            Span::styled(part.clone(), Style::default().fg(Color::LightGreen))
-        } else {
-            Span::raw("")
-        },
-        Span::raw(" │ "),
-        Span::styled("think: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(thinking_str, Style::default().fg(Color::Magenta)),
-        Span::raw(" │ "),
-        Span::styled("temp: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(temperature_text, Style::default().fg(Color::Yellow)),
-        Span::raw(" │ "),
-        Span::styled("ctx: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(
-                "{}{}/{} ({:.1}%)",
-                if app.context_tokens_estimated {
-                    "~"
-                } else {
-                    ""
-                },
-                app.context_tokens,
-                context_limit_text,
-                context_pct
-            ),
-            Style::default().fg(if context_pct > 80.0 {
-                Color::Red
+            ));
+            if !is_narrow {
+                for part in parts.iter().skip(1) {
+                    spans.push(Span::raw(" │ "));
+                    spans.push(Span::styled(part.clone(), Style::default().fg(Color::LightGreen)));
+                }
+            }
+        }
+    }
+
+    if !is_narrow {
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled("think: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(thinking_str, Style::default().fg(Color::Magenta)));
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled("temp: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(temperature_text, Style::default().fg(Color::Yellow)));
+    }
+
+    spans.push(Span::raw(" │ "));
+    spans.push(Span::styled("ctx: ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!(
+            "{}{}/{} ({:.1}%)",
+            if app.context_tokens_estimated {
+                "~"
             } else {
-                Color::Green
-            }),
+                ""
+            },
+            app.context_tokens,
+            context_limit_text,
+            context_pct
         ),
-        Span::styled(tps_str, Style::default().fg(Color::LightCyan)),
-        Span::raw(" │ "),
-    ]);
+        Style::default().fg(if context_pct > 80.0 {
+            Color::Red
+        } else {
+            Color::Green
+        }),
+    ));
+
+    if !is_narrow {
+        spans.push(Span::styled(tps_str, Style::default().fg(Color::LightCyan)));
+    }
+
+    let line = Line::from(spans);
 
     frame.render_widget(Paragraph::new(line), area);
 }

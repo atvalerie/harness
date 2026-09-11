@@ -15,7 +15,7 @@ pub struct TranscriptCache {
     anchor: Option<usize>,
 }
 
-pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
+pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     if app.messages.is_empty()
@@ -139,11 +139,19 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
                         ),
                         other => (other, String::new()),
                     };
+                    let file_url = if std::path::Path::new(&attachment.name).is_absolute() {
+                        format!("file:///{}", attachment.name.replace('\\', "/"))
+                    } else if let Ok(cwd) = std::env::current_dir() {
+                        format!("file:///{}/{}", cwd.display().to_string().replace('\\', "/"), attachment.name.replace('\\', "/"))
+                    } else {
+                        format!("file:///{}", attachment.name.replace('\\', "/"))
+                    };
+                    let hyperlinked_name = crate::ui::markdown::osc8_link(&file_url, &attachment.name);
                     let label = format!(
                         "  [attachment {}: {} | {} | {}]",
                         index + 1,
                         kind,
-                        attachment.name,
+                        hyperlinked_name,
                         details
                     );
                     item_lines.push(Line::from(vec![Span::styled(
@@ -354,6 +362,8 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         0
     };
+    app.chat_max_scroll = max_scroll;
+    app.chat_viewport_height = viewport_height;
 
     // app.chat_scroll represents how many lines UP from the bottom we have scrolled.
     // 0 = bottom (most recent).
@@ -405,6 +415,24 @@ pub fn render_chat(app: &App, frame: &mut Frame, area: Rect) {
     );
 
     frame.render_widget(paragraph, area);
+
+    if max_scroll > 0 {
+        use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_y);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
@@ -457,7 +485,8 @@ mod tests {
         app.interaction.expanded.insert(1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| render_chat(&app, f, f.area())).unwrap();
+        let mut app = app;
+        terminal.draw(|f| render_chat(&mut app, f, f.area())).unwrap();
         let text = terminal
             .backend()
             .buffer()

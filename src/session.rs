@@ -3,6 +3,11 @@ use crate::config::AppConfig;
 use crate::tools::TodoItem;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use fs2::FileExt;
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEW_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -54,6 +59,60 @@ pub struct UsageRecord {
     pub pricing: Option<crate::usage::Pricing>,
 }
 
+/// An OS-level exclusive lock for one saved session.
+pub struct SessionLock {
+    file: File,
+}
+
+impl SessionLock {
+    pub fn acquire(session: &Path) -> Result<Self, String> {
+        let parent = session
+            .parent()
+            .ok_or_else(|| "Session path has no parent".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create session directory: {error}"))?;
+        let path = session.with_extension("lock");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("Cannot open session lock {}: {error}", path.display()))?;
+        if let Err(error) = file.try_lock_exclusive() {
+            return Err(format!(
+                "Session is already in use by another Harness process: {} ({error})",
+                session.display()
+            ));
+        }
+        let write_result = (|| {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            writeln!(
+                &file,
+                "pid={} acquired_at={}",
+                std::process::id(),
+                chrono::Utc::now().to_rfc3339()
+            )?;
+            file.sync_data()
+        })();
+        if let Err(error) = write_result {
+            let _ = file.unlock();
+            return Err(format!(
+                "Cannot record session lock {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub name: String,
@@ -70,9 +129,11 @@ pub fn default_session_path(name: &str) -> Option<PathBuf> {
 
 pub fn new_session_path(prefix: &str) -> Option<PathBuf> {
     let name = format!(
-        "{}-{}",
+        "{}-{}-{}-{}",
         prefix,
-        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f"),
+        std::process::id(),
+        NEW_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     default_session_path(&name)
 }

@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-pub fn render(app: &App, frame: &mut Frame) {
+pub fn render(app: &mut App, frame: &mut Frame) {
     // An overlay owns the frame, including the cursor. Never leave transcript
     // cells or the underlying prompt cursor behind its content.
     if app.interaction.top().is_some() {
@@ -78,7 +78,16 @@ pub fn render(app: &App, frame: &mut Frame) {
         let content_lines = structured_lines
             .saturating_add(preview.details.len())
             .saturating_add(preview.diff_hunks.len());
-        let desired_height = content_lines.saturating_add(3).clamp(12, 24) as u16;
+        // Adaptively scale HITL panel height based on available terminal height:
+        // On compact screens (< 30 lines), don't consume more than 40% of the screen.
+        let max_allowed_height = if panel_area.height <= 25 {
+            panel_area.height.saturating_sub(4).max(5)
+        } else if panel_area.height <= 40 {
+            (panel_area.height * 2 / 5).clamp(8, 16)
+        } else {
+            24
+        };
+        let desired_height = (content_lines.saturating_add(3) as u16).clamp(6, max_allowed_height);
         let hitl_height = desired_height.min(panel_area.height.saturating_sub(3).max(1));
 
         let lower_chunks = Layout::default()
@@ -90,6 +99,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             .split(panel_area);
 
         chat::render_chat(app, frame, lower_chunks[0]);
+        app.chat_area = Some(lower_chunks[0]);
         modal::render_hitl_modal(app, frame, lower_chunks[1]);
     } else {
         // Normal mode
@@ -104,6 +114,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         ])
         .split(chat_area);
         chat::render_chat(app, frame, areas[0]);
+        app.chat_area = Some(areas[0]);
         if !suggestions.is_empty() {
             let selected = app
                 .interaction
@@ -258,7 +269,7 @@ mod tests {
                 crate::interaction::Overlay::Models,
             ] {
                 app.interaction.set_overlay(overlay, true);
-                terminal.draw(|frame| render(&app, frame)).unwrap();
+                terminal.draw(|frame| render(&mut app, frame)).unwrap();
             }
         }
     }
@@ -269,7 +280,7 @@ mod tests {
         app.interaction.query = "rollback".into();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 25)).unwrap();
-        terminal.draw(|f| render(&app, f)).unwrap();
+        terminal.draw(|f| render(&mut app, f)).unwrap();
         let text = terminal
             .backend()
             .buffer()
@@ -291,7 +302,7 @@ mod tests {
             crate::interaction::Overlay::Palette,
         ] {
             app.interaction.set_overlay(overlay, true);
-            terminal.draw(|f| render(&app, f)).unwrap();
+            terminal.draw(|f| render(&mut app, f)).unwrap();
             let text = terminal
                 .backend()
                 .buffer()
@@ -310,7 +321,7 @@ mod tests {
         app.input_buffer = "/ret".into();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| render(&app, f)).unwrap();
+        terminal.draw(|f| render(&mut app, f)).unwrap();
         let text = terminal
             .backend()
             .buffer()

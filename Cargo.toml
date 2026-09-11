@@ -22,6 +22,7 @@ rand = "0.9"
 sha2 = "0.10"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+fs2 = "0.4.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.0", features = ["windows-native"] }
