@@ -73,7 +73,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "/auto",
         aliases: &[],
         description:
-            "Session-wide model approval review: on, off, status (saved permissions unchanged)",
+            "Session-wide model approval review: on, off, status, model <name> (saved permissions unchanged)",
         arguments: Arguments::Optional,
         idle_only: true,
     },

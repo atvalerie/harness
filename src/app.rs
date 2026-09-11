@@ -1490,12 +1490,26 @@ impl App {
         let arg = argument.as_str();
         match spec.id {
             crate::commands::CommandId::Auto => {
-                match arg.trim().to_ascii_lowercase().as_str() {
+                let trimmed = arg.trim();
+                if let Some(model) = trimmed.strip_prefix("model ") {
+                    let model = model.trim();
+                    if model.is_empty() || model.eq_ignore_ascii_case("default") {
+                        self.config.auto_review_model = None;
+                        let _ = self.config.save();
+                        self.add_message("system", "Auto review model reset to default (codex-auto-review).");
+                    } else {
+                        self.config.auto_review_model = Some(model.to_string());
+                        let _ = self.config.save();
+                        self.add_message("system", format!("Auto review model set to '{}'.", model));
+                    }
+                    return;
+                }
+                match trimmed.to_ascii_lowercase().as_str() {
                     "on" => self.auto_mode = true,
                     "off" => self.auto_mode = false,
                     "" | "status" => {}
                     _ => {
-                        self.add_message("system", "Usage: /auto <on|off|status>");
+                        self.add_message("system", "Usage: /auto <on|off|status|model [name]>");
                         return;
                     }
                 }
