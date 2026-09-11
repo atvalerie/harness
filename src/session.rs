@@ -21,6 +21,8 @@ pub struct SessionSnapshot {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
+    pub transcript_history: Vec<ChatMessage>,
+    #[serde(default)]
     pub usage: Vec<UsageRecord>,
     /// The project context is optional so snapshots from older releases stay
     /// readable and portable.
@@ -212,6 +214,111 @@ fn journal_path(path: &Path) -> PathBuf {
     path.with_extension("events.jsonl")
 }
 
+pub fn meta_path(path: &Path) -> PathBuf {
+    path.with_extension("meta.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub version: u32,
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
+    pub provider: String,
+    pub model: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: usize,
+    pub prompt_tokens: u64,
+    pub candidates_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
+fn derive_session_title(snapshot: &SessionSnapshot, fallback: &str) -> String {
+    // 1. Look for the first meaningful user message to extract intent
+    for msg in &snapshot.messages {
+        if msg.role == "user" {
+            let line = msg.content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let clean = line.trim();
+            if !clean.is_empty() {
+                let truncated = clean.chars().take(60).collect::<String>();
+                return if clean.chars().count() > 60 {
+                    format!("{truncated}...")
+                } else {
+                    truncated
+                };
+            }
+        }
+    }
+    // 2. Look for summary checkpoint
+    for msg in &snapshot.messages {
+        if msg.role == "summary" {
+            if let Some(pos) = msg.content.find("## Objective and authorization") {
+                let after = &msg.content[pos..];
+                if let Some(line) = after.lines().nth(1) {
+                    let clean = line.trim().trim_start_matches("- ").trim();
+                    if !clean.is_empty() {
+                        return clean.chars().take(60).collect::<String>();
+                    }
+                }
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+fn extract_keywords(snapshot: &SessionSnapshot) -> Vec<String> {
+    let mut words = std::collections::BTreeSet::new();
+    for msg in &snapshot.messages {
+        if msg.role == "user" || msg.role == "tool" {
+            for word in msg.content.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+                let w = word.trim().to_ascii_lowercase();
+                if w.len() >= 4 && w.len() <= 20 {
+                    words.insert(w);
+                }
+            }
+        }
+    }
+    words.into_iter().take(25).collect()
+}
+
+pub fn save_metadata(path: &Path, snapshot: &SessionSnapshot) {
+    let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+    let title = derive_session_title(snapshot, id);
+    let (mut prompt_tokens, mut candidates_tokens, mut total_tokens): (u64, u64, u64) = (0, 0, 0);
+    for u in &snapshot.usage {
+        prompt_tokens = prompt_tokens.saturating_add(u.prompt_tokens);
+        candidates_tokens = candidates_tokens.saturating_add(u.candidates_tokens);
+        total_tokens = total_tokens.saturating_add(u.total_tokens);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let meta = SessionMetadata {
+        version: 1,
+        id: id.to_string(),
+        title,
+        project_root: snapshot.project_root.clone().or_else(|| snapshot.working_dir.clone()),
+        provider: snapshot.provider.clone(),
+        model: snapshot.model.clone(),
+        created_at: snapshot.usage.first().map(|u| u.timestamp.clone()).unwrap_or_else(|| now.clone()),
+        updated_at: now,
+        message_count: snapshot.messages.len(),
+        prompt_tokens,
+        candidates_tokens,
+        total_tokens,
+        keywords: extract_keywords(snapshot),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+        let meta_target = meta_path(path);
+        let temp = meta_target.with_extension(format!("tmp.{}", std::process::id()));
+        if let Ok(()) = fs::write(&temp, json.as_bytes()) {
+            let _ = fs::rename(&temp, &meta_target);
+        }
+    }
+}
+
 fn saved_states(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, (SessionSnapshot, u64)>> {
     static STATES: std::sync::OnceLock<
@@ -318,13 +425,16 @@ pub fn save(path: &Path, snapshot: &SessionSnapshot) -> Result<(), String> {
             Ok(())
         }
         Err(error) => Err(format!("Failed to commit session: {}", error)),
-    }
+    }?;
+    save_metadata(path, snapshot);
+    Ok(())
 }
 
 pub fn delete(path: &Path) -> Result<(), String> {
     // Exact sidecar paths only; never recursive deletion.
     for file in [
         journal_path(path),
+        meta_path(path),
         path.with_extension("changes.jsonl"),
         path.to_path_buf(),
     ] {
@@ -357,17 +467,35 @@ pub fn list() -> Vec<SessionInfo> {
             if path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .map(|stem| stem.ends_with(".export"))
+                .map(|stem| stem.ends_with(".export") || stem.ends_with(".meta"))
                 .unwrap_or(false)
             {
                 return None;
             }
-            let snapshot = load(&path)?;
             let name = path.file_stem()?.to_string_lossy().to_string();
             let modified = fs::metadata(journal_path(&path))
                 .or_else(|_| entry.metadata())
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+
+            // Fast path: try loading lightweight sidecar meta.json
+            let meta_file = meta_path(&path);
+            if let Ok(meta_content) = fs::read_to_string(&meta_file) {
+                if let Ok(meta) = serde_json::from_str::<SessionMetadata>(&meta_content) {
+                    return Some(SessionInfo {
+                        name,
+                        path,
+                        provider: meta.provider,
+                        model: meta.model,
+                        messages: meta.message_count,
+                        modified,
+                    });
+                }
+            }
+
+            // Fallback / self-healing: read full snapshot and generate sidecar
+            let snapshot = load(&path)?;
+            save_metadata(&path, &snapshot);
             Some(SessionInfo {
                 name,
                 path,
@@ -431,6 +559,40 @@ mod tests {
         super::delete(&path).unwrap();
         assert!(super::load(&path).is_none());
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_sidecar_round_trips_and_derives_title() {
+        let root = std::env::temp_dir().join(format!(
+            "holiday-meta-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("test-session.json");
+        let mut snapshot: super::SessionSnapshot = serde_json::from_value(
+            serde_json::json!({"provider":"openai","model":"gpt-4o","messages":[]}),
+        )
+        .unwrap();
+        snapshot.messages.push(crate::app::ChatMessage {
+            role: "user".into(),
+            content: "Fix TUI autocomplete acceptance and keybindings".into(),
+            timestamp: "12:00:00".into(),
+            attachments: Vec::new(),
+        });
+        super::save(&path, &snapshot).unwrap();
+
+        let meta_file = super::meta_path(&path);
+        assert!(meta_file.exists());
+        let meta_content = std::fs::read_to_string(&meta_file).unwrap();
+        let meta: super::SessionMetadata = serde_json::from_str(&meta_content).unwrap();
+        assert_eq!(meta.provider, "openai");
+        assert_eq!(meta.model, "gpt-4o");
+        assert_eq!(meta.title, "Fix TUI autocomplete acceptance and keybindings");
+        assert!(meta.keywords.contains(&"autocomplete".to_string()));
+        super::delete(&path).unwrap();
+        assert!(!meta_file.exists());
+        let _ = std::fs::remove_dir(root);
     }
 
     #[test]

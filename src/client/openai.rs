@@ -304,8 +304,11 @@ pub async fn stream_response(response: Response, tx: UnboundedSender<StreamSigna
                         if let Some(text) = delta.get("content").and_then(Value::as_str) {
                             let _ = tx.send(StreamSignal::TextDelta(text.to_string()));
                         }
-                        if let Some(thought) =
-                            delta.get("reasoning_content").and_then(Value::as_str)
+                        if let Some(thought) = delta
+                            .get("reasoning_content")
+                            .or_else(|| delta.get("reasoning"))
+                            .or_else(|| delta.get("thought"))
+                            .and_then(Value::as_str)
                         {
                             let _ = tx.send(StreamSignal::ThoughtDelta(thought.to_string()));
                         }
@@ -416,6 +419,7 @@ pub async fn stream_responses_response(response: Response, tx: UnboundedSender<S
                             }
                         }
                         "response.reasoning_summary_text.delta"
+                        | "response.reasoning_text.delta"
                         | "response.reasoning_content.delta" => {
                             if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                                 let _ = tx.send(StreamSignal::ThoughtDelta(delta.to_string()));

@@ -75,6 +75,9 @@ pub struct App {
     pub tool_registry: ToolRegistry,
     pub state: EngineState,
     pub messages: Vec<ChatMessage>,
+    /// Full durable transcript across compactions. Preserves raw pre-compaction history
+    /// so the model or tools can look back after compaction without polluting active attention.
+    pub transcript_history: Vec<ChatMessage>,
     pub chat_scroll: usize,
     pub chat_max_scroll: usize,
     pub chat_viewport_height: usize,
@@ -284,6 +287,7 @@ impl App {
             tool_registry,
             state: EngineState::Idle,
             messages: Vec::new(),
+            transcript_history: Vec::new(),
             chat_scroll: 0,
             chat_max_scroll: 0,
             chat_viewport_height: 0,
@@ -758,6 +762,11 @@ impl App {
         self.review.restore(snapshot.checkpoints);
         self.review.bind(path, true)?;
         self.messages = snapshot.messages;
+        self.transcript_history = if !snapshot.transcript_history.is_empty() {
+            snapshot.transcript_history
+        } else {
+            self.messages.clone()
+        };
         self.usage_records = snapshot.usage;
         self.usage_summary = Default::default();
         for record in &self.usage_records {
@@ -780,6 +789,7 @@ impl App {
             discovered.1
         };
         self.tool_registry.set_todo_items(snapshot.todos);
+        self.tool_registry.set_transcript_history(self.transcript_history.clone());
         self.plan_mode = snapshot.plan_mode;
         self.config.select_provider(&snapshot.provider);
         self.config.model = snapshot.model;
@@ -1175,6 +1185,14 @@ impl App {
         }
     }
 
+    pub fn push_chat_message(&mut self, msg: ChatMessage) {
+        self.transcript_history.push(msg.clone());
+        self.tool_registry.set_transcript_history(self.transcript_history.clone());
+        self.messages.push(msg);
+        self.interaction.dirty = true;
+        self.refresh_context_estimate();
+    }
+
     pub fn add_message_with_attachments(
         &mut self,
         role: &str,
@@ -1182,14 +1200,12 @@ impl App {
         attachments: Vec<Attachment>,
     ) {
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
-        self.messages.push(ChatMessage {
+        self.push_chat_message(ChatMessage {
             role: role.to_string(),
             content: content.into(),
             timestamp: now,
             attachments,
         });
-        self.interaction.dirty = true; // Preserve the reader viewport.
-        self.refresh_context_estimate();
     }
 
     pub fn flush_session(&mut self) -> Result<(), String> {
@@ -1203,6 +1219,7 @@ impl App {
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
             messages: self.messages.clone(),
+            transcript_history: self.transcript_history.clone(),
             usage: self.usage_records.clone(),
             working_dir: Some(self.tool_registry.working_dir()),
             project_root: self.project_root.clone(),
@@ -2386,9 +2403,12 @@ impl App {
         self.request_context_tokens = context_estimate;
 
         let output_would_overflow = self.context_would_overflow(context_estimate);
+        // Soft threshold: compact at natural turn boundaries (when there are no pending tool calls)
+        // or immediately when context is in danger of output overflow.
+        let at_natural_boundary = self.pending_tool_executions == 0 && self.queued_tool_calls.is_empty();
         if self.config.auto_compact
             && self.messages.len() > 2
-            && (context_estimate >= self.config.auto_compact_threshold_tokens
+            && ((context_estimate >= self.config.auto_compact_threshold_tokens && at_natural_boundary)
                 || output_would_overflow)
         {
             self.pending_generation_after_compaction = true;
@@ -2683,7 +2703,7 @@ impl App {
                     },
                     thought_signature: thought_signature.clone(),
                 };
-                self.messages.push(ChatMessage {
+                self.push_chat_message(ChatMessage {
                     role: "model_tool_call".to_string(),
                     content: serde_json::to_string(&fc_part).unwrap_or_default(),
                     timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -3139,7 +3159,7 @@ impl App {
         };
 
         // Save into message stream as a synthesized user/function turn
-        self.messages.push(ChatMessage {
+        self.push_chat_message(ChatMessage {
             role: "function".to_string(),
             content: serde_json::to_string(&response_part).unwrap_or_default(),
             timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -3200,7 +3220,7 @@ impl App {
                 id: call_id,
             },
         };
-        self.messages.push(ChatMessage {
+        self.push_chat_message(ChatMessage {
             role: "function".to_string(),
             content: serde_json::to_string(&response_part).unwrap_or_default(),
             timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -3617,12 +3637,15 @@ impl App {
                 // Summary is a real conversation item. `build_request` maps it
                 // to a user grounding turn so it survives session restore.
                 let now = chrono::Local::now().format("%H:%M:%S").to_string();
-                self.messages.push(ChatMessage {
+                let summary_msg = ChatMessage {
                     role: "summary".to_string(),
                     content: format!("Compact History Summary:\n{}", summary),
                     timestamp: now,
                     attachments: Vec::new(),
-                });
+                };
+                self.messages.push(summary_msg.clone());
+                self.transcript_history.push(summary_msg);
+                self.tool_registry.set_transcript_history(self.transcript_history.clone());
 
                 self.set_status("Context compacted");
                 self.add_message(

@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
@@ -26,16 +26,16 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
 
     if !app.draft_attachments.is_empty() {
         let mut chips = vec![Span::styled(
-            "  blocks: ",
+            "  [+] ",
             Style::default().fg(Color::DarkGray),
         )];
         for (index, attachment) in app.draft_attachments.iter().enumerate() {
             let (label, color) = match attachment {
                 DraftAttachment::Text { text, .. } => (
-                    format!("[{} text:{}c]", index + 1, text.chars().count()),
+                    format!("[#{} text:{}c]", index + 1, text.chars().count()),
                     Color::Yellow,
                 ),
-                DraftAttachment::Image { .. } => (format!("[{} image]", index + 1), Color::Magenta),
+                DraftAttachment::Image { .. } => (format!("[#{} image]", index + 1), Color::Magenta),
             };
             chips.push(Span::styled(
                 format!("{} ", label),
@@ -57,34 +57,45 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
             status_width <= area.width.saturating_sub(14) as usize
         })
         .collect::<String>();
-    let hint = if app.draft_attachments.is_empty() {
-        " /: commands | Ctrl+R: history | Ctrl+O: expand tool "
-    } else {
-        " Ctrl+K: commands | Ctrl+X: remove attachment | Ctrl+Enter: newline "
-    };
+
+    let mut top_titles = vec![
+        Span::styled(
+            " prompt ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if app.auto_mode {
+        top_titles.push(Span::styled(
+            "[auto] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title_top(Line::from(top_titles));
+
+    if !status.is_empty() {
+        block = block.title_top(
+            Line::from(vec![
+                Span::styled("* ", Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{} ", status), Style::default().fg(Color::Yellow)),
+            ])
+            .right_aligned(),
+        );
+    }
+
+    let hint_line = render_keybind_hints(app, area.width as usize);
+    block = block.title_bottom(hint_line);
+
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title_top(Line::from(Span::styled(
-                    " Prompt ",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )))
-                .title_top(
-                    Line::from(Span::styled(
-                        format!(" {} ", status),
-                        Style::default().fg(Color::Yellow),
-                    ))
-                    .right_aligned(),
-                )
-                .title_bottom(
-                    Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
-                        .right_aligned(),
-                )
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
+        .block(block)
         .scroll((scroll as u16, 0));
     frame.render_widget(paragraph, area);
 
@@ -95,6 +106,70 @@ pub fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn render_keybind_hints(app: &App, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let is_compact = width < 75;
+    let is_narrow = width < 95;
+
+    let items: Vec<(&str, &str)> = if !app.draft_attachments.is_empty() {
+        if is_compact {
+            vec![("↵", "send"), ("^X", "drop"), ("⇧↵", "newline")]
+        } else {
+            vec![
+                ("Enter", "send"),
+                ("Ctrl+X", "remove block"),
+                ("Shift+Enter", "newline"),
+                ("Ctrl+K", "commands"),
+            ]
+        }
+    } else if app.chat_scroll > 0 {
+        if is_compact {
+            vec![("Esc", "bottom"), ("PgUp/Dn", "scroll"), ("↵", "send")]
+        } else {
+            vec![
+                ("Esc", "scroll to bottom"),
+                ("PgUp/PgDn", "scroll"),
+                ("Enter", "send"),
+            ]
+        }
+    } else if is_compact {
+        vec![("↵", "send"), ("/", "commands"), ("^R", "history")]
+    } else if is_narrow {
+        vec![
+            ("Enter", "send"),
+            ("Shift+Enter", "newline"),
+            ("/", "commands"),
+            ("Ctrl+R", "history"),
+        ]
+    } else {
+        vec![
+            ("Enter", "send"),
+            ("Shift+Enter", "newline"),
+            ("/", "commands"),
+            ("Ctrl+R", "history"),
+            ("Ctrl+K", "palette"),
+        ]
+    };
+
+    for (i, (key, desc)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", desc),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans).right_aligned()
 }
 
 fn wrapped_rows(input: &str, width: usize) -> Vec<String> {

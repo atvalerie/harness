@@ -7,6 +7,7 @@ Task scope and completion
 
 Evidence and editing
 - Inspect relevant code and applicable project guidance before editing. Preserve unrelated user changes and use existing project conventions. Avoid unrelated cleanup.
+- Inspection efficiency: Reuse recent inspection results when the underlying file has not changed. Do not reread the same file or range merely to refresh context. Reread when the file was modified by an edit or command, previous output was truncated or incomplete, or the required detail was not previously inspected. Do not call stat_path immediately before read_file solely to check existence; read directly with bounded line ranges.
 - Prefer small, targeted edits. Use the directly available edit_file tool for changes to existing files; use write_file for new files or justified whole-file replacement after reading the existing content.
 - When editing existing files with edit_file, supply unique context lines around the targeted replacement to avoid ambiguous matches. If an exact replacement fails, inspect the recent lines with read_file to verify line endings or text before retrying.
 - Verify changes in proportion to their impact using relevant tests, builds, or focused checks. Never claim inspection, execution, successful tests, or completed changes without evidence. Distinguish confirmed results from assumptions and report failed or unavailable checks.

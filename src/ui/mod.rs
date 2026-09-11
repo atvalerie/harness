@@ -122,32 +122,86 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 .min(suggestions.len() - 1);
             let count = areas[1].height.saturating_sub(2) as usize;
             let start = selected.saturating_sub(count.saturating_sub(1));
+            let max_cmd_len = suggestions
+                .iter()
+                .map(|s| s.name.len())
+                .max()
+                .unwrap_or(12)
+                .max(12);
+
             let lines = suggestions
                 .iter()
                 .enumerate()
                 .skip(start)
                 .take(count)
                 .map(|(i, spec)| {
-                    ratatui::text::Line::styled(
-                        format!(
-                            "{} {}  {}",
-                            if i == selected { ">" } else { " " },
-                            spec.name,
-                            spec.description
+                    let is_active = i == selected;
+                    let prefix = if is_active { "> " } else { "  " };
+                    let cmd_col = format!("{:<width$}", spec.name, width = max_cmd_len + 2);
+                    let idle_tag = if spec.idle_only { " [idle]" } else { "" };
+                    ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled(
+                            prefix,
+                            ratatui::style::Style::default()
+                                .fg(ratatui::style::Color::Cyan)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
                         ),
-                        ratatui::style::Style::default().fg(if i == selected {
-                            ratatui::style::Color::Cyan
-                        } else {
-                            ratatui::style::Color::Gray
-                        }),
-                    )
+                        ratatui::text::Span::styled(
+                            cmd_col,
+                            if is_active {
+                                ratatui::style::Style::default()
+                                    .fg(ratatui::style::Color::White)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
+                            } else {
+                                ratatui::style::Style::default().fg(ratatui::style::Color::Gray)
+                            },
+                        ),
+                        ratatui::text::Span::styled(
+                            spec.description,
+                            if is_active {
+                                ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)
+                            } else {
+                                ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)
+                            },
+                        ),
+                        ratatui::text::Span::styled(
+                            idle_tag,
+                            ratatui::style::Style::default().fg(if is_active {
+                                ratatui::style::Color::Yellow
+                            } else {
+                                ratatui::style::Color::DarkGray
+                            }),
+                        ),
+                    ])
                 })
                 .collect::<Vec<_>>();
+
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan))
+                .title_top(ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(
+                        " Commands ",
+                        ratatui::style::Style::default()
+                            .fg(ratatui::style::Color::Cyan)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                ]))
+                .title_bottom(
+                    ratatui::text::Line::from(vec![
+                        ratatui::text::Span::styled("↑↓ ", ratatui::style::Style::default().fg(ratatui::style::Color::White).add_modifier(ratatui::style::Modifier::BOLD)),
+                        ratatui::text::Span::styled("navigate · ", ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
+                        ratatui::text::Span::styled("Tab/↵ ", ratatui::style::Style::default().fg(ratatui::style::Color::White).add_modifier(ratatui::style::Modifier::BOLD)),
+                        ratatui::text::Span::styled("select · ", ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
+                        ratatui::text::Span::styled("Esc ", ratatui::style::Style::default().fg(ratatui::style::Color::White).add_modifier(ratatui::style::Modifier::BOLD)),
+                        ratatui::text::Span::styled("hide ", ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
+                    ])
+                    .right_aligned(),
+                );
+
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(lines).block(
-                    ratatui::widgets::Block::bordered()
-                        .title(" Commands | Up/Down select | Tab insert | Esc hide "),
-                ),
+                ratatui::widgets::Paragraph::new(lines).block(block),
                 areas[1],
             );
         }

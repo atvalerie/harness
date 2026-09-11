@@ -208,6 +208,7 @@ pub struct TodoItem {
 }
 
 pub type TodoStore = Arc<Mutex<Vec<TodoItem>>>;
+pub type HistoryStore = Arc<Mutex<Vec<crate::app::ChatMessage>>>;
 
 struct SearchToolsTool {
     catalog: Arc<Mutex<Vec<ToolSummary>>>,
@@ -324,6 +325,7 @@ pub struct ToolRegistry {
     catalog: Arc<Mutex<Vec<ToolSummary>>>,
     discovered: Arc<Mutex<HashSet<String>>>,
     todos: TodoStore,
+    history: HistoryStore,
     agent_manager: AgentManager,
 }
 
@@ -337,6 +339,7 @@ impl ToolRegistry {
             catalog: Arc::new(Mutex::new(Vec::new())),
             discovered: Arc::new(Mutex::new(HashSet::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
+            history: Arc::new(Mutex::new(Vec::new())),
             agent_manager: AgentManager::new(),
         };
 
@@ -356,8 +359,10 @@ impl ToolRegistry {
             Arc::new(grounding::WeatherTool),
             ToolDescriptor::lazy(ToolCategory::Web, ToolRisk::ReadOnly),
         );
+        let read_file_tool = Arc::new(fs::ReadFileTool::new(reg.working_dir.clone()));
+        let read_cache = read_file_tool.cache();
         reg.register_with_descriptor(
-            Arc::new(fs::ReadFileTool::new(reg.working_dir.clone())),
+            read_file_tool,
             ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
         );
         reg.register_with_descriptor(
@@ -369,11 +374,17 @@ impl ToolRegistry {
             ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::ReadOnly),
         );
         reg.register_with_descriptor(
-            Arc::new(fs::WriteFileTool::new(reg.working_dir.clone())),
+            Arc::new(fs::WriteFileTool::new(
+                reg.working_dir.clone(),
+                read_cache.clone(),
+            )),
             ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::WorkspaceWrite),
         );
         reg.register_with_descriptor(
-            Arc::new(fs::EditFileTool::new(reg.working_dir.clone())),
+            Arc::new(fs::EditFileTool::new(
+                reg.working_dir.clone(),
+                read_cache,
+            )),
             ToolDescriptor::core(ToolCategory::Filesystem, ToolRisk::WorkspaceWrite),
         );
         reg.register_with_descriptor(
@@ -406,6 +417,26 @@ impl ToolRegistry {
         reg.register_with_descriptor(
             Arc::new(search::FindSymbolsTool::new(reg.working_dir.clone())),
             ToolDescriptor::lazy(ToolCategory::Filesystem, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::SearchHistoryTool::new(reg.history.clone())),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::ReadHistoryTool::new(reg.history.clone())),
+            ToolDescriptor::core(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::ListSessionsTool),
+            ToolDescriptor::lazy(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::SearchSessionsTool),
+            ToolDescriptor::lazy(ToolCategory::Other, ToolRisk::ReadOnly),
+        );
+        reg.register_with_descriptor(
+            Arc::new(search::ReadSessionTool),
+            ToolDescriptor::lazy(ToolCategory::Other, ToolRisk::ReadOnly),
         );
         reg.register_with_descriptor(
             Arc::new(skill::SkillTool::new(reg.working_dir.clone())),
@@ -706,6 +737,12 @@ impl ToolRegistry {
     pub fn set_todo_items(&self, items: Vec<TodoItem>) {
         if let Ok(mut todos) = self.todos.lock() {
             *todos = items;
+        }
+    }
+
+    pub fn set_transcript_history(&self, items: Vec<crate::app::ChatMessage>) {
+        if let Ok(mut hist) = self.history.lock() {
+            *hist = items;
         }
     }
 

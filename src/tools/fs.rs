@@ -1,18 +1,111 @@
 use async_trait::async_trait;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use super::{resolve_path, working_dir_path, DiffHunk, SharedWorkingDir, Tool, ToolPreview};
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ReadCacheKey {
+    path: PathBuf,
+    start_line: Option<usize>,
+    max_lines: Option<usize>,
+}
+
+#[derive(Clone)]
+struct ReadCacheEntry {
+    mtime: Option<SystemTime>,
+    len: u64,
+    content: String,
+}
+
+#[derive(Clone, Default)]
+pub struct ReadFileCache {
+    entries: Arc<Mutex<HashMap<ReadCacheKey, ReadCacheEntry>>>,
+}
+
+impl ReadFileCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn invalidate(&self, path: &Path) {
+        if let Ok(mut cache) = self.entries.lock() {
+            cache.retain(|k, _| k.path != path);
+        }
+    }
+
+    fn get(
+        &self,
+        path: &Path,
+        start_line: Option<usize>,
+        max_lines: Option<usize>,
+        mtime: Option<SystemTime>,
+        len: u64,
+    ) -> Option<String> {
+        let cache = self.entries.lock().ok()?;
+        let key = ReadCacheKey {
+            path: path.to_path_buf(),
+            start_line,
+            max_lines,
+        };
+        let entry = cache.get(&key)?;
+        if entry.mtime == mtime && entry.len == len {
+            Some(entry.content.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(
+        &self,
+        path: &Path,
+        start_line: Option<usize>,
+        max_lines: Option<usize>,
+        mtime: Option<SystemTime>,
+        len: u64,
+        content: String,
+    ) {
+        if let Ok(mut cache) = self.entries.lock() {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            let key = ReadCacheKey {
+                path: path.to_path_buf(),
+                start_line,
+                max_lines,
+            };
+            cache.insert(
+                key,
+                ReadCacheEntry {
+                    mtime,
+                    len,
+                    content,
+                },
+            );
+        }
+    }
+}
+
 pub struct ReadFileTool {
     cwd: SharedWorkingDir,
+    cache: ReadFileCache,
 }
 
 impl ReadFileTool {
     pub fn new(cwd: SharedWorkingDir) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            cache: ReadFileCache::new(),
+        }
+    }
+
+    pub fn cache(&self) -> ReadFileCache {
+        self.cache.clone()
     }
 }
 
@@ -83,24 +176,43 @@ impl Tool for ReadFileTool {
             return Err(format!("File does not exist: {}", path_str));
         }
 
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read file '{}': {}", path.display(), e))?;
+        let metadata = fs::metadata(&path)
+            .map_err(|e| format!("Failed to read file metadata '{}': {}", path.display(), e))?;
+        let mtime = metadata.modified().ok();
+        let len = metadata.len();
 
-        if args.get("start_line").is_some() || args.get("max_lines").is_some() {
-            let start_line = args
+        let has_range = args.get("start_line").is_some() || args.get("max_lines").is_some();
+        let (start_line_opt, max_lines_opt) = if has_range {
+            let start = args
                 .get("start_line")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(1) as usize;
-            if start_line == 0 {
+            if start == 0 {
                 return Err("'start_line' must be at least 1".to_string());
             }
-            let max_lines = args
+            let max = args
                 .get("max_lines")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(300) as usize;
-            if max_lines == 0 {
+            if max == 0 {
                 return Err("'max_lines' must be at least 1".to_string());
             }
+            (Some(start), Some(max))
+        } else {
+            (None, None)
+        };
+
+        if let Some(cached) = self
+            .cache
+            .get(&path, start_line_opt, max_lines_opt, mtime, len)
+        {
+            return Ok(cached);
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read file '{}': {}", path.display(), e))?;
+
+        let result = if let (Some(start_line), Some(max_lines)) = (start_line_opt, max_lines_opt) {
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
             let first = start_line.saturating_sub(1).min(total);
@@ -108,25 +220,28 @@ impl Tool for ReadFileTool {
             let selected = lines[first..last].join("\n");
             let displayed_start = if total == 0 { 0 } else { first + 1 };
             let displayed_end = if last == 0 { 0 } else { last };
-            return Ok(format!(
+            format!(
                 "[Lines {}-{} of {} in {}]\n{}",
                 displayed_start,
                 displayed_end,
                 total,
                 path.display(),
                 selected
-            ));
-        }
-
-        if content.len() > 16000 {
+            )
+        } else if content.len() > 16000 {
             let truncated = content.chars().take(16000).collect::<String>();
-            Ok(format!(
+            format!(
                 "File content (truncated to 16,000 chars):\n{}",
                 truncated
-            ))
+            )
         } else {
-            Ok(content)
-        }
+            content
+        };
+
+        self.cache
+            .insert(&path, start_line_opt, max_lines_opt, mtime, len, result.clone());
+
+        Ok(result)
     }
 }
 
@@ -622,11 +737,15 @@ impl Tool for DeletePathTool {
 
 pub struct WriteFileTool {
     cwd: SharedWorkingDir,
+    read_cache: Option<ReadFileCache>,
 }
 
 impl WriteFileTool {
-    pub fn new(cwd: SharedWorkingDir) -> Self {
-        Self { cwd }
+    pub fn new(cwd: SharedWorkingDir, read_cache: ReadFileCache) -> Self {
+        Self {
+            cwd,
+            read_cache: Some(read_cache),
+        }
     }
 }
 
@@ -740,6 +859,10 @@ impl Tool for WriteFileTool {
         fs::write(&path, content)
             .map_err(|e| format!("Failed to write file '{}': {}", path.display(), e))?;
 
+        if let Some(cache) = &self.read_cache {
+            cache.invalidate(&path);
+        }
+
         Ok(format!(
             "Successfully wrote {} bytes to {}",
             content.len(),
@@ -750,11 +873,15 @@ impl Tool for WriteFileTool {
 
 pub struct EditFileTool {
     cwd: SharedWorkingDir,
+    read_cache: Option<ReadFileCache>,
 }
 
 impl EditFileTool {
-    pub fn new(cwd: SharedWorkingDir) -> Self {
-        Self { cwd }
+    pub fn new(cwd: SharedWorkingDir, read_cache: ReadFileCache) -> Self {
+        Self {
+            cwd,
+            read_cache: Some(read_cache),
+        }
     }
 }
 
@@ -866,6 +993,9 @@ impl Tool for EditFileTool {
             apply_exact_edit(&source, old_string, new_string, replace_all)?;
         fs::write(&path, updated)
             .map_err(|e| format!("Failed to write file '{}': {}", path.display(), e))?;
+        if let Some(cache) = &self.read_cache {
+            cache.invalidate(&path);
+        }
         Ok(format!(
             "Applied {} exact replacement{} to {}",
             occurrences,
@@ -934,9 +1064,90 @@ fn apply_exact_edit(
 }
 
 #[cfg(test)]
-mod edit_tests {
-    use super::{apply_exact_edit, resolve_path};
+mod tests {
+    use super::*;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn read_file_caches_exact_reads_and_invalidates_on_modification() {
+        let temp_dir = std::env::temp_dir().join(format!("holiday_read_cache_test_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("sample.txt");
+        std::fs::write(&test_file, "line1\nline2\nline3\nline4\n").unwrap();
+
+        let cwd = Arc::new(Mutex::new(temp_dir.clone()));
+        let tool = ReadFileTool::new(cwd);
+
+        let args = serde_json::json!({
+            "path": "sample.txt",
+            "start_line": 1,
+            "max_lines": 2
+        });
+
+        let res1 = tool.execute(args.clone()).await.unwrap();
+        assert!(res1.contains("line1\nline2"));
+
+        // Second call hits cache
+        let res2 = tool.execute(args.clone()).await.unwrap();
+        assert_eq!(res1, res2);
+
+        // Modify file
+        // Sleep slightly to guarantee different mtime if filesystem resolution requires it
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&test_file, "modified1\nmodified2\nmodified3\n").unwrap();
+
+        let res3 = tool.execute(args).await.unwrap();
+        assert!(res3.contains("modified1\nmodified2"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn edit_and_write_file_invalidate_read_cache() {
+        let temp_dir = std::env::temp_dir().join(format!("holiday_edit_inval_test_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let test_file = temp_dir.join("sample.txt");
+        std::fs::write(&test_file, "original text\n").unwrap();
+
+        let cwd = Arc::new(Mutex::new(temp_dir.clone()));
+        let read_tool = ReadFileTool::new(cwd.clone());
+        let cache = read_tool.cache();
+        let edit_tool = EditFileTool::new(cwd.clone(), cache.clone());
+        let write_tool = WriteFileTool::new(cwd.clone(), cache.clone());
+
+        let read_args = serde_json::json!({"path": "sample.txt"});
+        let res1 = read_tool.execute(read_args.clone()).await.unwrap();
+        assert_eq!(res1, "original text\n");
+
+        // Edit the file through EditFileTool
+        edit_tool
+            .execute(serde_json::json!({
+                "path": "sample.txt",
+                "old_string": "original",
+                "new_string": "modified"
+            }))
+            .await
+            .unwrap();
+
+        // Read tool should immediately see the modification without stale cache
+        let res2 = read_tool.execute(read_args.clone()).await.unwrap();
+        assert_eq!(res2, "modified text\n");
+
+        // Write to file through WriteFileTool
+        write_tool
+            .execute(serde_json::json!({
+                "path": "sample.txt",
+                "content": "overwritten\n"
+            }))
+            .await
+            .unwrap();
+
+        let res3 = read_tool.execute(read_args).await.unwrap();
+        assert_eq!(res3, "overwritten\n");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn precise_edit_rejects_ambiguous_match() {

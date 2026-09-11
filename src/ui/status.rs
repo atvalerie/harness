@@ -79,7 +79,7 @@ pub fn render_usage(app: &App, frame: &mut Frame, area: Rect) {
 
     let mut spans = vec![
         Span::styled(
-            if streaming { " ⠋ Live " } else { " ● " },
+            if streaming { " [live] " } else { " [*] " },
             Style::default().fg(if streaming { Color::Cyan } else { Color::Green }),
         ),
         Span::styled("session: ", Style::default().fg(Color::DarkGray)),
@@ -148,7 +148,7 @@ mod usage_tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("Live"));
+        assert!(text.contains("live"));
         assert!(text.contains("out ~2"));
         app.request_usage = crate::usage::TokenUsage {
             input_tokens: Some(100),
@@ -205,11 +205,11 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let (state_icon, state_text, state_color) = match app.state {
-        EngineState::Idle => ("●", "ready", Color::Green),
-        EngineState::Streaming => ("◐", "generating", Color::Cyan),
-        EngineState::Compacting => ("⟳", "compacting", Color::Yellow),
-        EngineState::AwaitingHitlApproval => ("▲", "approval needed", Color::Yellow),
-        EngineState::ExecutingTool => ("⚡", "tool execution", Color::LightCyan),
+        EngineState::Idle => ("*", "ready", Color::Green),
+        EngineState::Streaming => ("~", "generating", Color::Cyan),
+        EngineState::Compacting => ("%", "compacting", Color::Yellow),
+        EngineState::AwaitingHitlApproval => ("!", "approval needed", Color::Yellow),
+        EngineState::ExecutingTool => ("#", "tool execution", Color::LightCyan),
     };
 
     let thinking_str = app.thinking_mode(&app.config.model);
@@ -332,16 +332,17 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         }),
     ));
 
-    let tps_str = if app.state == EngineState::Streaming || app.current_tps > 0.0 {
-        format!(" │ {:.1} tps", app.current_tps)
+    let tps_text = if app.state == EngineState::Streaming || app.current_tps > 0.0 {
+        format!("{:.1} tps", app.current_tps)
     } else if app.last_turn_tps > 0.0 {
-        format!(" │ {:.1} tps ({:.1}s)", app.last_turn_tps, app.last_turn_duration_secs)
+        format!("{:.1} tps ({:.1}s)", app.last_turn_tps, app.last_turn_duration_secs)
     } else {
         String::new()
     };
 
-    if !is_narrow && !tps_str.is_empty() {
-        spans.push(Span::styled(tps_str, Style::default().fg(Color::LightCyan)));
+    if !is_narrow && !tps_text.is_empty() {
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled(tps_text, Style::default().fg(Color::LightCyan)));
     }
 
     let line = Line::from(spans);

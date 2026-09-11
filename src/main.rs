@@ -2113,6 +2113,22 @@ fn handle_key_event(
                 app.interaction.suggestion_selected = 0;
                 return;
             }
+            KeyCode::Enter => {
+                let chosen = suggestions[selected];
+                if chosen.arguments == crate::commands::Arguments::Text
+                    || chosen.arguments == crate::commands::Arguments::Path
+                {
+                    app.input_buffer = format!("{} ", chosen.name);
+                    app.input_cursor = app.input_buffer.chars().count();
+                    app.interaction.suggestion_selected = 0;
+                } else {
+                    app.input_buffer = chosen.name.to_string();
+                    app.input_cursor = app.input_buffer.chars().count();
+                    app.interaction.suggestion_selected = 0;
+                    app.handle_enter(tx);
+                }
+                return;
+            }
             KeyCode::Esc => {
                 app.interaction.suggestions_dismissed = true;
                 return;
@@ -2439,5 +2455,32 @@ mod tests {
         );
         assert_eq!(app.input_buffer, format!("{expected} "));
         assert!(app.interaction.top().is_none());
+    }
+
+    #[test]
+    fn slash_suggestion_enter_selects_and_executes_or_inserts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::app::App::new(crate::config::AppConfig::default(), "".into());
+        app.interaction.back();
+        // Type partial command "/cle" (should match "/clear")
+        app.input_buffer = "/cle".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        super::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx.clone(),
+        );
+        // /clear has Optional arguments, so hitting Enter executes it and clears prompt
+        assert_eq!(app.input_buffer, "");
+
+        // Type partial command "/att" (should match "/attach", which requires Path)
+        app.input_buffer = "/att".into();
+        super::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            tx,
+        );
+        // /attach requires Path, so Enter inserts "/attach " for arguments
+        assert_eq!(app.input_buffer, "/attach ");
     }
 }

@@ -22,41 +22,67 @@ pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
         && app.current_thought_buffer.is_empty()
         && app.current_response_buffer.is_empty()
     {
+        lines.push(Line::from(""));
+        let cwd_str = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let (in_p, out_p) = crate::client::get_model_pricing(&app.config.model);
+        let pricing_tag = match (in_p, out_p) {
+            (Some(i), Some(o)) => format!(" (${:.2}/${:.2} M)", i, o),
+            _ => String::new(),
+        };
+
         lines.push(Line::from(vec![
+            Span::styled("  * ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(
-                "Welcome to Holiday",
+                "Holiday",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" [{}]", app.config.model),
+                format!(" [{}{}]", app.config.model, pricing_tag),
                 Style::default().fg(Color::Cyan),
             ),
         ]));
-        if app.interaction.credentials_available {
-            lines.push(Line::from(vec![Span::styled(
-                "Ready. Type /help for commands or enter a prompt.",
-                Style::default().fg(Color::DarkGray),
-            )]));
-        } else {
-            lines.push(Line::from(vec![Span::styled(
-                "You can explore without an API key.",
-                Style::default().fg(Color::DarkGray),
-            )]));
-            lines.push(Line::from(vec![Span::styled(
-                "For ChatGPT/Codex, run `holiday --login browser` or `holiday --login device`, then choose the codex provider.",
-                Style::default().fg(Color::DarkGray),
-            )]));
-            lines.push(Line::from(vec![Span::styled(
-                "For API keys, use /key <provider_api_key> or set the provider's environment variable.",
-                Style::default().fg(Color::DarkGray),
-            )]));
-            lines.push(Line::from(vec![Span::styled(
-                "Type /help for commands or enter a prompt.",
-                Style::default().fg(Color::DarkGray),
-            )]));
+
+        lines.push(Line::from(vec![
+            Span::styled("    dir: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cwd_str, Style::default().fg(Color::Gray)),
+        ]));
+
+        if !app.interaction.credentials_available {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("    ! ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("No API key configured.", Style::default().fg(Color::Yellow)),
+                Span::styled(" Use ", Style::default().fg(Color::DarkGray)),
+                Span::styled("/key <api_key>", Style::default().fg(Color::White)),
+                Span::styled(" or ", Style::default().fg(Color::DarkGray)),
+                Span::styled("holiday --login browser", Style::default().fg(Color::White)),
+            ]));
         }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("    Quick start:", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      /help", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("    show commands & slash options", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      /models", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("  switch AI model or provider", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      /compact", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" summarize history & reduce context tokens", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("      Enter", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("    type a prompt or question to start", Style::default().fg(Color::DarkGray)),
+        ]));
     }
 
     let mut cache = app.interaction.cache.borrow_mut();
@@ -107,7 +133,7 @@ pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
                 item_lines.push(Line::from(""));
                 item_lines.push(Line::from(vec![
                     Span::styled(
-                        "❯ user",
+                        "> user",
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
@@ -164,7 +190,7 @@ pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
                 item_lines.push(Line::from(""));
                 item_lines.push(Line::from(vec![
                     Span::styled(
-                        "◆ assistant",
+                        "* assistant",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -181,7 +207,7 @@ pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
             "thought" => {
                 item_lines.push(Line::from(""));
                 item_lines.push(Line::from(vec![
-                    Span::styled("· thought", Style::default().fg(Color::Magenta)),
+                    Span::styled("- thought", Style::default().fg(Color::Magenta)),
                     Span::styled(
                         format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
@@ -197,22 +223,31 @@ pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
             "tool" => {
                 item_lines.push(Line::from(""));
                 item_lines.push(Line::from(vec![
-                    Span::styled("⚡ tool", Style::default().fg(Color::Yellow)),
+                    Span::styled("[tool]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!("  {}  #{}", msg.timestamp, index + 1),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
-                let max_chars = area.width.saturating_sub(6).max(12) as usize;
-                let compact = msg.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                let (prefix_badge, content_text) = if let Some(rest) = msg.content.strip_prefix("✓ ") {
+                    (Span::styled("  ok ", Style::default().fg(Color::Green)), rest)
+                } else if let Some(rest) = msg.content.strip_prefix("✗ ") {
+                    (Span::styled("  err ", Style::default().fg(Color::Red)), rest)
+                } else {
+                    (Span::styled("  -> ", Style::default().fg(Color::DarkGray)), msg.content.as_str())
+                };
+
+                let max_chars = area.width.saturating_sub(12).max(12) as usize;
+                let compact = content_text.split_whitespace().collect::<Vec<_>>().join(" ");
                 let mut visible = compact.chars().take(max_chars).collect::<String>();
                 if compact.chars().count() > max_chars {
-                    visible.push('…');
+                    visible.push_str("...");
                 }
-                item_lines.push(Line::from(vec![Span::styled(
-                    format!("  {}", visible),
-                    Style::default().fg(Color::Yellow),
-                )]));
+
+                item_lines.push(Line::from(vec![
+                    prefix_badge,
+                    Span::styled(visible, Style::default().fg(Color::Yellow)),
+                ]));
             }
             "system" => {
                 if msg.content.starts_with("Error:") {
@@ -410,6 +445,7 @@ pub fn render_chat(app: &mut App, frame: &mut Frame, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .title(Span::styled(title, Style::default().fg(Color::DarkGray)))
             .border_style(Style::default().fg(Color::DarkGray)),
     );
