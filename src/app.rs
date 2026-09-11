@@ -140,8 +140,12 @@ pub struct App {
     // Metrics & Performance
     pub stream_epoch: u64,
     pub stream_start_time: Option<std::time::Instant>,
+    pub turn_start_time: Option<std::time::Instant>,
     pub candidate_chunks_count: u32,
     pub current_tps: f64,
+    pub last_turn_tps: f64,
+    pub last_turn_duration_secs: f64,
+    pub turn_output_tokens: u64,
 
     // Provider account limits shown in the status bar
     pub provider_limits: Option<String>,
@@ -327,8 +331,12 @@ impl App {
             sessions_selected: 0,
             stream_epoch: 0,
             stream_start_time: None,
+            turn_start_time: None,
             candidate_chunks_count: 0,
             current_tps: 0.0,
+            last_turn_tps: 0.0,
+            last_turn_duration_secs: 0.0,
+            turn_output_tokens: 0,
             provider_limits: None,
             status_message: Some("Ready".to_string()),
             should_quit: false,
@@ -1239,6 +1247,7 @@ impl App {
             .as_ref()
             .and_then(|p| p.cost_nano_usd(&self.request_usage));
         self.usage_summary.add(&self.request_usage);
+        self.turn_output_tokens = self.turn_output_tokens.saturating_add(candidates_tokens);
         self.usage_records.push(UsageRecord {
             timestamp: chrono::Local::now().to_rfc3339(),
             provider: self.config.provider.clone(),
@@ -1324,6 +1333,8 @@ impl App {
 
         self.add_message_with_attachments("user", text, attachments);
         let _ = self.flush_session();
+        self.turn_start_time = Some(std::time::Instant::now());
+        self.turn_output_tokens = 0;
         self.trigger_generation(tx);
     }
 
@@ -2623,8 +2634,14 @@ impl App {
                 self.candidate_chunks_count += 1;
                 if let Some(start) = self.stream_start_time {
                     let elapsed = start.elapsed().as_secs_f64();
-                    if elapsed > 0.1 && self.candidates_tokens > 0 {
-                        self.current_tps = self.candidates_tokens as f64 / elapsed;
+                    if elapsed > 0.05 {
+                        let tokens = if self.candidates_tokens > 0 {
+                            self.candidates_tokens
+                        } else {
+                            // High-frequency responsive estimate while awaiting provider usage
+                            ((self.current_thought_buffer.len() + self.current_response_buffer.len()) as u64 / 4).max(1)
+                        };
+                        self.current_tps = tokens as f64 / elapsed;
                     }
                 }
             }
@@ -2814,6 +2831,15 @@ impl App {
 
                 if self.state == EngineState::Streaming {
                     self.state = EngineState::Idle;
+                    if let Some(start) = self.turn_start_time.take() {
+                        let dur = start.elapsed().as_secs_f64();
+                        self.last_turn_duration_secs = dur;
+                        let out = self.candidates_tokens;
+                        self.turn_output_tokens = self.turn_output_tokens.saturating_add(out);
+                        if dur > 0.1 && self.turn_output_tokens > 0 {
+                            self.last_turn_tps = self.turn_output_tokens as f64 / dur;
+                        }
+                    }
                     let reason = finish_reason.unwrap_or_else(|| "STOP".to_string());
                     if self.plan_mode && self.latest_model_has_plan() {
                         self.interaction

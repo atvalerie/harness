@@ -15,6 +15,8 @@ pub fn render_usage(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         app.usage_records.last().map(|r| &r.details)
     };
+
+    // Current / Last Turn metrics
     let input = usage
         .and_then(|u| u.input_tokens)
         .map(|n| n.to_string())
@@ -30,39 +32,98 @@ pub fn render_usage(app: &App, frame: &mut Frame, area: Rect) {
                         .div_ceil(4)
                 )
             } else {
-                "unknown".into()
+                "0".into()
             }
         });
     let total = usage
         .and_then(|u| u.total())
         .map(|n| n.to_string())
-        .unwrap_or_else(|| "unknown".into());
+        .unwrap_or_else(|| "0".into());
     let cached = usage
         .and_then(|u| u.cache_read_tokens)
         .map(|n| n.to_string())
-        .unwrap_or_else(|| "?".into());
-    let rate = app.usage_summary.cache_rate();
-    let known = app.usage_summary.cache_known;
-    let cost = app
+        .unwrap_or_else(|| "0".into());
+
+    // Session-wide accumulating totals
+    let session_input = app.usage_summary.input;
+    let session_output = app.usage_summary.output;
+    let session_cached = app.usage_summary.cache_read;
+    let session_cache_rate = app.usage_summary.cache_rate();
+
+    // Session total cost
+    let total_cost_nano: u64 = app
         .usage_records
-        .last()
-        .and_then(|r| r.cost_nano_usd)
-        .map(|n| format!("${:.6}", n as f64 / 1_000_000_000.0))
-        .unwrap_or_else(|| "unpriced".into());
-    let text = format!(
-        " {} | in {} out {} total {} | cached {} | cache {} ({}/{}) | {} | ~ estimated",
-        if streaming { "Live" } else { "Last request" },
-        input,
-        output,
-        total,
-        cached,
-        rate,
-        known,
-        app.usage_records.len(),
-        if streaming { "cost pending" } else { &cost }
-    );
+        .iter()
+        .filter_map(|r| r.cost_nano_usd)
+        .sum();
+    let cost_str = if total_cost_nano > 0 {
+        format!("${:.4}", total_cost_nano as f64 / 1_000_000_000.0)
+    } else if let Some(last_cost) = app.usage_records.last().and_then(|r| r.cost_nano_usd) {
+        format!("${:.4}", last_cost as f64 / 1_000_000_000.0)
+    } else {
+        "$0.00".into()
+    };
+
+    // Speed / TPS
+    let tps = if streaming || app.state == EngineState::ExecutingTool {
+        if app.current_tps > 0.0 {
+            format!("{:.1} tps", app.current_tps)
+        } else {
+            "streaming".to_string()
+        }
+    } else if app.last_turn_tps > 0.0 {
+        format!("{:.1} tps ({:.1}s)", app.last_turn_tps, app.last_turn_duration_secs)
+    } else {
+        String::new()
+    };
+
+    let mut spans = vec![
+        Span::styled(
+            if streaming { " ⠋ Live " } else { " ● " },
+            Style::default().fg(if streaming { Color::Cyan } else { Color::Green }),
+        ),
+        Span::styled("session: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "in {} (cached {}) / out {}",
+                format_compact_number(session_input),
+                if session_cached > 0 {
+                    format!("{} · {}", format_compact_number(session_cached), session_cache_rate)
+                } else {
+                    format_compact_number(session_cached)
+                },
+                format_compact_number(session_output)
+            ),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    spans.push(Span::raw(" │ "));
+    spans.push(Span::styled("turn: ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("in {} out {} total {}", input, output, total),
+        Style::default().fg(Color::LightCyan),
+    ));
+
+    if cached != "0" && cached != "?" {
+        spans.push(Span::styled(
+            format!(" (cached {})", cached),
+            Style::default().fg(Color::LightGreen),
+        ));
+    }
+
+    if cost_str != "$0.00" {
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled(cost_str, Style::default().fg(Color::Yellow)));
+    }
+
+    if !tps.is_empty() {
+        spans.push(Span::raw(" │ "));
+        spans.push(Span::styled(tps, Style::default().fg(Color::Cyan)));
+    }
+
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(Line::from(spans)),
         area,
     );
 }
@@ -132,7 +193,7 @@ mod usage_tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("Last request | in 100 out 20 total 120"));
+        assert!(text.contains("in 100 out 20 total 120"));
     }
 }
 
@@ -143,12 +204,12 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         _ => String::new(),
     };
 
-    let (state_badge, state_fg, state_bg) = match app.state {
-        EngineState::Idle => ("IDLE", Color::Black, Color::DarkGray),
-        EngineState::Streaming => ("STREAMING", Color::Black, Color::Green),
-        EngineState::Compacting => ("COMPACTING", Color::Black, Color::Yellow),
-        EngineState::AwaitingHitlApproval => ("GATE-HOLD", Color::Black, Color::Yellow),
-        EngineState::ExecutingTool => ("TOOL-EXEC", Color::Black, Color::LightCyan),
+    let (state_icon, state_text, state_color) = match app.state {
+        EngineState::Idle => ("●", "ready", Color::Green),
+        EngineState::Streaming => ("◐", "generating", Color::Cyan),
+        EngineState::Compacting => ("⟳", "compacting", Color::Yellow),
+        EngineState::AwaitingHitlApproval => ("▲", "approval needed", Color::Yellow),
+        EngineState::ExecutingTool => ("⚡", "tool execution", Color::LightCyan),
     };
 
     let thinking_str = app.thinking_mode(&app.config.model);
@@ -179,51 +240,34 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         .map(compact_provider_limit_parts)
         .filter(|parts| !parts.is_empty());
 
-    let tps_str = if app.state == EngineState::Streaming || app.current_tps > 0.0 {
-        format!(" │ {:.1} tps", app.current_tps)
-    } else {
-        String::new()
-    };
-
-    let activity = match app.state {
-        EngineState::Streaming | EngineState::Compacting | EngineState::ExecutingTool => {
-            format!("{} ", spinner(app))
-        }
-        EngineState::AwaitingHitlApproval => "! ".to_string(),
-        EngineState::Idle => String::new(),
-    };
-
     let is_narrow = area.width < 90;
     let is_compact = area.width < 60;
 
     let mut spans = vec![
         Span::styled(
-            if is_compact { " H " } else { " HOLIDAY " },
+            if is_compact { " " } else { " holiday " },
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw("│ "),
         Span::styled(
-            format!(" {} ", state_badge),
+            format!("{} {} ", state_icon, state_text),
             Style::default()
-                .fg(state_fg)
-                .bg(state_bg)
+                .fg(state_color)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
 
     if app.auto_mode {
         spans.push(Span::styled(
-            if is_compact { " AUTO " } else { " AUTO REVIEW " },
+            "[auto] ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    spans.push(Span::styled(activity, Style::default().fg(Color::LightCyan)));
     spans.push(Span::styled(
         &app.config.model,
         Style::default()
@@ -262,9 +306,15 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
 
     spans.push(Span::raw(" │ "));
     spans.push(Span::styled("ctx: ", Style::default().fg(Color::DarkGray)));
+    let compact_indicator = if app.config.auto_compact {
+        let thresh = format_compact_number(app.config.auto_compact_threshold_tokens);
+        format!(" [compact@{}]", thresh)
+    } else {
+        String::new()
+    };
     spans.push(Span::styled(
         format!(
-            "{}{}/{} ({:.1}%)",
+            "{}{}/{} ({:.1}%){}",
             if app.context_tokens_estimated {
                 "~"
             } else {
@@ -272,7 +322,8 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             },
             app.context_tokens,
             context_limit_text,
-            context_pct
+            context_pct,
+            compact_indicator
         ),
         Style::default().fg(if context_pct > 80.0 {
             Color::Red
@@ -281,7 +332,15 @@ pub fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         }),
     ));
 
-    if !is_narrow {
+    let tps_str = if app.state == EngineState::Streaming || app.current_tps > 0.0 {
+        format!(" │ {:.1} tps", app.current_tps)
+    } else if app.last_turn_tps > 0.0 {
+        format!(" │ {:.1} tps ({:.1}s)", app.last_turn_tps, app.last_turn_duration_secs)
+    } else {
+        String::new()
+    };
+
+    if !is_narrow && !tps_str.is_empty() {
         spans.push(Span::styled(tps_str, Style::default().fg(Color::LightCyan)));
     }
 
